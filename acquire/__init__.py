@@ -15,7 +15,17 @@ from .read import (
     COMMON_MEDIA_PATHS,
 )
 
+from .catalog import (
+    FileCatalog,
+    ProjectCatalog,
+    SensitivityFlag,
+    catalog_project,
+    catalog_project_group,
+    classify_file,
+)
+
 __all__ = [
+    # From read
     "ProjectFile",
     "ProjectGroup",
     "discover_projects",
@@ -28,4 +38,11 @@ __all__ = [
     "is_project_file",
     "DEFAULT_WATCH_DIR",
     "COMMON_MEDIA_PATHS",
+    # From catalog
+    "FileCatalog",
+    "ProjectCatalog",
+    "SensitivityFlag",
+    "catalog_project",
+    "catalog_project_group",
+    "classify_file",
 ]
