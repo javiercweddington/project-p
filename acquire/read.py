@@ -17,9 +17,9 @@ Naming convention:
     {Company} - {Product}[-YYYYMMDDTHHMMSSZ][-NNN.zip]
 
 Examples:
-    Ampere - Shower Power-20210425T055243Z-001.zip
-    Clipsy LLC - GOLIGO Walker  (unzipped directory)
-    RMI - Xenxo S-Ring 1.0-20210425T055329Z-005.zip
+    Acme Corp - Widget Pro-20210425T055243Z-001.zip
+    Beta LLC - Gamma Device  (unzipped directory)
+    Delta Inc - Epsilon Tool v2-20210425T055329Z-005.zip
 """
 
 import os
@@ -85,7 +85,7 @@ def parse_filename(filename: str) -> Optional[Tuple[str, str, str, int, Optional
     if name.lower().endswith('.zip'):
         name = name[:-4]
 
-    # Now remove version from name (e.g., "Ampere - Shower Power-001" -> "Ampere - Shower Power")
+    # Now remove version from name (e.g., "Acme - Widget-001" -> "Acme - Widget")
     if version > 0:
         name = re.sub(r'-\d{3}$', '', name)
 
