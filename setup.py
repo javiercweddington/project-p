@@ -4,7 +4,7 @@ if __name__ == "__main__":
     setup(
         name="project-p",
         version="0.1.0",
-        description="A Python project",
+        description="anonymization",
         author="JavierCW",
         author_email="servingthroughscience [at] gmail [dot] com",
         license="MIT",
