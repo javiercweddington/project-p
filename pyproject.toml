@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "Author", email = "servingthroughscience [at] gmail [dot] com"}
+    {name = "JavierCW", email = "servingthroughscience [at] gmail [dot] com"}
 ]
 dependencies = [
     "requests>=2.31.0",
