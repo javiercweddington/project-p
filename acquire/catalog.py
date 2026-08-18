@@ -16,8 +16,10 @@ from __future__ import annotations
 import re
 import io
 import os
+import sys
 import hashlib
 import difflib
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
@@ -30,7 +32,97 @@ try:
 except ImportError:
     HAS_PYPDF = False
 
+try:
+    from gliner import GLiNER
+    HAS_GLINER = True
+except ImportError:
+    HAS_GLINER = False
+    GLiNER = None
+
 from .read import ProjectFile, ProjectGroup
+
+# Module-level logger for proper error reporting
+_logger = logging.getLogger(__name__)
+
+# ---- GLiNER-based entity detection ----
+# Based on working test: ~/test_glin.py
+# Uses urchade/gliner_multi-v2.1 with labels ["person", "organization"]
+
+_gliner_model = None
+_gliner_model_name = os.environ.get("GLINER_MODEL", "urchade/gliner_multi-v2.1")
+_gliner_threshold = float(os.environ.get("GLINER_THRESHOLD", "0.5"))
+_gliner_labels = ["person", "organization"]
+
+
+def _get_gliner_model():
+    """Get or create the GLiNER model (lazy singleton)."""
+    global _gliner_model
+    if _gliner_model is not None:
+        return _gliner_model
+    if not HAS_GLINER:
+        return None
+    try:
+        _logger.info("Loading GLiNER model %s ...", _gliner_model_name)
+        _gliner_model = GLiNER.from_pretrained(_gliner_model_name)
+        _logger.info("GLiNER model loaded.")
+        return _gliner_model
+    except Exception as e:
+        _logger.warning("Failed to load GLiNER model: %s", e)
+        _gliner_model = object()  # sentinel to avoid retrying
+        return None
+
+
+def _extract_entities_with_gliner(text: str, source: str) -> List[EntityHit]:
+    """Use GLiNER to extract named entities from text.
+
+    Falls back to regex-based detection if GLiNER is not available.
+
+    Args:
+        text: Text content to scan.
+        source: Source filename/path for attribution.
+
+    Returns:
+        List of EntityHit objects.
+    """
+    model = _get_gliner_model()
+    if model is None:
+        _logger.debug("GLiNER not available, falling back to regex-based entity detection")
+        return extract_entities_from_text_regex(text, source)
+
+    hits = []
+    seen = set()  # deduplicate within the same text
+    # Process text in chunks to handle long documents
+    chunk_size = 3000
+    overlap = 200
+    for start in range(0, len(text), chunk_size - overlap):
+        chunk = text[start:start + chunk_size]
+        if not chunk.strip():
+            continue
+        try:
+            for e in model.predict_entities(chunk, _gliner_labels, threshold=_gliner_threshold):
+                entity_text = e['text'].strip()
+                entity_type = e['label'].lower()
+                confidence = round(float(e['score']), 3)
+                # Deduplicate: keep highest confidence for each (type, value) pair
+                key = (entity_type, entity_text.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                if entity_type == 'person':
+                    hits.append(EntityHit(entity_type='person', value=entity_text,
+                                          source=source, confidence=confidence))
+                elif entity_type == 'organization':
+                    hits.append(EntityHit(entity_type='company', value=entity_text,
+                                          source=source, confidence=confidence))
+        except Exception as e:
+            _logger.debug("GLiNER prediction failed on chunk: %s", e)
+            continue
+
+    if hits:
+        return hits
+
+    # Fallback to regex if GLiNER found nothing
+    return extract_entities_from_text_regex(text, source)
 
 
 # ---- Sensitivity detection patterns ----
@@ -116,7 +208,8 @@ def extract_pdf_text(filepath: Path, max_pages: int = 5) -> str:
         for i in range(min(max_pages, len(reader.pages))):
             pages.append(reader.pages[i].extract_text() or "")
         return '\n'.join(pages)
-    except Exception:
+    except Exception as e:
+        _logger.debug("Failed to extract text from PDF %s: %s", filepath, e)
         return ""
 
 
@@ -141,7 +234,9 @@ def extract_pdf_text_from_zip(zip_path: Path, zip_entry: str, max_pages: int = 5
                 for i in range(min(max_pages, len(reader.pages))):
                     pages.append(reader.pages[i].extract_text() or "")
                 return '\n'.join(pages)
-    except Exception:
+    except Exception as e:
+        _logger.debug("Failed to extract text from PDF %s in zip %s: %s",
+                       zip_entry, zip_path, e)
         return ""
 
 
@@ -180,9 +275,11 @@ def scan_text_for_sensitivity(text: str, source: str) -> List[SensitivityFlag]:
         ))
 
     # Company names (look for patterns like "Company Name LLC" or "Name Technologies")
+    # IMPORTANT: The regex requires the company keyword to be at the END of the match
+    # to avoid false positives like "was machined in Kansas" matching "Kansas" as a company.
     for keyword in _COMPANY_KEYWORDS:
         pattern = re.compile(
-            r'([A-Z][A-Za-z\s.&]+(?:' + keyword + r'))',
+            r'([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\s+' + re.escape(keyword) + r')',
             re.IGNORECASE,
         )
         for match in pattern.finditer(text):
@@ -419,8 +516,13 @@ class FileCatalog:
                         self._files_by_type[file_type].append(name)
                         self._file_count_by_type[file_type] += 1
                         self._total_files += 1
-        except (zipfile.BadZipFile, Exception):
-            pass
+        except zipfile.BadZipFile as e:
+            _logger.warning("Invalid zip file %s: %s", self.project_file.filepath, e)
+        except PermissionError as e:
+            _logger.warning("Permission denied reading zip %s: %s",
+                            self.project_file.filepath, e)
+        except OSError as e:
+            _logger.warning("OS error reading zip %s: %s", self.project_file.filepath, e)
 
     def _catalog_directory(self):
         """Catalog files in a directory."""
@@ -433,8 +535,9 @@ class FileCatalog:
                     self._files_by_type[file_type].append(rel)
                     self._file_count_by_type[file_type] += 1
                     self._total_files += 1
-        except PermissionError:
-            pass
+        except PermissionError as e:
+            _logger.warning("Permission denied reading directory %s: %s",
+                            self.project_file.filepath, e)
 
     def get_sensitivity_flags(self, scan_pdf_content: bool = True) -> List[SensitivityFlag]:
         """Analyze filenames AND PDF content for sensitive information.
@@ -474,8 +577,10 @@ class FileCatalog:
             try:
                 with zipfile.ZipFile(self.project_file.filepath, 'r') as zf:
                     files_to_scan = zf.namelist()
-            except (zipfile.BadZipFile, Exception):
-                pass
+            except zipfile.BadZipFile as e:
+                _logger.warning("Invalid zip file %s: %s", self.project_file.filepath, e)
+            except OSError as e:
+                _logger.warning("OS error reading zip %s: %s", self.project_file.filepath, e)
         else:
             try:
                 for filepath in self.project_file.filepath.rglob('*'):
@@ -483,8 +588,9 @@ class FileCatalog:
                         files_to_scan.append(
                             str(filepath.relative_to(self.project_file.filepath))
                         )
-            except PermissionError:
-                pass
+            except PermissionError as e:
+                _logger.warning("Permission denied reading directory %s: %s",
+                                self.project_file.filepath, e)
 
         for filename in files_to_scan:
             if filename.endswith('/'):
@@ -517,8 +623,10 @@ class FileCatalog:
                             n for n in zf.namelist()
                             if n.lower().endswith('.pdf') and not n.endswith('/')
                         ]
-                except (zipfile.BadZipFile, Exception):
-                    pass
+                except zipfile.BadZipFile as e:
+                    _logger.warning("Invalid zip file %s: %s", self.project_file.filepath, e)
+                except OSError as e:
+                    _logger.warning("OS error reading zip %s: %s", self.project_file.filepath, e)
                 for pdf_entry in pdf_files:
                     text = extract_pdf_text_from_zip(self.project_file.filepath, pdf_entry)
                     if text:
@@ -535,8 +643,9 @@ class FileCatalog:
                                 self._sensitivity_flags.extend(
                                     scan_text_for_sensitivity(text, rel)
                                 )
-                except PermissionError:
-                    pass
+                except PermissionError as e:
+                    _logger.warning("Permission denied reading directory %s: %s",
+                                    self.project_file.filepath, e)
 
         return self._sensitivity_flags
 
@@ -743,6 +852,390 @@ def print_consolidation_suggestions(
               f"Versions B: {s.project_b.version_count}")
 
 
+# ---- Named entity detection ----
+#
+# This module uses pattern-based detection rather than hardcoded name lists.
+# It relies on structural cues (titles, capitalization, context words) to
+# identify named entities in text.
+
+
+class EntityHit:
+    """A detected named entity in a file."""
+
+    def __init__(self, entity_type: str, value: str, source: str,
+                 confidence: float = 1.0, context: str = ""):
+        self.entity_type = entity_type  # 'person', 'company', 'product'
+        self.value = value
+        self.source = source
+        self.confidence = confidence
+        self.context = context
+
+    def __repr__(self):
+        return (f"EntityHit(type={self.entity_type!r}, value={self.value!r}, "
+                f"source={self.source!r})")
+
+
+# Words that indicate a person name follows (titles, roles, positions)
+_PERSON_TITLE_WORDS = {
+    'mr', 'mrs', 'ms', 'miss', 'dr', 'prof', 'professor',
+    'ceo', 'coo', 'cto', 'cfo', 'cmo', 'cpo',
+    'vp', 'vice president', 'director', 'manager', 'engineer',
+    'president', 'chairman', 'chairwoman', 'chief',
+    'author', 'creator', 'designer', 'developer', 'writer',
+    'contact', 'consultant', 'advisor', 'attorney', 'counsel',
+    # Chinese titles
+    '先生', '女士', '小姐', '博士', '教授', '经理', '总监', '总裁', '总经理',
+}
+
+# Words that indicate an organization/company context
+_ORG_INDICATOR_WORDS = {
+    'company', 'corporation', 'corporate', 'inc', 'incorporated', 'llc',
+    'ltd', 'limited', 'gmbh', 'ag', 'sa', 'plc', 'nv', 'bv',
+    'technologies', 'technology', 'industries', 'industry', 'solutions',
+    'systems', 'labs', 'laboratories', 'medical', 'engineering',
+    'group', 'groups', 'holdings', 'partners', 'partnership',
+    'consulting', 'services', 'service', 'international', 'global',
+}
+
+# Product/model indicator patterns
+_PRODUCT_PATTERNS = [
+    # Model numbers: Model X-1234, Model 123, M-1234
+    re.compile(r'(?:model|mod|mdl)[\s:-]*([A-Z0-9][-0-9A-Z]{2,10})', re.IGNORECASE),
+    # Part numbers: P/N: 123, Part No: ABC-123
+    re.compile(r'(?:part\s*(?:no|number)\.?|p/n|pn)[\s:]*([A-Z0-9][-0-9A-Z.]{2,20})', re.IGNORECASE),
+    # Serial numbers: S/N: 123, Serial No: ABC
+    re.compile(r'(?:serial\s*(?:no|number)\.?|s/n|sn)[\s:]*([A-Z0-9][-0-9A-Z.]{2,20})', re.IGNORECASE),
+    # Versioned product names: ProductName v1.2, ProductName 1.2.3
+    re.compile(r'([A-Z][A-Za-z0-9]+)\s+v(\d+\.\d+(?:\.\d+)?)', re.IGNORECASE),
+]
+
+
+# Words that are commonly capitalized in documents but are NOT person names
+_NOT_PERSON_NAMES = {
+    # Articles, prepositions, conjunctions
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+    'of', 'with', 'by', 'from', 'is', 'it', 'its', 'as', 'be', 'was',
+    'are', 'were', 'been', 'has', 'have', 'had', 'do', 'does', 'did',
+    'will', 'would', 'could', 'should', 'may', 'might', 'shall', 'can',
+    'that', 'this', 'these', 'those', 'which', 'who', 'whom', 'whose',
+    'what', 'when', 'where', 'how', 'if', 'then', 'than', 'not', 'no',
+    'nor', 'so', 'yet', 'both', 'each', 'every', 'all', 'any', 'some',
+    'such', 'only', 'own', 'same', 'into', 'over', 'after', 'before',
+    'up', 'out', 'just', 'about', 'also', 'being', 'done', 'here',
+    'there', 'other', 'another', 'much', 'many', 'more', 'most',
+    # Common business/legal document words
+    'product', 'service', 'company', 'parties', 'party', 'agreement',
+    'contract', 'work', 'works', 'works', 'information', 'confidential',
+    'disclosure', 'use', 'terms', 'conditions', 'rights', 'obligations',
+    'liability', 'indemnity', 'warranty', 'limitation', 'termination',
+    'notice', 'notices', 'section', 'sections', 'clause', 'clauses',
+    'exhibit', 'schedule', 'appendix', 'attachment', 'amendment',
+    'representations', 'warranties', 'covenants', 'general', 'specific',
+    'mutual', 'sole', 'exclusive', 'nonexclusive', 'written', 'written',
+    'either', 'neither', 'authorized', 'representative', 'representatives',
+    'legal', 'legal', 'business', 'purpose', 'purposes', 'scope',
+    'definition', 'definitions', 'interpreted', 'meaning', 'means',
+    'including', 'include', 'includes', 'included', 'exclude', 'excludes',
+    'limited', 'limit', 'limits', 'unlimited', 'reasonable', 'reasonably',
+    'good', 'faith', 'efforts', 'best', 'commercial', 'market',
+    'knowledge', 'aware', 'believe', 'know', 'understand', 'agree',
+    'consent', 'approval', 'permission', 'license', 'licenses',
+    'proprietary', 'intellectual', 'property', 'patent', 'trademark',
+    'copyright', 'trade', 'secret', 'secrets', 'technology', 'data',
+    'material', 'materials', 'document', 'documents', 'record', 'records',
+    'file', 'files', 'copy', 'copies', 'original', 'version', 'versions',
+    'date', 'dates', 'time', 'times', 'period', 'periods', 'term', 'terms',
+    'day', 'days', 'week', 'weeks', 'month', 'months', 'year', 'years',
+    'prior', 'previous', 'subsequent', 'following', 'hereof', 'herein',
+    'thereof', 'therein', 'hereby', 'thereby', 'whereof', 'wherein',
+    'further', 'more', 'less', 'least', 'least', 'least', 'least',
+    'based', 'basis', 'upon', 'among', 'between', 'through', 'during',
+    'within', 'without', 'against', 'around', 'along', 'across',
+    'department', 'division', 'office', 'offices', 'location', 'locations',
+    'address', 'contact', 'phone', 'email', 'website', 'web', 'internet',
+    'system', 'systems', 'software', 'hardware', 'equipment', 'device',
+    'devices', 'component', 'components', 'part', 'parts', 'unit', 'units',
+    'model', 'models', 'type', 'types', 'kind', 'kinds', 'class', 'classes',
+    'category', 'categories', 'group', 'groups', 'set', 'sets', 'list',
+    'lists', 'table', 'tables', 'chart', 'charts', 'figure', 'figures',
+    'page', 'pages', 'line', 'lines', 'item', 'items', 'entry', 'entries',
+    'total', 'subtotal', 'net', 'gross', 'amount', 'amounts', 'price',
+    'prices', 'cost', 'costs', 'fee', 'fees', 'charge', 'charges',
+    'payment', 'payments', 'invoice', 'invoices', 'order', 'orders',
+    'delivery', 'deliveries', 'shipment', 'shipments', 'shipping',
+    'warranty', 'return', 'returns', 'exchange', 'refund', 'refunds',
+    'credit', 'debit', 'balance', 'account', 'accounts', 'bank', 'banks',
+    'financial', 'fiscal', 'tax', 'taxes', 'insurance', 'coverage',
+    'risk', 'risks', 'loss', 'losses', 'damage', 'damages', 'injury',
+    'health', 'safety', 'environment', 'regulation', 'regulations',
+    'compliance', 'law', 'laws', 'legal', 'statute', 'statutes',
+    'rule', 'rules', 'policy', 'policies', 'procedure', 'procedures',
+    'standard', 'standards', 'requirement', 'requirements', 'specification',
+    'design', 'development', 'testing', 'test', 'tests', 'quality',
+    'control', 'assurance', 'management', 'plan', 'plans', 'project',
+    'projects', 'program', 'programs', 'process', 'processes', 'method',
+    'methods', 'approach', 'approaches', 'strategy', 'strategies',
+    'analysis', 'research', 'study', 'studies', 'report', 'reports',
+    'review', 'reviews', 'audit', 'audits', 'inspection', 'inspections',
+    'evaluation', 'assessment', 'monitoring', 'maintenance', 'support',
+    'training', 'education', 'consulting', 'advisory', 'professional',
+    'technical', 'operational', 'administrative', 'executive', 'senior',
+    'junior', 'middle', 'lower', 'upper', 'first', 'second', 'third',
+    'final', 'initial', 'early', 'late', 'new', 'old', 'current',
+    'former', 'existing', 'potential', 'actual', 'possible', 'likely',
+    'unlikely', 'certain', 'uncertain', 'required', 'optional', 'may',
+    'shall', 'must', 'will', 'shall', 'may', 'might', 'should', 'could',
+    'documentation', 'possession', 'possessed', 'possession', 'modification',
+    'modifications', 'model', 'models', 'modifying', 'modify',
+}
+
+
+def _is_likely_person_name(first: str, last: str) -> bool:
+    """Heuristic check: does this look like a person name?
+
+    Uses structural heuristics rather than hardcoded lists:
+    - Both words are Title Case
+    - Reasonable length (2-20 chars each)
+    - Not common false-positive words
+    """
+    if first.lower() in _NOT_PERSON_NAMES or last.lower() in _NOT_PERSON_NAMES:
+        return False
+    if len(first) < 2 or len(last) < 2:
+        return False
+    if len(first) > 20 or len(last) > 20:
+        return False
+    return True
+
+
+def _detect_person_names_regex(text: str) -> List[str]:
+    """Detect person names in text using regex patterns (fallback when LLM unavailable).
+
+
+    Pattern 1: Title + Name (Dr. John Smith, CEO Jane Doe)
+    Pattern 2: "Name, Title" (John Smith, CEO or John Smith, Manager)
+    Pattern 3: Chinese title + single character surname
+    Pattern 4: "by Name" pattern (common in documents)
+    Pattern 5: "Name <email>" pattern
+    """
+    names = set()
+
+    # Pattern 1: Title + First Last
+    for match in re.finditer(
+        r'(?:Mr|Mrs|Ms|Miss|Dr|Prof|Professor|CEO|COO|CTO|CFO|VP|Director|Manager|Engineer|President)[.:\s]+('
+        r'[A-Z][a-z]+)\s+([A-Z][a-z]+)',
+        text
+    ):
+        first, last = match.group(1), match.group(2)
+        if _is_likely_person_name(first, last):
+            names.add(f"{first} {last}")
+
+    # Pattern 2: "Name, Title" (John Smith, CEO or John Smith, Manager)
+    for match in re.finditer(
+        r'([A-Z][a-z]+)\s+([A-Z][a-z]+),\s+(?:CEO|COO|CTO|CFO|VP|Director|Manager|Engineer|President|Owner|Founder)',
+        text
+    ):
+        first, last = match.group(1), match.group(2)
+        if _is_likely_person_name(first, last):
+            names.add(f"{first} {last}")
+
+    # Pattern 3: Chinese title + single character surname
+    for match in re.finditer(
+        r'(?:先生|女士|小姐|博士|教授|经理|总监|总裁|总经理)[\s:]*'
+        r'([赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜'
+        r'戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐费'
+        r'廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄和穆'
+        r'萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝'
+        r'闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐邱骆高夏蔡田樊胡凌霍虞万支柯'
+        r'昝管卢莫经房裘缪干解应宗丁宣贲邓郁单杭洪包诸左石崔吉钮龚程嵇邢滑裴'
+        r'陆荣翁荀羊於惠甄曲家封芮羿储靳汲邴糜松井段富巫乌焦巴弓牧隗山谷车侯'
+        r'宓蓬全郗班仰秋仲伊宫宁仇栾暴甘钭厉戎祖武符刘景詹束龙叶幸司韶郜黎蓟'
+        r'薄印宿白怀蒲邰从鄂索咸籍赖卓蔺屠蒙池乔阴胥能苍双温庄晏瞿蛮充慕连茹'
+        r'习宦艾鱼容向古易慎戈廖庾终暨居衡步都耿满弘匡国文寇广禄阙东欧殳沃利'
+        r'蔚越夔隆师巩厍聂晁勾敖融冷訾辛阚那简饶空曾毋沙乜养鞠须丰巢关蒯相查'
+        r'后荆红游竺权逯盖益桓公])',
+        text
+    ):
+        names.add(match.group(1))
+
+    # Pattern 4: "by Name" pattern (common in documents)
+    for match in re.finditer(
+        r'\bby\s+([A-Z][a-z]+)\s+([A-Z][a-z]+)\b',
+        text
+    ):
+        first, last = match.group(1), match.group(2)
+        if _is_likely_person_name(first, last):
+            names.add(f"{first} {last}")
+
+    # Pattern 5: "Name <email>" pattern
+    for match in re.finditer(
+        r'([A-Z][a-z]+)\s+([A-Z][a-z]+)\s+<[\w.+-]+@[\w.-]+>',
+        text
+    ):
+        first, last = match.group(1), match.group(2)
+        if _is_likely_person_name(first, last):
+            names.add(f"{first} {last}")
+
+    return list(names)
+
+
+def _detect_company_names_regex(text: str) -> List[str]:
+    """Detect company names in text using regex patterns.
+
+    
+    Pattern 1: Words followed by org indicators (X Technologies, Y LLC)
+    Pattern 2: "Name & Name" pattern
+    Pattern 3: "Name of Name" pattern
+    
+    IMPORTANT: The regex requires the org indicator word to be at the END
+    of the match to avoid false positives like "was machined in Kansas".
+    """
+    companies = set()
+    
+    # Pattern 1: TitleCase words followed by org indicator (keyword at end)
+    for keyword in _ORG_INDICATOR_WORDS:
+        # Match: "Acme Technologies" but NOT "machined in Kansas"
+        # The keyword must be the last word, preceded by TitleCase words
+        pattern = re.compile(
+            r'\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\s+' + re.escape(keyword) + r')\b',
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(text):
+            company = match.group(1).strip()
+            words = company.split()
+            if 2 <= len(words) <= 6:
+                companies.add(company)
+    
+    # Pattern 2: "Name & Name" (partnerships, law firms)
+    for match in re.finditer(
+        r'([A-Z][A-Za-z]+)\s+&\s+([A-Z][A-Za-z]+)',
+        text
+    ):
+        companies.add(match.group(0).strip())
+    
+    # Pattern 3: "Name of Name" (University of X, State of Y)
+    for match in re.finditer(
+        r'([A-Z][A-Za-z]+\s+of\s+[A-Z][A-Za-z]+)',
+        text
+    ):
+        value = match.group(1).strip()
+        if len(value.split()) >= 3:
+            companies.add(value)
+    
+    return list(companies)
+
+
+def _detect_product_names_regex(text: str) -> List[str]:
+    """Detect product names and model numbers in text using regex patterns.
+
+    
+    Uses indicator patterns (Model, P/N, S/N, version patterns).
+    """
+    products = set()
+    
+    for pattern in _PRODUCT_PATTERNS:
+        for match in pattern.finditer(text):
+            value = match.group(0).strip()
+            if len(value) > 2:
+                products.add(value)
+    
+    return list(products)
+
+
+def extract_entities_from_text_regex(text: str, source: str) -> List[EntityHit]:
+    """Extract named entities from text content using regex patterns (fallback).
+
+    Args:
+        text: Text content to scan.
+        source: Source filename/path for attribution.
+
+    Returns:
+        List of EntityHit objects for detected entities.
+    """
+    hits = []
+
+    for name in _detect_person_names_regex(text):
+        hits.append(EntityHit(
+            entity_type='person',
+            value=name,
+            source=source,
+            confidence=0.7,
+        ))
+
+    for company in _detect_company_names_regex(text):
+        hits.append(EntityHit(
+            entity_type='company',
+            value=company,
+            source=source,
+            confidence=0.6,
+        ))
+
+    for product in _detect_product_names_regex(text):
+        hits.append(EntityHit(
+            entity_type='product',
+            value=product,
+            source=source,
+            confidence=0.5,
+        ))
+
+    return hits
+
+
+def extract_entities_from_text(text: str, source: str) -> List[EntityHit]:
+    """Extract named entities from text content.
+
+    Uses GLiNER when available, falls back to regex patterns.
+
+    Args:
+        text: Text content to scan.
+        source: Source filename/path for attribution.
+
+    Returns:
+        List of EntityHit objects for detected entities.
+    """
+    return _extract_entities_with_gliner(text, source)
+
+
+def extract_entities_from_filename(filename: str) -> List[EntityHit]:
+    """Extract named entities from a filename.
+
+    Args:
+        filename: The filename to scan.
+
+    Returns:
+        List of EntityHit objects for detected entities.
+    """
+    hits = []
+
+    # Person names in filename
+    for name in _detect_person_names_regex(filename):
+        hits.append(EntityHit(
+            entity_type='person',
+            value=name,
+            source=filename,
+            confidence=0.8,  # Higher confidence for filenames
+        ))
+
+    # Company names in filename
+    for company in _detect_company_names_regex(filename):
+        hits.append(EntityHit(
+            entity_type='company',
+            value=company,
+            source=filename,
+            confidence=0.7,
+        ))
+
+    # Product names in filename
+    for product in _detect_product_names_regex(filename):
+        hits.append(EntityHit(
+            entity_type='product',
+            value=product,
+            source=filename,
+            confidence=0.6,
+        ))
+
+    return hits
+
+
 # ---- Batch file discrimination ----
 
 class FileSignature:
@@ -782,15 +1275,19 @@ class FileDiscriminator:
     Uses both content (hashes) and metadata (name, size, type) for discrimination.
     """
 
-    def __init__(self, projects: List[ProjectGroup], sample_size: int = 8192):
+    def __init__(self, projects: List[ProjectGroup], sample_size: int = 8192,
+                 scan_content: bool = False):
         """
         Args:
             projects: List of ProjectGroups to analyze.
             sample_size: Number of bytes to sample for hashing (for large files).
+            scan_content: If True, also scan file contents for named entities.
         """
         self.projects = projects
         self.sample_size = sample_size
+        self.scan_content = scan_content
         self._signatures: List[FileSignature] = []
+        self._entities: Optional[List[EntityHit]] = None
         self._built = False
 
     def _build_signatures(self):
@@ -830,8 +1327,12 @@ class FileDiscriminator:
                         content_hash=content_hash,
                         name_normalized=norm,
                     ))
-        except (zipfile.BadZipFile, Exception):
-            pass
+        except zipfile.BadZipFile as e:
+            _logger.warning("Invalid zip file %s: %s", pf.filepath, e)
+        except PermissionError as e:
+            _logger.warning("Permission denied reading zip %s: %s", pf.filepath, e)
+        except OSError as e:
+            _logger.warning("OS error reading zip %s: %s", pf.filepath, e)
 
     def _signature_from_dir(self, pf: ProjectFile):
         """Build signatures for files in a directory."""
@@ -853,8 +1354,9 @@ class FileDiscriminator:
                     content_hash=content_hash,
                     name_normalized=norm,
                 ))
-        except PermissionError:
-            pass
+        except PermissionError as e:
+            _logger.warning("Permission denied reading directory %s: %s",
+                            pf.filepath, e)
 
     def _hash_file(self, filepath: Path) -> str:
         """Compute MD5 hash of a file (sample first N bytes for large files)."""
@@ -863,7 +1365,11 @@ class FileDiscriminator:
             with open(filepath, 'rb') as f:
                 h.update(f.read(self.sample_size))
             return h.hexdigest()
-        except (PermissionError, OSError):
+        except PermissionError as e:
+            _logger.debug("Permission denied reading file %s: %s", filepath, e)
+            return ""
+        except OSError as e:
+            _logger.debug("OS error reading file %s: %s", filepath, e)
             return ""
 
     def _hash_zip_entry(self, zf: zipfile.ZipFile, name: str) -> str:
@@ -873,7 +1379,8 @@ class FileDiscriminator:
             with zf.open(name) as f:
                 h.update(f.read(self.sample_size))
             return h.hexdigest()
-        except Exception:
+        except Exception as e:
+            _logger.debug("Failed to hash zip entry %s: %s", name, e)
             return ""
 
     @property
@@ -948,6 +1455,65 @@ class FileDiscriminator:
             if s.content_hash not in dup_hashes and id(s) not in similar_names
         ]
 
+    def _extract_entities_from_signatures(self):
+        """Extract named entities from all file signatures."""
+        if self._entities is not None:
+            return
+
+        self._entities = []
+
+        for sig in self._signatures:
+            # Extract entities from filename
+            self._entities.extend(extract_entities_from_filename(sig.filename))
+
+        # Optionally scan file contents for entities
+        if self.scan_content and HAS_PYPDF:
+            for sig in self._signatures:
+                if sig.file_type == 'document' and sig.filename.lower().endswith('.pdf'):
+                    text = self._extract_pdf_text_for_sig(sig)
+                    if text:
+                        self._entities.extend(extract_entities_from_text(text, sig.filename))
+
+    def _extract_pdf_text_for_sig(self, sig: FileSignature) -> str:
+        """Extract text from a PDF file signature."""
+        if sig.filepath.suffix.lower() == '.zip':
+            return extract_pdf_text_from_zip(sig.filepath, sig.filename)
+        else:
+            return extract_pdf_text(sig.filepath)
+
+    @property
+    def entities(self) -> List[EntityHit]:
+        """Get all extracted named entities."""
+        self._build_signatures()
+        self._extract_entities_from_signatures()
+        return self._entities
+
+    def find_entities(self, entity_type: Optional[str] = None) -> List[EntityHit]:
+        """Find named entities, optionally filtered by type.
+
+        Args:
+            entity_type: Filter by type ('person', 'company', 'product').
+                        If None, return all entities.
+
+        Returns:
+            List of EntityHit objects.
+        """
+        if entity_type:
+            return [e for e in self.entities if e.entity_type == entity_type]
+        return self.entities
+
+    def find_people(self) -> List[EntityHit]:
+        """Find all person names detected."""
+        return self.find_entities('person')
+
+    def find_companies(self) -> List[EntityHit]:
+        """Find all company names detected."""
+        return self.find_entities('company')
+
+    def find_products(self) -> List[EntityHit]:
+        """Find all product names detected."""
+        return self.find_entities('product')
+
     def summary(self) -> str:
         """Get a human-readable summary of file discrimination."""
         self._build_signatures()
@@ -977,5 +1543,55 @@ class FileDiscriminator:
         unique = self.find_unique()
         lines.append("")
         lines.append(f"Unique files: {len(unique)}")
+
+        # Named entities
+        all_entities = self.entities
+        if all_entities:
+            lines.append("")
+            lines.append("Named Entities:")
+            
+            # Count by type
+            entity_counts = defaultdict(int)
+            for e in all_entities:
+                entity_counts[e.entity_type] += 1
+            for etype, count in sorted(entity_counts.items()):
+                lines.append(f"  {etype}: {count}")
+            
+            lines.append("")
+            lines.append("People detected:")
+            people = self.find_people()
+            if people:
+                # Deduplicate and show
+                seen = set()
+                for e in people:
+                    if e.value not in seen:
+                        lines.append(f"  - {e.value} (from {e.source})")
+                        seen.add(e.value)
+            else:
+                lines.append("  (none)")
+            
+            lines.append("")
+            lines.append("Companies detected:")
+            companies = self.find_companies()
+            if companies:
+                seen = set()
+                for e in companies:
+                    if e.value not in seen:
+                        lines.append(f"  - {e.value} (from {e.source})")
+                        seen.add(e.value)
+            else:
+                lines.append("  (none)")
+            
+            lines.append("")
+            lines.append("Products detected:")
+            products = self.find_products()
+            if products:
+                seen = set()
+                for e in products:
+                    if e.value not in seen:
+                        lines.append(f"  - {e.value} (from {e.source})")
+                        seen.add(e.value)
+            else:
+                lines.append("  (none)")
 
         return '\n'.join(lines)
