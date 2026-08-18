@@ -11,14 +11,256 @@ READ-ONLY: This module is strictly READ-ONLY. It only reads file metadata
 and content for analysis purposes. No files are created, modified, or deleted.
 """
 
+from __future__ import annotations
+
 import re
+import io
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 from datetime import datetime
 import zipfile
 
+try:
+    from PyPDF2 import PdfReader
+    HAS_PYPDF = True
+except ImportError:
+    HAS_PYPDF = False
+
 from .read import ProjectFile, ProjectGroup
+
+
+# ---- Sensitivity detection patterns ----
+
+# Common company/organization name patterns (keywords that suggest a company)
+_COMPANY_KEYWORDS = [
+    'llc', 'inc', 'corp', 'corporation', 'ltd', 'gmbh', 'sa', 'plc',
+    'company', 'co.', 'industries', 'technologies', 'systems', 'labs',
+    'medical', 'solutions', 'group', 'holdings', 'partners',
+]
+
+# Title patterns that often precede person names
+_PERSON_TITLE_PATTERN = re.compile(
+    r'(?:Mr|Mrs|Ms|Dr|Prof|CEO|COO|CTO|CFO|VP|Director|Manager|Engineer)'
+    r'[.\s]+([A-Z][a-z]+)\s+([A-Z][a-z]+)',
+)
+
+# Location patterns
+_LOCATION_PATTERNS = [
+    # US States
+    r'\b(?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming)\b',
+    # Countries (English)
+    r'\b(?:United States|USA|America|China|Japan|Germany|France|United Kingdom|UK|Canada|Australia|India|Brazil|Mexico|Italy|Spain|Korea|Hong Kong|Singapore|Switzerland|Netherlands|Sweden|Norway|Denmark|Finland|Belgium|Austria|Ireland|Portugal|Greece|Turkey|Russia|South Africa|Argentina|Chile|Colombia)\b',
+    # Countries (Chinese)
+    r'(?:中国|美国|日本|德国|法国|英国|加拿大|澳大利亚|印度|巴西|墨西哥|意大利|西班牙|韩国|香港|新加坡|瑞士|荷兰|瑞典|挪威|丹麦|芬兰|比利时|奥地利|爱尔兰|葡萄牙|希腊|土耳其|俄罗斯|南非|阿根廷|智利|哥伦比亚)',
+    # Chinese Provinces
+    r'(?:北京|上海|天津|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾|内蒙古|广西|西藏|宁夏|新疆|香港|澳门)',
+    # Chinese Cities
+    r'(?:北京|上海|广州|深圳|杭州|南京|成都|重庆|武汉|西安|长沙|郑州|济南|青岛|大连|沈阳|哈尔滨|长春|昆明|贵阳|南宁|福州|厦门|南昌|合肥|石家庄|太原|兰州|银川|西宁|乌鲁木齐|拉萨|呼和浩特|海口|三亚|东莞|佛山|苏州|无锡|常州|南通|徐州|扬州|镇江|泰州|盐城|淮安|宿迁|连云港|常州|温州|宁波|绍兴|嘉兴|湖州|金华|衢州|舟山|台州|丽水|杭州|南京|苏州|无锡|常州|徐州|南通|扬州|镇江|泰州|盐城|淮安|宿迁|连云港)',
+    # Common city patterns (City, State or City, Country)
+    r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+,?\s+(?:[A-Z]{2}|\w+)\b',
+]
+
+# Address pattern (street addresses - English)
+_ADDRESS_PATTERN_EN = re.compile(
+    r'\b\d+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:St|St|Ave|Blvd|Dr|Ln|Rd|Way|Pl|Ct|Ter|Cir)\.?\b',
+    re.IGNORECASE,
+)
+
+# Address pattern (Chinese addresses)
+_ADDRESS_PATTERN_CN = re.compile(
+    r'(?:[^\s]{2,10}(?:省|市|区|县|镇|乡|村|路|街|大道|巷|弄|号|室|楼|栋|座|层|楼|单元))',
+)
+
+# ZIP/Postal code patterns (US)
+_US_ZIP_PATTERN = re.compile(r'\b\d{5}(?:-\d{4})?\b')
+
+# ZIP/Postal code patterns (China - 6 digits)
+_CN_ZIP_PATTERN = re.compile(r'\b\d{6}\b')
+
+
+class SensitivityFlag:
+    """A flag indicating potentially sensitive information found in a file."""
+
+    def __init__(self, flag_type: str, value: str, source: str,
+                 context: str = "", confidence: float = 1.0):
+        self.flag_type = flag_type  # 'company', 'person', 'location', 'email', 'phone'
+        self.value = value          # The detected sensitive value
+        self.source = source        # Filename or path where it was found
+        self.context = context      # Surrounding text/context
+        self.confidence = confidence  # 0.0 to 1.0
+
+    def __repr__(self):
+        return (f"SensitivityFlag(type={self.flag_type!r}, value={self.value!r}, "
+                f"source={self.source!r})")
+
+
+def extract_pdf_text(filepath: Path, max_pages: int = 5) -> str:
+    """Extract text from a PDF file.
+
+    Args:
+        filepath: Path to the PDF file.
+        max_pages: Maximum number of pages to extract (to limit processing).
+
+    Returns:
+        Extracted text as a string, or empty string if extraction fails.
+    """
+    if not HAS_PYPDF:
+        return ""
+    try:
+        reader = PdfReader(str(filepath))
+        pages = []
+        for i in range(min(max_pages, len(reader.pages))):
+            pages.append(reader.pages[i].extract_text() or "")
+        return '\n'.join(pages)
+    except Exception:
+        return ""
+
+
+def extract_pdf_text_from_zip(zip_path: Path, zip_entry: str, max_pages: int = 5) -> str:
+    """Extract text from a PDF file inside a zip archive.
+
+    Args:
+        zip_path: Path to the zip file.
+        zip_entry: Path of the PDF entry inside the zip.
+        max_pages: Maximum number of pages to extract.
+
+    Returns:
+        Extracted text as a string, or empty string if extraction fails.
+    """
+    if not HAS_PYPDF:
+        return ""
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            with zf.open(zip_entry) as pdf_file:
+                reader = PdfReader(io.BytesIO(pdf_file.read()))
+                pages = []
+                for i in range(min(max_pages, len(reader.pages))):
+                    pages.append(reader.pages[i].extract_text() or "")
+                return '\n'.join(pages)
+    except Exception:
+        return ""
+
+
+def scan_text_for_sensitivity(text: str, source: str) -> List[SensitivityFlag]:
+    """Scan extracted text for sensitive information.
+
+    Args:
+        text: Text content to scan.
+        source: Source filename/path for attribution.
+
+    Returns:
+        List of SensitivityFlag objects for detected sensitive information.
+    """
+    flags = []
+    text_lower = text.lower()
+
+    # Email addresses
+    for match in re.finditer(r'[\w\.-]+@[\w\.-]+\.\w+', text):
+        flags.append(SensitivityFlag(
+            flag_type='email',
+            value=match.group(),
+            source=source,
+            context=_get_context(text, match.start()),
+        ))
+
+    # Phone numbers
+    for match in re.finditer(
+        r'(?:\+\d{1,3}[-.\s]\d{3,4}[-.\s]\d{3,8}|\(?\d{3}\)?[-.\s]\d{3,4}[-.\s]\d{4})',
+        text
+    ):
+        flags.append(SensitivityFlag(
+            flag_type='phone',
+            value=match.group(),
+            source=source,
+            context=_get_context(text, match.start()),
+        ))
+
+    # Company names (look for patterns like "Company Name LLC" or "Name Technologies")
+    for keyword in _COMPANY_KEYWORDS:
+        pattern = re.compile(
+            r'([A-Z][A-Za-z\s.&]+(?:' + keyword + r'))',
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(text):
+            company = match.group(1).strip()
+            if 2 <= len(company.split()) <= 5:  # Reasonable company name length
+                flags.append(SensitivityFlag(
+                    flag_type='company',
+                    value=company,
+                    source=source,
+                    context=_get_context(text, match.start()),
+                    confidence=0.6,
+                ))
+
+    # Person names via titles (e.g., "CEO Lech Murawski", "Dr. John Smith")
+    for match in _PERSON_TITLE_PATTERN.finditer(text):
+        first, last = match.group(1), match.group(2)
+        name = f"{first} {last}"
+        flags.append(SensitivityFlag(
+            flag_type='person',
+            value=name,
+            source=source,
+            context=_get_context(text, match.start()),
+            confidence=0.8,
+        ))
+
+    # Locations (states, countries, Chinese provinces/cities)
+    for pattern in _LOCATION_PATTERNS:
+        for match in re.finditer(pattern, text):
+            location = match.group().strip()
+            if len(location) > 2:  # Avoid false positives
+                flags.append(SensitivityFlag(
+                    flag_type='location',
+                    value=location,
+                    source=source,
+                    context=_get_context(text, match.start()),
+                    confidence=0.7,
+                ))
+
+    # US ZIP codes (indicate addresses)
+    for match in _US_ZIP_PATTERN.finditer(text):
+        flags.append(SensitivityFlag(
+            flag_type='address',
+            value=match.group(),
+            source=source,
+            context=_get_context(text, match.start()),
+            confidence=0.5,
+        ))
+
+    # Chinese ZIP codes (6 digits)
+    for match in _CN_ZIP_PATTERN.finditer(text):
+        flags.append(SensitivityFlag(
+            flag_type='address',
+            value=match.group(),
+            source=source,
+            context=_get_context(text, match.start()),
+            confidence=0.4,  # Lower confidence - 6 digits could be other things
+        ))
+
+    # Chinese addresses
+    for match in _ADDRESS_PATTERN_CN.finditer(text):
+        flags.append(SensitivityFlag(
+            flag_type='address',
+            value=match.group(),
+            source=source,
+            context=_get_context(text, match.start()),
+            confidence=0.6,
+        ))
+
+    return flags
+
+
+def _get_context(text: str, pos: int, window: int = 50) -> str:
+    """Get surrounding context text around a position."""
+    start = max(0, pos - window)
+    end = min(len(text), pos + window)
+    context = text[start:end].replace('\n', ' ').strip()
+    if start > 0:
+        context = "..." + context
+    if end < len(text):
+        context = context + "..."
+    return context
 
 
 # File type classifications
@@ -86,22 +328,6 @@ def classify_file(filename: str) -> str:
         if ext in exts:
             return file_type
     return 'other'
-
-
-class SensitivityFlag:
-    """A flag indicating potentially sensitive information found in a file."""
-
-    def __init__(self, flag_type: str, value: str, source: str,
-                 context: str = "", confidence: float = 1.0):
-        self.flag_type = flag_type  # 'company', 'person', 'location', 'email', 'phone'
-        self.value = value          # The detected sensitive value
-        self.source = source        # Filename or path where it was found
-        self.context = context      # Surrounding text/context
-        self.confidence = confidence  # 0.0 to 1.0
-
-    def __repr__(self):
-        return (f"SensitivityFlag(type={self.flag_type!r}, value={self.value!r}, "
-                f"source={self.source!r})")
 
 
 class FileCatalog:
@@ -207,33 +433,33 @@ class FileCatalog:
         except PermissionError:
             pass
 
-    def get_sensitivity_flags(self) -> List[SensitivityFlag]:
-        """Analyze filenames for sensitive information.
+    def get_sensitivity_flags(self, scan_pdf_content: bool = True) -> List[SensitivityFlag]:
+        """Analyze filenames AND PDF content for sensitive information.
 
-        Scans filenames for patterns that indicate:
+        Scans for patterns that indicate:
         - Company names
         - Person names
         - Email addresses
         - Phone numbers
+        - Locations / addresses
         - Document types that may contain sensitive data
+
+        Args:
+            scan_pdf_content: If True, also extract and scan PDF text content.
         """
         if self._sensitivity_flags is not None:
             return self._sensitivity_flags
 
         self._sensitivity_flags = []
 
-        # Patterns for sensitive information detection
+        # --- Phase 1: Scan filenames ---
         email_pattern = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
-        # Phone pattern: require at least one non-digit separator or + prefix
-        # to avoid matching dates (e.g., 20210113)
         phone_pattern = re.compile(
             r'(?:'
-            r'\+\d{1,3}[-.\s]\d{3,4}[-.\s]\d{3,8}'  # +1 555-123-4567
-            r'|\(?\d{3}\)?[-.\s]\d{3,4}[-.\s]\d{4}'  # (555) 123-4567 or 555-123-4567
+            r'\+\d{1,3}[-.\s]\d{3,4}[-.\s]\d{3,8}'
+            r'|\(?\d{3}\)?[-.\s]\d{3,4}[-.\s]\d{4}'
             r')'
         )
-
-        # Known document types that are typically sensitive
         sensitive_doc_types = [
             'nda', 'non-disclosure', 'confidential',
             'invoice', 'quotation', 'proposal', 'contract',
@@ -258,37 +484,56 @@ class FileCatalog:
                 pass
 
         for filename in files_to_scan:
-            # Skip directory entries
             if filename.endswith('/'):
                 continue
 
-            # Check for email addresses
             for match in email_pattern.finditer(filename):
                 self._sensitivity_flags.append(SensitivityFlag(
-                    flag_type='email',
-                    value=match.group(),
-                    source=filename,
+                    flag_type='email', value=match.group(), source=filename,
                 ))
-
-            # Check for phone numbers
             for match in phone_pattern.finditer(filename):
                 self._sensitivity_flags.append(SensitivityFlag(
-                    flag_type='phone',
-                    value=match.group(),
-                    source=filename,
+                    flag_type='phone', value=match.group(), source=filename,
                 ))
-
-            # Check for sensitive document types in filename
             filename_lower = filename.lower()
             for doc_type in sensitive_doc_types:
                 if doc_type in filename_lower:
                     self._sensitivity_flags.append(SensitivityFlag(
-                        flag_type='sensitive_doc',
-                        value=doc_type,
-                        source=filename,
-                        confidence=0.7,
+                        flag_type='sensitive_doc', value=doc_type,
+                        source=filename, confidence=0.7,
                     ))
-                    break  # One flag per file for doc type
+                    break
+
+        # --- Phase 2: Scan PDF content ---
+        if scan_pdf_content and HAS_PYPDF:
+            pdf_files = []
+            if self.project_file.is_zipped:
+                try:
+                    with zipfile.ZipFile(self.project_file.filepath, 'r') as zf:
+                        pdf_files = [
+                            n for n in zf.namelist()
+                            if n.lower().endswith('.pdf') and not n.endswith('/')
+                        ]
+                except (zipfile.BadZipFile, Exception):
+                    pass
+                for pdf_entry in pdf_files:
+                    text = extract_pdf_text_from_zip(self.project_file.filepath, pdf_entry)
+                    if text:
+                        self._sensitivity_flags.extend(
+                            scan_text_for_sensitivity(text, pdf_entry)
+                        )
+            else:
+                try:
+                    for filepath in self.project_file.filepath.rglob('*'):
+                        if filepath.is_file() and filepath.suffix.lower() == '.pdf':
+                            text = extract_pdf_text(filepath)
+                            if text:
+                                rel = str(filepath.relative_to(self.project_file.filepath))
+                                self._sensitivity_flags.extend(
+                                    scan_text_for_sensitivity(text, rel)
+                                )
+                except PermissionError:
+                    pass
 
         return self._sensitivity_flags
 
