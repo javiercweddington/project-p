@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import re
 import io
+import os
+import hashlib
+import difflib
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from collections import defaultdict
@@ -620,3 +623,359 @@ def catalog_project(project_file: ProjectFile) -> FileCatalog:
 def catalog_project_group(project_group: ProjectGroup) -> ProjectCatalog:
     """Convenience function to create a ProjectCatalog for a ProjectGroup."""
     return ProjectCatalog(project_group)
+
+
+# ---- Consolidation suggestions ----
+
+class ConsolidationSuggestion:
+    """A suggestion to consolidate two projects."""
+
+    def __init__(self, project_a: ProjectGroup, project_b: ProjectGroup,
+                 reason: str, confidence: float = 1.0):
+        self.project_a = project_a
+        self.project_b = project_b
+        self.reason = reason
+        self.confidence = confidence  # 0.0 to 1.0
+
+    def __repr__(self):
+        return (f"ConsolidationSuggestion({self.project_a.project_name!r} + "
+                f"{self.project_b.project_name!r}, reason={self.reason!r})")
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize a project name for comparison."""
+    # Lowercase, remove special chars, collapse whitespace
+    name = name.lower().strip()
+    name = re.sub(r'[^a-z0-9\s-]', '', name)
+    name = re.sub(r'\s+', ' ', name)
+    return name
+
+
+def suggest_consolidations(
+    projects: List[ProjectGroup],
+    name_threshold: float = 0.8
+) -> List[ConsolidationSuggestion]:
+    """Suggest projects that should be consolidated.
+
+    Only suggests consolidation when:
+    1. Same company (or very similar company name - typo case) AND same product
+    2. Different project names (indicating version split or naming inconsistency)
+
+    Args:
+        projects: List of ProjectGroups to compare.
+        name_threshold: Similarity threshold for company name typo detection (0.0 to 1.0).
+
+    Returns:
+        List of ConsolidationSuggestion objects.
+    """
+    suggestions = []
+    compared = set()
+
+    for i, a in enumerate(projects):
+        for j, b in enumerate(projects):
+            if i >= j:
+                continue  # Only compare each pair once
+
+            pair_key = (a.project_name, b.project_name)
+            if pair_key in compared:
+                continue
+            compared.add(pair_key)
+
+            # Skip if project names are identical (already same project)
+            if a.project_name == b.project_name:
+                continue
+
+            # --- Check company match (exact or near-typo) ---
+            company_exact = a.company.lower() == b.company.lower()
+            company_similar = False
+            if not company_exact:
+                company_sim = difflib.SequenceMatcher(None, a.company.lower(), b.company.lower()).ratio()
+                company_similar = company_sim >= name_threshold
+
+            if not company_exact and not company_similar:
+                continue  # Different companies - never suggest
+
+            # --- Check product match (exact) ---
+            if a.product.lower() != b.product.lower():
+                continue  # Different products - never suggest
+
+            # Same company (or typo) + same product + different project name
+            if company_exact:
+                reason = (f"Same company ({a.company}) + product ({a.product}) "
+                          f"but different project names")
+                confidence = 0.9
+            else:
+                reason = (f"Similar company name ({a.company} vs {b.company}, "
+                          f"similarity: {company_sim:.2f}) + same product ({a.product})")
+                confidence = company_sim * 0.9
+
+            suggestions.append(ConsolidationSuggestion(
+                project_a=a,
+                project_b=b,
+                reason=reason,
+                confidence=confidence,
+            ))
+
+    return suggestions
+
+
+def print_consolidation_suggestions(
+    projects: List[ProjectGroup],
+    name_threshold: float = 0.8
+) -> None:
+    """Print consolidation suggestions in a human-readable format."""
+    suggestions = suggest_consolidations(projects, name_threshold)
+
+    if not suggestions:
+        print("No consolidation suggestions found.")
+        return
+
+    print(f"Consolidation Suggestions: {len(suggestions)}")
+    print("=" * 60)
+
+    for i, s in enumerate(suggestions, 1):
+        print(f"\n{i}. {s.project_a.project_name} + {s.project_b.project_name}")
+        print(f"   Reason: {s.reason}")
+        print(f"   Confidence: {s.confidence:.0%}")
+        print(f"   Company A: {s.project_a.company}, Product A: {s.project_a.product}")
+        print(f"   Company B: {s.project_b.company}, Product B: {s.project_b.product}")
+        print(f"   Versions A: {s.project_a.version_count}, "
+              f"Versions B: {s.project_b.version_count}")
+
+
+# ---- Batch file discrimination ----
+
+class FileSignature:
+    """A signature for a file used for comparison."""
+
+    def __init__(self, filepath: Path, project_name: str, version: int,
+                 filename: str, file_type: str, size: int,
+                 content_hash: str = "", name_normalized: str = ""):
+        self.filepath = filepath
+        self.project_name = project_name
+        self.version = version
+        self.filename = filename
+        self.file_type = file_type
+        self.size = size
+        self.content_hash = content_hash
+        self.name_normalized = name_normalized or _normalize_name(filename)
+
+
+class DuplicateGroup:
+    """A group of files with identical content."""
+
+    def __init__(self, content_hash: str):
+        self.content_hash = content_hash
+        self.files: List[FileSignature] = []
+
+    def add(self, sig: FileSignature):
+        self.files.append(sig)
+
+    def __repr__(self):
+        return (f"DuplicateGroup(hash={self.content_hash[:12]}..., "
+                f"count={len(self.files)})")
+
+
+class FileDiscriminator:
+    """Compare files across projects to find duplicates, similarities, and unique files.
+
+    Uses both content (hashes) and metadata (name, size, type) for discrimination.
+    """
+
+    def __init__(self, projects: List[ProjectGroup], sample_size: int = 8192):
+        """
+        Args:
+            projects: List of ProjectGroups to analyze.
+            sample_size: Number of bytes to sample for hashing (for large files).
+        """
+        self.projects = projects
+        self.sample_size = sample_size
+        self._signatures: List[FileSignature] = []
+        self._built = False
+
+    def _build_signatures(self):
+        """Build file signatures for all files in all projects."""
+        if self._built:
+            return
+
+        self._signatures = []
+
+        for pg in self.projects:
+            for pf in pg.files:
+                if pf.is_zipped:
+                    self._signature_from_zip(pf)
+                else:
+                    self._signature_from_dir(pf)
+
+        self._built = True
+
+    def _signature_from_zip(self, pf: ProjectFile):
+        """Build signatures for files in a zip archive."""
+        try:
+            with zipfile.ZipFile(pf.filepath, 'r') as zf:
+                for name in zf.namelist():
+                    if name.endswith('/'):
+                        continue
+                    file_type = classify_file(name)
+                    info = zf.getinfo(name)
+                    content_hash = self._hash_zip_entry(zf, name)
+                    norm = _normalize_name(Path(name).stem)
+                    self._signatures.append(FileSignature(
+                        filepath=pf.filepath,
+                        project_name=pf.project_name,
+                        version=pf.version,
+                        filename=name,
+                        file_type=file_type,
+                        size=info.file_size,
+                        content_hash=content_hash,
+                        name_normalized=norm,
+                    ))
+        except (zipfile.BadZipFile, Exception):
+            pass
+
+    def _signature_from_dir(self, pf: ProjectFile):
+        """Build signatures for files in a directory."""
+        try:
+            for filepath in pf.filepath.rglob('*'):
+                if not filepath.is_file() or filepath.name.startswith('._'):
+                    continue
+                file_type = classify_file(filepath.name)
+                size = filepath.stat().st_size
+                content_hash = self._hash_file(filepath)
+                norm = _normalize_name(filepath.stem)
+                self._signatures.append(FileSignature(
+                    filepath=filepath,
+                    project_name=pf.project_name,
+                    version=pf.version,
+                    filename=filepath.name,
+                    file_type=file_type,
+                    size=size,
+                    content_hash=content_hash,
+                    name_normalized=norm,
+                ))
+        except PermissionError:
+            pass
+
+    def _hash_file(self, filepath: Path) -> str:
+        """Compute MD5 hash of a file (sample first N bytes for large files)."""
+        h = hashlib.md5()
+        try:
+            with open(filepath, 'rb') as f:
+                h.update(f.read(self.sample_size))
+            return h.hexdigest()
+        except (PermissionError, OSError):
+            return ""
+
+    def _hash_zip_entry(self, zf: zipfile.ZipFile, name: str) -> str:
+        """Compute MD5 hash of a zip entry (sample first N bytes)."""
+        h = hashlib.md5()
+        try:
+            with zf.open(name) as f:
+                h.update(f.read(self.sample_size))
+            return h.hexdigest()
+        except Exception:
+            return ""
+
+    @property
+    def signatures(self) -> List[FileSignature]:
+        """Get all file signatures."""
+        self._build_signatures()
+        return self._signatures
+
+    def find_duplicates(self) -> List[DuplicateGroup]:
+        """Find files with identical content (same hash)."""
+        self._build_signatures()
+        hash_groups = defaultdict(list)
+        for sig in self._signatures:
+            if sig.content_hash:
+                hash_groups[sig.content_hash].append(sig)
+
+        return [
+            DuplicateGroup(h) for h, sigs in hash_groups.items()
+            if len(sigs) > 1
+        ]
+
+    def find_similar_names(self, threshold: float = 0.8) -> List[Tuple[FileSignature, FileSignature, float]]:
+        """Find files with similar names but potentially different content."""
+        self._build_signatures()
+        similar = []
+        compared = set()
+
+        for i, a in enumerate(self._signatures):
+            for j, b in enumerate(self._signatures):
+                if i >= j:
+                    continue
+                pair = (id(a), id(b))
+                if pair in compared:
+                    continue
+                compared.add(pair)
+
+                sim = difflib.SequenceMatcher(None, a.name_normalized, b.name_normalized).ratio()
+                if sim >= threshold and a.name_normalized != b.name_normalized:
+                    similar.append((a, b, sim))
+
+        return sorted(similar, key=lambda x: x[2], reverse=True)
+
+    def find_by_type(self, file_type: str) -> List[FileSignature]:
+        """Find all files of a given type."""
+        self._build_signatures()
+        return [s for s in self._signatures if s.file_type == file_type]
+
+    def find_unique(self) -> List[FileSignature]:
+        """Find files that are unique (no duplicate by hash, no similar name)."""
+        self._build_signatures()
+        dup_hashes = set()
+        hash_groups = defaultdict(list)
+        for sig in self._signatures:
+            if sig.content_hash:
+                hash_groups[sig.content_hash].append(sig)
+        for h, sigs in hash_groups.items():
+            if len(sigs) > 1:
+                dup_hashes.add(h)
+
+        similar_names = set()
+        for i, a in enumerate(self._signatures):
+            for j, b in enumerate(self._signatures):
+                if i >= j:
+                    continue
+                sim = difflib.SequenceMatcher(None, a.name_normalized, b.name_normalized).ratio()
+                if sim >= 0.8 and a.name_normalized != b.name_normalized:
+                    similar_names.add(id(a))
+                    similar_names.add(id(b))
+
+        return [
+            s for s in self._signatures
+            if s.content_hash not in dup_hashes and id(s) not in similar_names
+        ]
+
+    def summary(self) -> str:
+        """Get a human-readable summary of file discrimination."""
+        self._build_signatures()
+        dups = self.find_duplicates()
+        by_type = defaultdict(list)
+        for s in self._signatures:
+            by_type[s.file_type].append(s)
+
+        lines = [
+            "File Discrimination Summary",
+            f"Projects analyzed: {len(self.projects)}",
+            f"Total files: {len(self._signatures)}",
+            "",
+            "Files by type:",
+        ]
+        for file_type in sorted(by_type.keys()):
+            sigs = by_type[file_type]
+            lines.append(f"  {file_type}: {len(sigs)}")
+
+        lines.append("")
+        lines.append(f"Duplicate groups: {len(dups)}")
+        for dup in dups:
+            lines.append(f"  Hash {dup.content_hash[:12]}... ({len(dup.files)} files):")
+            for f in dup.files:
+                lines.append(f"    - {f.filename} ({f.project_name} v{f.version})")
+
+        unique = self.find_unique()
+        lines.append("")
+        lines.append(f"Unique files: {len(unique)}")
+
+        return '\n'.join(lines)

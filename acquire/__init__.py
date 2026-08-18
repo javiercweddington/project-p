@@ -19,9 +19,12 @@ from .catalog import (
     FileCatalog,
     ProjectCatalog,
     SensitivityFlag,
+    ConsolidationSuggestion,
     catalog_project,
     catalog_project_group,
     classify_file,
+    suggest_consolidations,
+    print_consolidation_suggestions,
 )
 
 __all__ = [
@@ -42,7 +45,10 @@ __all__ = [
     "FileCatalog",
     "ProjectCatalog",
     "SensitivityFlag",
+    "ConsolidationSuggestion",
     "catalog_project",
     "catalog_project_group",
     "classify_file",
+    "suggest_consolidations",
+    "print_consolidation_suggestions",
 ]
