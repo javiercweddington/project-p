@@ -910,99 +910,24 @@ _PRODUCT_PATTERNS = [
 ]
 
 
-# Words that are commonly capitalized in documents but are NOT person names
-_NOT_PERSON_NAMES = {
-    # Articles, prepositions, conjunctions
-    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-    'of', 'with', 'by', 'from', 'is', 'it', 'its', 'as', 'be', 'was',
-    'are', 'were', 'been', 'has', 'have', 'had', 'do', 'does', 'did',
-    'will', 'would', 'could', 'should', 'may', 'might', 'shall', 'can',
-    'that', 'this', 'these', 'those', 'which', 'who', 'whom', 'whose',
-    'what', 'when', 'where', 'how', 'if', 'then', 'than', 'not', 'no',
-    'nor', 'so', 'yet', 'both', 'each', 'every', 'all', 'any', 'some',
-    'such', 'only', 'own', 'same', 'into', 'over', 'after', 'before',
-    'up', 'out', 'just', 'about', 'also', 'being', 'done', 'here',
-    'there', 'other', 'another', 'much', 'many', 'more', 'most',
-    # Common business/legal document words
-    'product', 'service', 'company', 'parties', 'party', 'agreement',
-    'contract', 'work', 'works', 'works', 'information', 'confidential',
-    'disclosure', 'use', 'terms', 'conditions', 'rights', 'obligations',
-    'liability', 'indemnity', 'warranty', 'limitation', 'termination',
-    'notice', 'notices', 'section', 'sections', 'clause', 'clauses',
-    'exhibit', 'schedule', 'appendix', 'attachment', 'amendment',
-    'representations', 'warranties', 'covenants', 'general', 'specific',
-    'mutual', 'sole', 'exclusive', 'nonexclusive', 'written', 'written',
-    'either', 'neither', 'authorized', 'representative', 'representatives',
-    'legal', 'legal', 'business', 'purpose', 'purposes', 'scope',
-    'definition', 'definitions', 'interpreted', 'meaning', 'means',
-    'including', 'include', 'includes', 'included', 'exclude', 'excludes',
-    'limited', 'limit', 'limits', 'unlimited', 'reasonable', 'reasonably',
-    'good', 'faith', 'efforts', 'best', 'commercial', 'market',
-    'knowledge', 'aware', 'believe', 'know', 'understand', 'agree',
-    'consent', 'approval', 'permission', 'license', 'licenses',
-    'proprietary', 'intellectual', 'property', 'patent', 'trademark',
-    'copyright', 'trade', 'secret', 'secrets', 'technology', 'data',
-    'material', 'materials', 'document', 'documents', 'record', 'records',
-    'file', 'files', 'copy', 'copies', 'original', 'version', 'versions',
-    'date', 'dates', 'time', 'times', 'period', 'periods', 'term', 'terms',
-    'day', 'days', 'week', 'weeks', 'month', 'months', 'year', 'years',
-    'prior', 'previous', 'subsequent', 'following', 'hereof', 'herein',
-    'thereof', 'therein', 'hereby', 'thereby', 'whereof', 'wherein',
-    'further', 'more', 'less', 'least', 'least', 'least', 'least',
-    'based', 'basis', 'upon', 'among', 'between', 'through', 'during',
-    'within', 'without', 'against', 'around', 'along', 'across',
-    'department', 'division', 'office', 'offices', 'location', 'locations',
-    'address', 'contact', 'phone', 'email', 'website', 'web', 'internet',
-    'system', 'systems', 'software', 'hardware', 'equipment', 'device',
-    'devices', 'component', 'components', 'part', 'parts', 'unit', 'units',
-    'model', 'models', 'type', 'types', 'kind', 'kinds', 'class', 'classes',
-    'category', 'categories', 'group', 'groups', 'set', 'sets', 'list',
-    'lists', 'table', 'tables', 'chart', 'charts', 'figure', 'figures',
-    'page', 'pages', 'line', 'lines', 'item', 'items', 'entry', 'entries',
-    'total', 'subtotal', 'net', 'gross', 'amount', 'amounts', 'price',
-    'prices', 'cost', 'costs', 'fee', 'fees', 'charge', 'charges',
-    'payment', 'payments', 'invoice', 'invoices', 'order', 'orders',
-    'delivery', 'deliveries', 'shipment', 'shipments', 'shipping',
-    'warranty', 'return', 'returns', 'exchange', 'refund', 'refunds',
-    'credit', 'debit', 'balance', 'account', 'accounts', 'bank', 'banks',
-    'financial', 'fiscal', 'tax', 'taxes', 'insurance', 'coverage',
-    'risk', 'risks', 'loss', 'losses', 'damage', 'damages', 'injury',
-    'health', 'safety', 'environment', 'regulation', 'regulations',
-    'compliance', 'law', 'laws', 'legal', 'statute', 'statutes',
-    'rule', 'rules', 'policy', 'policies', 'procedure', 'procedures',
-    'standard', 'standards', 'requirement', 'requirements', 'specification',
-    'design', 'development', 'testing', 'test', 'tests', 'quality',
-    'control', 'assurance', 'management', 'plan', 'plans', 'project',
-    'projects', 'program', 'programs', 'process', 'processes', 'method',
-    'methods', 'approach', 'approaches', 'strategy', 'strategies',
-    'analysis', 'research', 'study', 'studies', 'report', 'reports',
-    'review', 'reviews', 'audit', 'audits', 'inspection', 'inspections',
-    'evaluation', 'assessment', 'monitoring', 'maintenance', 'support',
-    'training', 'education', 'consulting', 'advisory', 'professional',
-    'technical', 'operational', 'administrative', 'executive', 'senior',
-    'junior', 'middle', 'lower', 'upper', 'first', 'second', 'third',
-    'final', 'initial', 'early', 'late', 'new', 'old', 'current',
-    'former', 'existing', 'potential', 'actual', 'possible', 'likely',
-    'unlikely', 'certain', 'uncertain', 'required', 'optional', 'may',
-    'shall', 'must', 'will', 'shall', 'may', 'might', 'should', 'could',
-    'documentation', 'possession', 'possessed', 'possession', 'modification',
-    'modifications', 'model', 'models', 'modifying', 'modify',
-}
-
+# Simplified name validation - GLiNER handles entity detection,
+# regex fallback uses minimal heuristics only.
 
 def _is_likely_person_name(first: str, last: str) -> bool:
     """Heuristic check: does this look like a person name?
 
-    Uses structural heuristics rather than hardcoded lists:
-    - Both words are Title Case
+    Uses minimal structural heuristics:
     - Reasonable length (2-20 chars each)
-    - Not common false-positive words
+    - Title Case format
     """
-    if first.lower() in _NOT_PERSON_NAMES or last.lower() in _NOT_PERSON_NAMES:
-        return False
     if len(first) < 2 or len(last) < 2:
         return False
     if len(first) > 20 or len(last) > 20:
+        return False
+    # Check Title Case
+    if not (first[0].isupper() and first[1:].islower()) and first.isalpha():
+        return False
+    if not (last[0].isupper() and last[1:].islower()) and last.isalpha():
         return False
     return True
 
