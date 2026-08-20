@@ -27,6 +27,13 @@ from .catalog import (
     print_consolidation_suggestions,
 )
 
+from .metadata import (
+    ImageOCR,
+    SensitiveDocFlagger,
+    FilenamePatternDetector,
+    CADMetadataExtractor,
+)
+
 __all__ = [
     # From read
     "ProjectFile",
@@ -51,4 +58,9 @@ __all__ = [
     "classify_file",
     "suggest_consolidations",
     "print_consolidation_suggestions",
+    # From metadata
+    "ImageOCR",
+    "SensitiveDocFlagger",
+    "FilenamePatternDetector",
+    "CADMetadataExtractor",
 ]

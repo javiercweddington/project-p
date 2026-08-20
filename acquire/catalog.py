@@ -41,6 +41,14 @@ except ImportError:
 
 from .read import ProjectFile, ProjectGroup
 
+# Import metadata classes for enhanced sensitivity detection
+from .metadata import (
+    ImageOCR,
+    SensitiveDocFlagger,
+    FilenamePatternDetector,
+    CADMetadataExtractor,
+)
+
 # Module-level logger for proper error reporting
 _logger = logging.getLogger(__name__)
 
@@ -51,7 +59,12 @@ _logger = logging.getLogger(__name__)
 _gliner_model = None
 _gliner_model_name = os.environ.get("GLINER_MODEL", "urchade/gliner_multi-v2.1")
 _gliner_threshold = float(os.environ.get("GLINER_THRESHOLD", "0.5"))
-_gliner_labels = ["person", "organization"]
+# Expanded labels based on cross-product analysis (Bosch + Wizama)
+# GLiNER is zero-shot and supports arbitrary label names
+_gliner_labels = [
+    "person", "organization", "email", "phone", "address",
+    "invoice", "date", "money",
+]
 
 
 def _get_gliner_model():

@@ -7,6 +7,8 @@ Handles cleaning for different file types:
 - ImageCleaner: Remove EXIF/metadata from images
 - AudioCleaner: Remove metadata from audio files
 - VideoCleaner: Remove metadata from video files
+- XLSXCleaner: Remove metadata from Excel files
+- DOCXCleaner: Remove metadata from Word documents
 
 All cleaners work on copies in /tmp/ and never modify originals.
 """
@@ -34,6 +36,18 @@ try:
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
+
+try:
+    from openpyxl import load_workbook
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+try:
+    from docx import Document
+    HAS_PYTHON_DOCX = True
+except ImportError:
+    HAS_PYTHON_DOCX = False
 
 
 # File extension sets for routing
@@ -371,6 +385,183 @@ class VideoCleaner:
             return False
 
 
+class XLSXCleaner:
+    """Clean Excel files by removing document metadata and cleaning cell content.
+
+    Uses openpyxl to:
+    1. Remove core properties (author, last_modified_by, company, etc.)
+    2. Optionally clean cell text content using entity mapper
+
+    Supports .xlsx and .xlsm files (macro-enabled workbooks).
+    """
+
+    # Office document core properties to clear
+    _CORE_PROPERTIES = {
+        'creator', 'last_modified_by', 'contributor',
+        'author', 'company', 'manager',
+        'description', 'subject', 'title',
+        'keywords', 'category', 'comments',
+    }
+
+    def __init__(self, mapper: EntityMapper):
+        self.mapper = mapper
+        self.text_cleaner = TextCleaner(mapper)
+
+        if not HAS_OPENPYXL:
+            _logger.warning(
+                "openpyxl not available; Excel cleaning limited. "
+                "Install with: pip install openpyxl"
+            )
+
+    def clean_file(self, input_path: Path, output_path: Path,
+                   clean_content: bool = False) -> bool:
+        """Clean an Excel file by removing metadata.
+
+        Args:
+            input_path: Source Excel file path
+            output_path: Destination Excel file path
+            clean_content: If True, also scan and replace entities in cell text
+
+        Returns:
+            True if cleaning was successful
+        """
+        if not HAS_OPENPYXL:
+            _logger.warning("openpyxl not available; copying Excel file as-is")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(input_path, output_path)
+            return True
+
+        try:
+            # Load workbook
+            wb = load_workbook(input_path, keep_vba=True if input_path.suffix.lower() == '.xlsm' else False)
+
+            # Clear core properties
+            props = wb.properties
+            for prop in self._CORE_PROPERTIES:
+                setattr(props, prop, '')
+
+            # Optionally clean cell content
+            if clean_content:
+                for ws in wb.worksheets:
+                    for row in ws.iter_rows():
+                        for cell in row:
+                            if isinstance(cell.value, str):
+                                cell.value = self.text_cleaner.clean_text(cell.value)
+
+            # Save
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            wb.save(str(output_path))
+            return True
+
+        except Exception as e:
+            _logger.error("Error cleaning Excel file %s: %s", input_path, e)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(input_path, output_path)
+            return False
+
+
+class DOCXCleaner:
+    """Clean Word documents by removing metadata and cleaning text content.
+
+    Uses python-docx to:
+    1. Remove core properties (author, last_modified_by, company, etc.)
+    2. Remove custom properties
+    3. Optionally clean paragraph/run text using entity mapper
+
+    Note: python-docx does not preserve all formatting perfectly.
+    For production use, consider using msoffcrypto-tool + libreoffice.
+    """
+
+    # Office document core properties to clear
+    _CORE_PROPERTIES = {
+        'creator', 'last_modified_by', 'contributor',
+        'author', 'company', 'manager',
+        'description', 'subject', 'title',
+        'keywords', 'category', 'comments',
+    }
+
+    def __init__(self, mapper: EntityMapper):
+        self.mapper = mapper
+        self.text_cleaner = TextCleaner(mapper)
+
+        if not HAS_PYTHON_DOCX:
+            _logger.warning(
+                "python-docx not available; Word cleaning limited. "
+                "Install with: pip install python-docx"
+            )
+
+    def clean_file(self, input_path: Path, output_path: Path,
+                   clean_content: bool = False) -> bool:
+        """Clean a Word document by removing metadata.
+
+        Args:
+            input_path: Source DOCX file path
+            output_path: Destination DOCX file path
+            clean_content: If True, also scan and replace entities in text
+
+        Returns:
+            True if cleaning was successful
+        """
+        if not HAS_PYTHON_DOCX:
+            _logger.warning("python-docx not available; copying DOCX as-is")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(input_path, output_path)
+            return True
+
+        try:
+            doc = Document(str(input_path))
+
+            # Clear core properties via the underlying XML
+            core_props = doc.core_properties
+            for prop_name in self._CORE_PROPERTIES:
+                setter = getattr(core_props, f'set_{prop_name}', None)
+                if setter:
+                    setter('')
+                else:
+                    # Direct attribute access
+                    try:
+                        setattr(core_props, prop_name, '')
+                    except (AttributeError, TypeError):
+                        pass
+
+            # Clear custom properties from the XML
+            try:
+                custom_props = doc.custom_properties
+                if custom_props:
+                    # Clear all custom properties
+                    props_elem = custom_props._properties
+                    for child in list(props_elem):
+                        props_elem.remove(child)
+            except Exception:
+                pass
+
+            # Optionally clean paragraph/run text
+            if clean_content:
+                for para in doc.paragraphs:
+                    for run in para.runs:
+                        if isinstance(run.text, str) and run.text:
+                            run.text = self.text_cleaner.clean_text(run.text)
+                # Also check tables
+                for table in doc.tables:
+                    for row in table.rows:
+                        for cell in row.cells:
+                            for para in cell.paragraphs:
+                                for run in para.runs:
+                                    if isinstance(run.text, str) and run.text:
+                                        run.text = self.text_cleaner.clean_text(run.text)
+
+            # Save
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            doc.save(str(output_path))
+            return True
+
+        except Exception as e:
+            _logger.error("Error cleaning DOCX %s: %s", input_path, e)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(input_path, output_path)
+            return False
+
+
 class FileCleanerRouter:
     """Route files to the appropriate cleaner based on file type."""
 
@@ -381,6 +572,8 @@ class FileCleanerRouter:
         self.image_cleaner = ImageCleaner(mapper)
         self.audio_cleaner = AudioCleaner(mapper)
         self.video_cleaner = VideoCleaner(mapper)
+        self.xlsx_cleaner = XLSXCleaner(mapper)
+        self.docx_cleaner = DOCXCleaner(mapper)
 
     def clean_file(self, input_path: Path, output_path: Path,
                    entity_spans: Optional[List[Tuple[int, int, str, str]]] = None) -> bool:
@@ -406,6 +599,10 @@ class FileCleanerRouter:
             return self.audio_cleaner.clean_file(input_path, output_path)
         elif ext in VIDEO_EXTS:
             return self.video_cleaner.clean_file(input_path, output_path)
+        elif ext in ('.xlsx', '.xlsm'):
+            return self.xlsx_cleaner.clean_file(input_path, output_path)
+        elif ext == '.docx':
+            return self.docx_cleaner.clean_file(input_path, output_path)
         else:
             # Unknown type: copy as-is
             _logger.debug("Unknown file type %s; copying as-is", ext)
@@ -425,4 +622,8 @@ class FileCleanerRouter:
             return self.audio_cleaner
         elif ext in VIDEO_EXTS:
             return self.video_cleaner
+        elif ext in ('.xlsx', '.xlsm'):
+            return self.xlsx_cleaner
+        elif ext == '.docx':
+            return self.docx_cleaner
         return None
