@@ -1,5 +1,10 @@
 from setuptools import setup, find_packages
 
+# System dependencies (not installed via pip):
+#   ffmpeg  - required for video/audio metadata stripping
+#   Install: sudo apt install ffmpeg  (Linux)
+#            brew install ffmpeg      (macOS)
+
 if __name__ == "__main__":
     setup(
         name="project-p",
@@ -16,6 +21,10 @@ if __name__ == "__main__":
             "pandas>=2.0.0",
             "PyPDF2>=3.0.0",
             "gliner>=0.2.0",
+            "Pillow>=10.0.0",
+            "openpyxl>=3.1.0",
+            "python-docx>=1.0.0",
+            "scikit-learn>=1.3.0",
         ],
         extras_require={
             "dev": [
