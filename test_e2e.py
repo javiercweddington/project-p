@@ -13,7 +13,7 @@ PROJECT_DIR = Path("/media/sparrows/KINGSTON/Wizama - Social Game Console")
 sys.path.insert(0, str(Path(__file__).parent))
 from acquire.metadata import ImageOCR, SensitiveDocFlagger, FilenamePatternDetector, CADMetadataExtractor
 from clean.cleaner import (
-    TextCleaner, PDFCleaner, ImageCleaner, AudioCleaner, VideoCleaner,
+    TextCleaner, PDFCleaner, ImageCleaner,
     XLSXCleaner, DOCXCleaner, FileCleanerRouter
 )
 from clean.anonymizer import EntityMapper
@@ -133,37 +133,19 @@ def main():
         router = FileCleanerRouter(mapper)
         results['DOC'] = test_cleaner('FileCleanerRouter', router, doc_file, output_dir)
     
-    # Test 12: MP4 video
-    mp4_file = find_one_file('.mp4')
-    if mp4_file:
-        cleaner = VideoCleaner(mapper)
-        results['MP4'] = test_cleaner('VideoCleaner', cleaner, mp4_file, output_dir)
-    
-    # Test 13: MOV video
-    mov_file = find_one_file('.MOV') or find_one_file('.mov')
-    if mov_file:
-        cleaner = VideoCleaner(mapper)
-        results['MOV'] = test_cleaner('VideoCleaner', cleaner, mov_file, output_dir)
-    
-    # Test 14: M4A audio
-    m4a_file = find_one_file('.m4a')
-    if m4a_file:
-        cleaner = AudioCleaner(mapper)
-        results['M4A'] = test_cleaner('AudioCleaner', cleaner, m4a_file, output_dir)
-    
-    # Test 15: TXT (text cleaner)
+    # Test 12: TXT (text cleaner)
     txt_file = find_one_file('.txt')
     if txt_file:
         cleaner = TextCleaner(mapper)
         results['TXT'] = test_cleaner('TextCleaner', cleaner, txt_file, output_dir)
     
-    # Test 16: STL (3D print - copy as-is)
+    # Test 13: STL (3D print - copy as-is)
     stl_file = find_one_file('.stl')
     if stl_file:
         router = FileCleanerRouter(mapper)
         results['STL'] = test_cleaner('FileCleanerRouter', router, stl_file, output_dir)
     
-    # Test 17: SensitiveDocFlagger on filenames
+    # Test 14: SensitiveDocFlagger on filenames
     _logger.info("Testing SensitiveDocFlagger on sample filenames")
     flagger = SensitiveDocFlagger()
     test_names = [
@@ -176,7 +158,7 @@ def main():
     _logger.info(f"  Flagged {len(flagged)}/{len(test_names)} as sensitive")
     results['SensitiveDocFlagger'] = True
     
-    # Test 18: FilenamePatternDetector
+    # Test 15: FilenamePatternDetector
     _logger.info("Testing FilenamePatternDetector on sample filenames")
     detector = FilenamePatternDetector()
     for name in test_names:

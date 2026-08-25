@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 import shutil
 import zipfile
@@ -97,22 +98,22 @@ class PPTXCleaner:
         """
         ext = input_path.suffix.lower()
 
-        # Legacy .ppt format - can't safely clean, copy with warning
+        # Legacy .ppt format - can't safely clean, remove staged file
         if ext == '.ppt':
             _logger.warning(
                 "Legacy .ppt format detected: %s. "
-                "Copy-as-is with warning.",
+                "Removing staged file (fail-closed).",
                 input_path.name,
             )
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
+            if output_path.exists():
+                os.remove(output_path)
             return False
 
         if not HAS_PYTHON_PPTX:
-            _logger.warning("python-pptx not available; copying PPTX as-is")
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
-            return True
+            _logger.warning("python-pptx not available; removing PPTX (fail-closed)")
+            if output_path.exists():
+                os.remove(output_path)
+            return False
 
         try:
             prs = Presentation(str(input_path))
@@ -136,8 +137,8 @@ class PPTXCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning PPTX %s: %s", input_path, e)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
+            if output_path.exists():
+                os.remove(output_path)
             return False
 
     def _clear_properties(self, core_props) -> None:

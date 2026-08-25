@@ -56,12 +56,12 @@ class ImageOCR:
                 "sudo apt install tesseract-ocr && pip install pytesseract pillow"
             )
 
-    def extract_text(self, image_path: Path, lang: str = 'eng') -> Optional[str]:
+    def extract_text(self, image_path: Path, lang: str = 'eng+chi_sim') -> Optional[str]:
         """Extract text from an image file using OCR.
 
         Args:
             image_path: Path to the image file.
-            lang: Language code for Tesseract (default: 'eng').
+            lang: Language code for Tesseract (default: 'eng+chi_sim' for bilingual support).
 
         Returns:
             Extracted text, or None if OCR failed or is unavailable.
@@ -81,12 +81,12 @@ class ImageOCR:
             _logger.debug("OCR failed on %s: %s", image_path, e)
             return None
 
-    def extract_text_from_bytes(self, image_bytes: bytes, lang: str = 'eng') -> Optional[str]:
+    def extract_text_from_bytes(self, image_bytes: bytes, lang: str = 'eng+chi_sim') -> Optional[str]:
         """Extract text from image bytes using OCR.
 
         Args:
             image_bytes: Raw image data.
-            lang: Language code for Tesseract.
+            lang: Language code for Tesseract (default: 'eng+chi_sim' for bilingual support).
 
         Returns:
             Extracted text, or None if OCR failed.

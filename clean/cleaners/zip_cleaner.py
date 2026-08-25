@@ -36,6 +36,7 @@ Dependencies:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import struct
@@ -117,15 +118,15 @@ class ZipCleaner:
                     )
                 else:
                     _logger.warning(
-                        "Not a ZIP file: %s, copying as-is",
+                        "Not a ZIP file: %s, removing staged file (fail-closed)",
                         input_path.name,
                     )
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(input_path, output_path)
+                    if output_path.exists():
+                        os.remove(output_path)
                     return False
             except Exception:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(input_path, output_path)
+                if output_path.exists():
+                    os.remove(output_path)
                 return False
 
         # Create temp directory for extraction
@@ -165,8 +166,8 @@ class ZipCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning ZIP %s: %s", input_path, e)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
+            if output_path.exists():
+                os.remove(output_path)
             return False
 
         finally:
@@ -342,6 +343,7 @@ class ZipCleaner:
 
         - Normalized timestamps (CLEAN_TIMESTAMP)
         - Cleaned entry paths (no usernames)
+        - Anonymized entry names (sensitive entities replaced with placeholders)
         - No archive comment
         - No per-file comments
         """
@@ -357,6 +359,11 @@ class ZipCleaner:
 
                 # Clean entry path (remove username patterns)
                 arcname = self._clean_entry_path(arcname)
+
+                # Anonymize entry name by replacing sensitive entities
+                # This ensures filenames like "JCW20200615 INVOICE - Acme Corp.pdf"
+                # become "JCW20200615 INVOICE - [COMPANY_001].pdf"
+                arcname = self.mapper.replace_in_text(arcname)
 
                 # Create clean info object with normalized timestamp
                 info = zipfile.ZipInfo(

@@ -26,9 +26,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 from .anonymizer import EntityMapper, SpanBasedReplacer
-from .cleaner import FileCleanerRouter, TEXT_EXTS, IMAGE_EXTS, AUDIO_EXTS, VIDEO_EXTS
+from .cleaner import FileCleanerRouter, TEXT_EXTS, IMAGE_EXTS
 from .diff import ChangeTracker, DiffReport, compute_file_hash, compute_text_hash
-from .verifier import verify_clean, LeakageReport
+from .verifier import verify_clean, LeakageReport, ChangeTracker as VerifierChangeTracker
 
 _logger = logging.getLogger(__name__)
 
@@ -112,8 +112,27 @@ class CleanPipeline:
         self.staging_dir = Path(staging_dir) if staging_dir else (
             DEFAULT_STAGING_DIR / project_name
         )
-        self.mapper = mapper or EntityMapper()
+        # Create the diff.ChangeTracker that records every substitution
         self.tracker = ChangeTracker()
+
+        # Create a verifier ChangeTracker that the mapper callback feeds into
+        self._verifier_tracker = VerifierChangeTracker()
+
+        # Wire up the mapper so every real substitution is recorded.
+        # The callback signature is: (original, placeholder, source) -> None
+        def _on_replace(original: str, placeholder: str, source: str) -> None:
+            # We don't know entity_type at callback time, but we can look it up
+            mapping = mapper.get_mapping(original) if mapper else None
+            entity_type = mapping.entity_type if mapping else 'unknown'
+            self.tracker.record_change(
+                file_path=source or "",
+                entity_type=entity_type,
+                original=original,
+                placeholder=placeholder,
+            )
+            self._verifier_tracker.record_change(original, placeholder, source or "")
+
+        self.mapper = mapper or EntityMapper(tracker_callback=_on_replace)
         self._entity_spans: Dict[str, List[Tuple[int, int, str, str]]] = {}
 
     def load_entity_spans(self, spans: Dict[str, List[Tuple[int, int, str, str]]]) -> None:
@@ -125,8 +144,20 @@ class CleanPipeline:
         """
         self._entity_spans = spans
 
+    # Only register true identifier values in the mapper.
+    # Generic keywords like "invoice", "payment", "nda" from sensitive_doc detection
+    # would corrupt content by replacing those common words everywhere.
+    # Similarly, generic dates/descriptions from CAD metadata are not identifiers.
+    _IDENTIFIER_ENTITY_TYPES = frozenset({
+        'person', 'company', 'email', 'phone', 'product',
+    })
+
     def load_sensitivity_flags(self, flags: List) -> None:
         """Pre-populate the entity mapper from acquisition sensitivity flags.
+
+        Only registers true identifier values (person, company, email, phone, product).
+        Generic keywords like "invoice", "payment" from sensitive_doc detection are
+        skipped to prevent corrupting normal content.
 
         This ensures consistent placeholders across all files before cleaning begins.
 
@@ -134,6 +165,14 @@ class CleanPipeline:
             flags: List of SensitivityFlag objects from acquire.catalog
         """
         for flag in flags:
+            # Skip non-identifier entity types to prevent mapper poisoning
+            if flag.flag_type not in self._IDENTIFIER_ENTITY_TYPES:
+                _logger.debug(
+                    "Skipping non-identifier flag: %r (%s from %s)",
+                    flag.value, flag.flag_type, flag.source,
+                )
+                continue
+
             self.mapper.get_or_create(
                 entity_type=flag.flag_type,
                 value=flag.value,
@@ -178,6 +217,7 @@ class CleanPipeline:
                 original_dir=self.source_dir,
                 mapper=self.mapper,
                 project_name=self.project_name,
+                tracker=self._verifier_tracker,
             )
             result.leakage_report = leakage_report
 
@@ -199,9 +239,10 @@ class CleanPipeline:
         # Step 5: Save mapper for audit trail
         self._save_mapper()
 
-        # Determine overall success
+        # Determine overall success: any failure means the run is not successful
         result.success = (
             cleaned > 0
+            and failed == 0
             and len(result.errors) == 0
             and (result.leakage_report is None or result.leakage_report.all_passed)
         )
@@ -280,8 +321,97 @@ class CleanPipeline:
             else:
                 failed += 1
                 _logger.warning("Failed to clean %s", rel_path)
+                # Quarantine: move the original file outside the deliverable
+                self._quarantine_file(staging_file, rel_path)
+
+        # Anonymize filenames and directory components
+        self._anonymize_paths()
 
         return cleaned, failed
+
+    def _anonymize_paths(self) -> None:
+        """Rename files and directories in staging to replace sensitive entities.
+
+        Walks the staging directory bottom-up so that child paths are renamed
+        before their parents, avoiding broken intermediate paths. Also handles
+        ZIP member names by reprocessing any .zip files through the cleaner.
+
+        Addresses the risk that filenames like:
+            "JCW20200615 INVOICE - Acme Corp - John Smith.xlsm"
+        contain sensitive entities that would otherwise be delivered as-is.
+        """
+        # Collect all directories and files
+        dirs_to_rename: List[Path] = []
+        files_to_rename: List[Path] = []
+
+        for dirpath, dirnames, filenames in os.walk(self.staging_dir, topdown=False):
+            current_dir = Path(dirpath)
+
+            # Skip staging root itself
+            if current_dir == self.staging_dir:
+                continue
+
+            # Check if directory name needs anonymization
+            anonymized_dir = self.mapper.replace_in_text(current_dir.name)
+            if anonymized_dir != current_dir.name:
+                dirs_to_rename.append(current_dir)
+
+            # Check files in this directory
+            for filename in filenames:
+                if filename.startswith('.'):
+                    continue
+                anonymized_file = self.mapper.replace_in_text(filename)
+                if anonymized_file != filename:
+                    files_to_rename.append(current_dir / filename)
+
+        # Rename files first
+        for file_path in files_to_rename:
+            if not file_path.exists():
+                continue
+            anonymized_name = self.mapper.replace_in_text(file_path.name)
+            # Ensure extension is preserved properly
+            new_path = file_path.parent / anonymized_name
+            self._safe_rename(file_path, new_path, "file")
+
+        # Rename directories bottom-up
+        for dir_path in dirs_to_rename:
+            if not dir_path.exists():
+                continue
+            anonymized_name = self.mapper.replace_in_text(dir_path.name)
+            new_path = dir_path.parent / anonymized_name
+            self._safe_rename(dir_path, new_path, "directory")
+
+    def _safe_rename(self, old_path: Path, new_path: Path, item_type: str) -> None:
+        """Safely rename a file or directory, handling conflicts.
+
+        Args:
+            old_path: Current path
+            new_path: Desired new path
+            item_type: "file" or "directory" for logging
+        """
+        if old_path == new_path:
+            return
+
+        # Handle name conflicts by adding a suffix
+        if new_path.exists():
+            stem = new_path.stem
+            suffix = new_path.suffix
+            counter = 1
+            while new_path.exists():
+                new_path = new_path.parent / f"{stem}_{counter:03d}{suffix}"
+                counter += 1
+
+        try:
+            old_path.rename(new_path)
+            _logger.info(
+                "Anonymized %s: %s -> %s",
+                item_type, old_path.name, new_path.name,
+            )
+        except OSError as e:
+            _logger.warning(
+                "Failed to rename %s %s: %s",
+                item_type, old_path.name, e,
+            )
 
     def _check_size_delta(self, rel_path: Path, orig_size: int, clean_size: int) -> None:
         """Check size delta between original and cleaned file.
@@ -326,6 +456,32 @@ class CleanPipeline:
                 rel_path, abs(delta_percent), orig_size, clean_size,
             )
 
+    def _quarantine_file(self, staging_file: Path, rel_path: Path) -> None:
+        """Move a failed file to a quarantine directory outside the deliverable.
+
+        Failed files are moved to {_staging_dir_parent}/_quarantine/{project_name}/
+        so they are not included in the cleaned output.
+
+        Args:
+            staging_file: Path to the file in staging that failed to clean
+            rel_path: Relative path within the staging directory
+        """
+        quarantine_dir = self.staging_dir.parent / '_quarantine' / self.project_name
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+
+        quarantine_path = quarantine_dir / rel_path
+        quarantine_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            staging_file.rename(quarantine_path)
+            _logger.info(
+                "Quarantined %s -> %s", rel_path, quarantine_path,
+            )
+        except OSError as e:
+            _logger.warning(
+                "Failed to quarantine %s: %s", rel_path, e,
+            )
+
     def _normalize_mtime(self, file_path: Path) -> None:
         """Normalize filesystem mtime to prevent temporal leakage.
 
@@ -345,12 +501,20 @@ class CleanPipeline:
             )
 
     def _save_mapper(self) -> None:
-        """Save the entity mapper for audit trail."""
-        mapper_path = self.staging_dir / ".entity_mapper.json"
+        """Save the entity mapper to an audit location outside the staging dir.
+
+        The mapper contains the reverse mapping with every original sensitive
+        value in plaintext. Writing it into the deliverable folder would leak
+        those values, so it is placed in a separate audit directory at the
+        same level as the staging parent.
+        """
+        audit_dir = self.staging_dir.parent / '_audit' / self.project_name
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        mapper_path = audit_dir / ".entity_mapper.json"
         try:
             with open(mapper_path, 'w') as f:
                 json.dump(self.mapper.to_dict(), f, indent=2)
-            _logger.info("Saved entity mapper to %s", mapper_path)
+            _logger.info("Saved entity mapper to %s (audit location)", mapper_path)
         except Exception as e:
             _logger.warning("Failed to save entity mapper: %s", e)
 

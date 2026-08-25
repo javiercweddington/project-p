@@ -41,8 +41,6 @@ from .cleaners import (
 from .cleaners import (
     TEXT_EXTS,
     IMAGE_EXTS,
-    AUDIO_EXTS,
-    VIDEO_EXTS,
     DOCUMENT_EXTS,
     CAD_EXTS,
     ZIP_EXTS,
@@ -65,8 +63,6 @@ __all__ = [
     # Extension sets
     'TEXT_EXTS',
     'IMAGE_EXTS',
-    'AUDIO_EXTS',
-    'VIDEO_EXTS',
     'DOCUMENT_EXTS',
     'CAD_EXTS',
     'ZIP_EXTS',

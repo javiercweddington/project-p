@@ -10,6 +10,7 @@ Extension sets are defined here for centralized reference.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -40,15 +41,6 @@ TEXT_EXTS = {
 IMAGE_EXTS = {
     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
     '.webp', '.ico', '.heic', '.heif',
-}
-
-AUDIO_EXTS = {
-    '.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a',
-}
-
-VIDEO_EXTS = {
-    '.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm',
-    '.m4v', '.mpg', '.mpeg',
 }
 
 DOCUMENT_EXTS = {
@@ -130,34 +122,15 @@ class FileCleanerRouter:
         if ext in ('.pptx', '.ppt'):
             return self.pptx_cleaner.clean_file(input_path, output_path)
 
-        # Audio and video - copy as-is with warning (cleaners removed)
-        if ext in AUDIO_EXTS:
-            _logger.warning(
-                "Audio file %s copied as-is (audio cleaner not configured)",
-                input_path.name,
-            )
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
-            return True
-
-        if ext in VIDEO_EXTS:
-            _logger.warning(
-                "Video file %s copied as-is (video cleaner not configured)",
-                input_path.name,
-            )
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
-            return True
-
         # .dat files - sniff magic bytes to determine type
         if ext == '.dat':
             return self._handle_dat_file(input_path, output_path)
 
-        # Unknown type: copy as-is
-        _logger.debug("Unknown file type %s; copying as-is", ext)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(input_path, output_path)
-        return True
+        # Unknown type: remove staged file (fail-closed)
+        _logger.debug("Unknown file type %s; removing staged file (fail-closed)", ext)
+        if output_path.exists():
+            os.remove(output_path)
+        return False
 
     def _handle_dat_file(self, input_path: Path, output_path: Path) -> bool:
         """Handle .dat files by sniffing magic bytes.
@@ -226,9 +199,9 @@ class FileCleanerRouter:
 
         except Exception as e:
             _logger.error("Failed to handle .dat file %s: %s", input_path, e)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
-            return True
+            if output_path.exists():
+                os.remove(output_path)
+            return False
 
     def get_cleaner_for_ext(self, ext: str):
         """Get the appropriate cleaner for a file extension.

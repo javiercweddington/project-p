@@ -51,15 +51,22 @@ class EntityMapper:
     The same entity text always produces the same placeholder.
     Mappings are case-insensitive for normalization but preserve
     the original casing for the first-seen entity.
+
+    Optionally accepts a tracker callback that is invoked for every
+    substitution so downstream components (e.g., the verifier's
+    ChangeTracker) can record what was actually replaced.
     """
 
-    def __init__(self):
+    def __init__(self, tracker_callback=None):
         # Normalized key → EntityMapping
         self._mappings: Dict[str, EntityMapping] = {}
-        # Counter per entity type
+        # Counter per placeholder prefix (not per entity_type) so that unknown
+        # types sharing the [ENTITY_nnn] prefix don't collide.
         self._counters: Dict[str, int] = defaultdict(int)
         # Reverse mapping: placeholder → original
         self._reverse: Dict[str, str] = {}
+        # Optional callback: (original, placeholder, source) -> None
+        self._tracker_callback = tracker_callback
 
     @property
     def mappings(self) -> List[EntityMapping]:
@@ -69,6 +76,93 @@ class EntityMapper:
     @property
     def mapping_count(self) -> int:
         return len(self._mappings)
+
+    def _generate_variants(self, original: str) -> List[str]:
+        """Generate normalized variants of an entity value for matching.
+
+        Addresses cases where "Globus Medical" appears as "globusmedical",
+        "globus_medical", "globus-medical", etc. in emails, URLs, or
+        concatenated text.
+
+        Returns a list of unique variants (deduplicated, lowercase).
+        """
+        variants = set()
+        variants.add(original.lower().strip())
+
+        # Remove spaces, hyphens, underscores for concatenated forms
+        collapsed = re.sub(r'[\s\-_]+', '', original).lower().strip()
+        if collapsed and len(collapsed) >= 2:
+            variants.add(collapsed)
+
+        # Replace spaces with hyphens
+        hyphenated = re.sub(r'\s+', '-', original).lower().strip()
+        if hyphenated != original.lower():
+            variants.add(hyphenated)
+
+        # Replace spaces with underscores
+        underscored = re.sub(r'\s+', '_', original).lower().strip()
+        if underscored != original.lower():
+            variants.add(underscored)
+
+        return list(variants)
+
+    def _build_pattern(self, original: str) -> re.Pattern:
+        """Build a boundary-aware, case-insensitive regex pattern for an entity.
+
+        Strategy:
+        - Variants containing spaces (e.g. "globus medical"): use \\b word
+          boundaries so they do not match inside larger words.
+        - Variants WITHOUT spaces (e.g. "globusmedical" or "sa"): use BOTH
+          \\b word boundaries (for standalone words like "SA") AND context-aware
+          boundaries (for email domains like @globusmedical.com).
+        - Pure-numeric variants: always use \\b word boundaries.
+
+        All variant patterns are joined with | (longest first) into a single
+        alternation so the regex engine tries the most specific match first.
+        """
+        variants = self._generate_variants(original)
+
+        # Separate into groups
+        spaced = []
+        no_space = []
+        pure_numeric = []
+
+        for v in variants:
+            if v.isdigit():
+                pure_numeric.append(v)
+            elif ' ' in v:
+                spaced.append(v)
+            else:
+                no_space.append(v)
+
+        parts = []
+
+        # Spaced variants: standard word boundary
+        for v in sorted(spaced, key=len, reverse=True):
+            parts.append(r'\b' + re.escape(v) + r'\b')
+
+        # No-space alphabetic variants: use BOTH word boundary AND context-aware
+        for v in sorted(no_space, key=len, reverse=True):
+            escaped = re.escape(v)
+            # Word boundary pattern (for standalone words like "SA")
+            parts.append(r'\b' + escaped + r'\b')
+            # Context-aware pattern (for email domains like @globusmedical.com)
+            # Use (?<!\w) lookbehind to prevent matching inside larger words
+            # (e.g., "sa" should not match inside "USA")
+            parts.append(
+                r'(?<!\w)' + escaped + r'(?:\.|@|(?=[<>,;:\s_\-/])|$)'
+            )
+
+        # Pure numeric: word boundary
+        for v in sorted(pure_numeric, key=len, reverse=True):
+            parts.append(r'\b' + re.escape(v) + r'\b')
+
+        if not parts:
+            # Fallback: should not happen for valid entities
+            return re.compile(re.escape(original.lower()), re.IGNORECASE)
+
+        pattern_str = '(?:' + '|'.join(parts) + ')'
+        return re.compile(pattern_str, re.IGNORECASE)
 
     def get_or_create(self, entity_type: str, value: str,
                       source: Optional[str] = None) -> str:
@@ -95,11 +189,12 @@ class EntityMapper:
 
         # Create new mapping
         prefix = ENTITY_PREFIX_MAP.get(entity_type, _DEFAULT_PREFIX)
-        self._counters[entity_type] += 1
-        counter = self._counters[entity_type]
+        # Key counter by prefix (not entity_type) so two unknown types that
+        # both map to "ENTITY" don't mint [ENTITY_001] twice each.
+        self._counters[prefix] += 1
+        counter = self._counters[prefix]
         placeholder = f"[{prefix}_{counter:03d}]"
 
-        # Since EntityMapping is frozen, create a new one
         mapping = EntityMapping(
             original=value.strip(),
             placeholder=placeholder,
@@ -109,6 +204,11 @@ class EntityMapper:
         )
         self._mappings[key] = mapping
         self._reverse[placeholder] = value.strip()
+
+        # Notify tracker callback of the new mapping
+        if self._tracker_callback is not None:
+            self._tracker_callback(value.strip(), placeholder, source or "")
+
         return placeholder
 
     def resolve(self, placeholder: str) -> Optional[str]:
@@ -123,11 +223,19 @@ class EntityMapper:
         """Get the mapping for an entity value."""
         return self._mappings.get(value.strip().lower())
 
-    def replace_in_text(self, text: str) -> str:
+    def replace_in_text(self, text: str, source: str = "") -> str:
         """Replace all known entities in text with their placeholders.
 
-        Uses word-boundary-aware replacement to avoid partial matches.
+        Uses boundary-aware regex replacement with variant generation
+        to handle cases where entities appear in different formats:
+        - "Globus Medical" matches "globusmedical" (in emails)
+        - "Globus Medical" matches "globus-medical", "globus_medical"
+        - Short entities use word boundaries to avoid partial matches
+
         Longer entities are replaced first to prevent conflicts.
+
+        When a tracker callback is configured, each successful substitution
+        is recorded via the callback.
         """
         if not self._mappings:
             return text
@@ -141,20 +249,28 @@ class EntityMapper:
 
         result = text
         for mapping in sorted_mappings:
-            # Use re.escape for literal matching, case-insensitive
-            pattern = re.compile(re.escape(mapping.original), re.IGNORECASE)
+            pattern = self._build_pattern(mapping.original)
+
+            # Count and record replacements for tracker
+            if self._tracker_callback is not None:
+                matches = pattern.findall(result)
+                for _ in matches:
+                    self._tracker_callback(mapping.original, mapping.placeholder, source)
+
             result = pattern.sub(mapping.placeholder, result)
 
         return result
 
     def replace_spans(self, text: str,
-                      spans: List[Tuple[int, int, str]]) -> str:
+                      spans: List[Tuple[int, int, str]],
+                      source: str = "") -> str:
         """Replace entity spans in text using character offsets.
 
         Args:
             text: Original text
             spans: List of (start, end, entity_type) tuples.
                    The text[start:end] is the entity value.
+            source: Optional source path for the tracker callback.
 
         Returns:
             Text with entities replaced by placeholders.
@@ -168,7 +284,7 @@ class EntityMapper:
         result = text
         for start, end, entity_type in sorted_spans:
             entity_value = result[start:end]
-            placeholder = self.get_or_create(entity_type, entity_value)
+            placeholder = self.get_or_create(entity_type, entity_value, source)
             result = result[:start] + placeholder + result[end:]
 
         return result
@@ -223,13 +339,13 @@ class EntityMapper:
             )
             mapper._mappings[key] = mapping
             mapper._reverse[placeholder] = original
-            # Restore counter
+            # Restore counter (keyed by prefix, not entity_type)
             prefix = ENTITY_PREFIX_MAP.get(entity_type, _DEFAULT_PREFIX)
             match = re.match(rf'\[{prefix}_(\d+)\]', placeholder)
             if match:
                 num = int(match.group(1))
-                mapper._counters[entity_type] = max(
-                    mapper._counters[entity_type], num
+                mapper._counters[prefix] = max(
+                    mapper._counters[prefix], num
                 )
         return mapper
 

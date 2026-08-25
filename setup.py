@@ -19,7 +19,7 @@ if __name__ == "__main__":
             "requests>=2.31.0",
             "numpy>=1.24.0",
             "pandas>=2.0.0",
-            "PyPDF2>=3.0.0",
+            "pypdf>=4.0.0",
             "gliner>=0.2.0",
             "Pillow>=10.0.0",
             "openpyxl>=3.1.0",

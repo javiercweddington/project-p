@@ -27,7 +27,7 @@ from datetime import datetime
 import zipfile
 
 try:
-    from PyPDF2 import PdfReader
+    from pypdf import PdfReader
     HAS_PYPDF = True
 except ImportError:
     HAS_PYPDF = False
@@ -121,11 +121,15 @@ def _extract_entities_with_gliner(text: str, source: str) -> List[EntityHit]:
                 if key in seen:
                     continue
                 seen.add(key)
+                # Map all GLiNER entity types, not just person/organization
                 if entity_type == 'person':
                     hits.append(EntityHit(entity_type='person', value=entity_text,
                                           source=source, confidence=confidence))
                 elif entity_type == 'organization':
                     hits.append(EntityHit(entity_type='company', value=entity_text,
+                                          source=source, confidence=confidence))
+                elif entity_type in ('email', 'phone', 'address', 'invoice', 'date', 'money'):
+                    hits.append(EntityHit(entity_type=entity_type, value=entity_text,
                                           source=source, confidence=confidence))
         except Exception as e:
             _logger.debug("GLiNER prediction failed on chunk: %s", e)
@@ -1404,20 +1408,85 @@ class FileDiscriminator:
             # Extract entities from filename
             self._entities.extend(extract_entities_from_filename(sig.filename))
 
-        # Optionally scan file contents for entities
-        if self.scan_content and HAS_PYPDF:
+        # Optionally scan file contents for entities (multi-format)
+        if self.scan_content:
             for sig in self._signatures:
-                if sig.file_type == 'document' and sig.filename.lower().endswith('.pdf'):
-                    text = self._extract_pdf_text_for_sig(sig)
-                    if text:
-                        self._entities.extend(extract_entities_from_text(text, sig.filename))
+                text = self._extract_text_for_entity_scan(sig)
+                if text:
+                    self._entities.extend(extract_entities_from_text(text, sig.filename))
 
-    def _extract_pdf_text_for_sig(self, sig: FileSignature) -> str:
-        """Extract text from a PDF file signature."""
-        if sig.filepath.suffix.lower() == '.zip':
-            return extract_pdf_text_from_zip(sig.filepath, sig.filename)
-        else:
-            return extract_pdf_text(sig.filepath)
+    def _extract_text_for_entity_scan(self, sig: FileSignature) -> str:
+        """Extract text from a file for entity scanning (multi-format support)."""
+        ext = sig.filename.lower().split('.')[-1] if '.' in sig.filename else ''
+        filepath = sig.filepath
+
+        # PDF
+        if ext == 'pdf' and HAS_PYPDF:
+            if filepath.suffix.lower() == '.zip':
+                return extract_pdf_text_from_zip(filepath, sig.filename)
+            else:
+                return extract_pdf_text(filepath)
+
+        # DOCX
+        elif ext == 'docx':
+            try:
+                import docx
+                doc = docx.Document(str(filepath))
+                return '\n'.join(p.text for p in doc.paragraphs)[:50000]
+            except Exception:
+                return ""
+
+        # XLSX
+        elif ext == 'xlsx':
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(str(filepath), read_only=True, data_only=True)
+                cells = []
+                for ws in wb.worksheets:
+                    for row in ws.iter_rows(values_only=True):
+                        cells.append(' '.join(str(c) for c in row if c))
+                wb.close()
+                return '\n'.join(cells)[:50000]
+            except Exception:
+                return ""
+
+        # PPTX
+        elif ext == 'pptx':
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(filepath))
+                texts = []
+                for slide in prs.slides:
+                    for shape in slide.shapes:
+                        if hasattr(shape, "text"):
+                            texts.append(shape.text)
+                return '\n'.join(texts)[:50000]
+            except Exception:
+                return ""
+
+        # Images - use OCR
+        elif ext in ('png', 'jpg', 'jpeg', 'bmp', 'tiff', 'tif', 'webp'):
+            try:
+                ocr = ImageOCR()
+                return ocr.extract_text(filepath) or ""
+            except Exception:
+                return ""
+
+        # CAD (STEP, DXF) - text-based
+        elif ext in ('step', 'stp', 'dxf'):
+            try:
+                return filepath.read_text(encoding='utf-8', errors='ignore')[:50000]
+            except Exception:
+                return ""
+
+        # Plain text
+        elif ext in ('txt', 'csv', 'md', 'log'):
+            try:
+                return filepath.read_text(encoding='utf-8', errors='ignore')[:50000]
+            except Exception:
+                return ""
+
+        return ""
 
     @property
     def entities(self) -> List[EntityHit]:

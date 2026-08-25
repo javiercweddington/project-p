@@ -37,12 +37,13 @@ Dependencies (optional, ranked by quality):
 - PyMuPDF (fitz): Best control over PDF internals
 - pdfminer.six: Text extraction with layout awareness
 - reportlab: Page rebuilding with cleaned text
-- PyPDF2: Basic operations (fallback)
+- pypdf: Basic operations (fallback)
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import struct
 from pathlib import Path
@@ -53,12 +54,15 @@ from .text import TextCleaner
 
 _logger = logging.getLogger(__name__)
 
-# Try optional dependencies
+# Try optional dependencies (modern pypdf only; PyPDF2 is deprecated)
 try:
-    from PyPDF2 import PdfReader, PdfWriter
-    HAS_PYPDF2 = True
+    from pypdf import PdfReader, PdfWriter
+    HAS_PYPDF = True
 except ImportError:
-    HAS_PYPDF2 = False
+    HAS_PYPDF = False
+
+# Alias for backward compatibility in code references
+HAS_PYPDF2 = HAS_PYPDF
 
 try:
     from pdfminer.high_level import extract_text, extract_pages
@@ -87,7 +91,7 @@ class PDFCleaner:
     Uses a multi-strategy approach based on available dependencies:
     - PyMuPDF (best): Full page rebuild with cleaned content
     - pdfminer + reportlab: Extract text, rebuild pages
-    - PyPDF2 (fallback): Metadata removal + incremental update detection
+    - pypdf (fallback): Metadata removal + incremental update detection
     - copy-as-is (last resort): When no PDF library is available
 
     All strategies attempt to address incremental updates by rebuilding
@@ -103,8 +107,8 @@ class PDFCleaner:
             self._strategy = 'pymupdf'
         elif HAS_PDFMINER and HAS_REPORTLAB:
             self._strategy = 'pdfminer_reportlab'
-        elif HAS_PYPDF2:
-            self._strategy = 'pypdf2'
+        elif HAS_PYPDF:
+            self._strategy = 'pypdf'
         else:
             self._strategy = 'copy'
 
@@ -135,8 +139,8 @@ class PDFCleaner:
                 return self._clean_with_pymupdf(input_path, output_path)
             elif self._strategy == 'pdfminer_reportlab':
                 return self._clean_with_pdfminer(input_path, output_path)
-            elif self._strategy == 'pypdf2':
-                return self._clean_with_pypdf2(input_path, output_path)
+            elif self._strategy == 'pypdf':
+                return self._clean_with_pypdf(input_path, output_path)
             else:
                 return self._copy_as_is(input_path, output_path)
         except Exception as e:
@@ -185,20 +189,22 @@ class PDFCleaner:
     def _clean_with_pymupdf(self, input_path: Path, output_path: Path) -> bool:
         """Use PyMuPDF for full PDF sanitization.
 
-        Full page rebuild: extracts text from each page, cleans entities,
-        removes all metadata/annotations/attachments/signatures/JS,
-        and rebuilds the PDF from scratch.
+        Uses redaction annotations to remove entity text from the original
+        document, preserving layout and CJK text. This is superior to the
+        extract-and-rebuild approach which destroys formatting and drops CJK.
 
-        This addresses incremental updates by NOT copying page objects.
+        This addresses incremental updates by applying redactions which
+        replace content streams rather than overlaying black boxes.
         """
         try:
             doc = fitz.open(str(input_path))
 
-            # Check for embedded files
-            if doc.embfile_count() > 0:
+            # Check for embedded files using correct API
+            embfile_names = doc.embfile_names()
+            if embfile_names:
                 _logger.warning(
                     "PDF %s has %d embedded files (will be removed)",
-                    input_path.name, doc.embfile_count(),
+                    input_path.name, len(embfile_names),
                 )
 
             # Check for JavaScript
@@ -209,33 +215,40 @@ class PDFCleaner:
                     input_path.name,
                 )
 
-            # Check for digital signatures
-            if doc.is_signed:
-                _logger.warning(
-                    "PDF %s has digital signature (will be removed)",
-                    input_path.name,
-                )
+            # Check for digital signatures (correct API: doc.is_signed is a method in newer versions)
+            try:
+                if hasattr(doc, 'is_signed') and callable(doc.is_signed):
+                    is_signed = doc.is_signed()
+                else:
+                    is_signed = getattr(doc, 'is_signed', False)
+                if is_signed:
+                    _logger.warning(
+                        "PDF %s has digital signature (will be removed)",
+                        input_path.name,
+                    )
+            except Exception:
+                pass
 
             # Check for 3D annotations
             self._check_3d_annotations(doc)
 
-            # Create new document (fresh, no incremental update history)
-            new_doc = fitz.open()
+            # Get entity terms to redact from the mapper
+            entity_terms = self._get_entity_terms_to_redact()
 
             for page_num in range(len(doc)):
                 page = doc[page_num]
 
-                # Remove annotations before extracting text
-                # (annotations may contain sensitive text not in main content)
-                annot_count = page.count_annotations()
-                if annot_count > 0:
+                # Remove annotations using correct API (iterate page.annots)
+                annots = list(page.annots()) if page.annots() else []
+                if annots:
                     _logger.debug(
                         "Removing %d annotations from page %d",
-                        annot_count, page_num + 1,
+                        len(annots), page_num + 1,
                     )
-                    page.delete_annotations()
+                    while page.annots():
+                        page.delete_annot(page.annots()[0])
 
-                # Extract text (including from form fields)
+                # Extract text and clean it to find entities present
                 text = page.get_text()
 
                 # Also extract form field values
@@ -250,44 +263,33 @@ class PDFCleaner:
                         if field_value:
                             text += "\n" + field_value
 
-                # Clean text
+                # Clean text to determine which entities are present
                 cleaned_text = self.text_cleaner.clean_text(text)
 
-                # Get page dimensions
-                rect = page.rect
-
-                # Create new page with same dimensions
-                new_page = new_doc.new_page(width=rect.width, height=rect.height)
-
-                # Insert cleaned text (basic insertion, loses formatting)
-                if cleaned_text.strip():
-                    new_page.insert_text(
-                        (72, 72),  # Margin
-                        cleaned_text,
-                        fontsize=11,
-                    )
-
-                # Copy images (without metadata)
-                image_list = page.get_images(full=True)
-                for img_info in image_list:
+                # Find entity terms that appear in this page and redact them
+                for term in entity_terms:
                     try:
-                        xref = img_info[0]
-                        base_image = doc.extract_image(xref)
-                        image_bytes = base_image["image"]
-                        new_page.insert_image(
-                            rect,
-                            image=image_bytes,
-                        )
+                        occurrences = page.search_for(term)
+                        if occurrences:
+                            _logger.debug(
+                                "Redacting '%s' (%d occurrences) on page %d",
+                                term, len(occurrences), page_num + 1,
+                            )
+                            for rect in occurrences:
+                                page.add_redact_annot(rect)
                     except Exception:
-                        _logger.debug(
-                            "Failed to extract image from page %d", page_num + 1,
-                        )
+                        pass
+
+                # Apply all redaction annotations (replaces content, not overlay)
+                if page.annots():
+                    page.apply_redactions()
+
+            # Clear document metadata
+            doc.set_metadata(["", "", "", "", "", "", "", ""])
 
             # Save with garbage collection (removes unused objects)
-            # garbage=4 is maximum cleanup
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            new_doc.save(str(output_path), garbage=4, deflate=True, clean=True)
-            new_doc.close()
+            doc.save(str(output_path), garbage=4, deflate=True, clean=True)
             doc.close()
 
             return True
@@ -296,15 +298,35 @@ class PDFCleaner:
             _logger.error("PyMuPDF cleaning failed: %s", e)
             return False
 
+    def _get_entity_terms_to_redact(self) -> List[str]:
+        """Get list of entity terms that should be redacted from PDFs.
+
+        Returns terms from the entity mapper that need to be searched for
+        and redacted in PDF pages.
+        """
+        terms = []
+
+        # EntityMapper stores mappings in _mappings: Dict[str, EntityMapping]
+        # where EntityMapping has .original (the original entity text)
+        if hasattr(self.mapper, '_mappings'):
+            for mapping in self.mapper._mappings.values():
+                original = mapping.original
+                if original and len(original.strip()) > 0:
+                    terms.append(original)
+
+        return list(set(terms))  # Deduplicate
+
     def _check_3d_annotations(self, doc) -> None:
         """Check for U3D/PRC 3D model annotations."""
         for page_num in range(len(doc)):
             page = doc[page_num]
             try:
-                annots = page.get_annotations()
+                annots = list(page.annots()) if page.annots() else []
                 if annots:
                     for annot in annots:
-                        if annot.get("type") == "3D":
+                        # annot.info is a dict with annotation properties
+                        info = annot.info
+                        if info.get("subtype") == "3D":
                             _logger.warning(
                                 "Page %d: U3D/PRC 3D model embedded (will be removed)",
                                 page_num + 1,
@@ -357,19 +379,19 @@ class PDFCleaner:
             _logger.error("pdfminer+reportlab cleaning failed: %s", e)
             return False
 
-    # ---- PyPDF2 strategy (fallback) ----
+    # ---- pypdf strategy (fallback) ----
 
-    def _clean_with_pypdf2(self, input_path: Path, output_path: Path) -> bool:
-        """Use PyPDF2 for PDF cleaning.
+    def _clean_with_pypdf(self, input_path: Path, output_path: Path) -> bool:
+        """Use pypdf for PDF cleaning.
 
-        WARNING: PyPDF2 copies page objects rather than rebuilding them,
+        WARNING: pypdf copies page objects rather than rebuilding them,
         which means incremental update data may persist. This strategy
         addresses XMP, annotations, attachments, and form fields but
         cannot guarantee removal of incremental update remnants.
 
         For full sanitization, use PyMuPDF strategy.
         """
-        if not HAS_PYPDF2:
+        if not HAS_PYPDF:
             return False
 
         try:
@@ -411,7 +433,7 @@ class PDFCleaner:
             return True
 
         except Exception as e:
-            _logger.error("PyPDF2 cleaning failed: %s", e)
+            _logger.error("pypdf cleaning failed: %s", e)
             return False
 
     def _remove_page_annotations(self, page, page_num: int) -> None:
@@ -434,7 +456,7 @@ class PDFCleaner:
     def _clean_page_content(self, page) -> None:
         """Attempt to clean page content stream.
 
-        Note: This is limited with PyPDF2. Full content stream
+        Note: This is limited with pypdf. Full content stream
         manipulation requires PyMuPDF or similar.
         """
         # Extract text and register entities
@@ -501,17 +523,17 @@ class PDFCleaner:
     # ---- fallback ----
 
     def _copy_as_is(self, input_path: Path, output_path: Path) -> bool:
-        """Fallback: copy the file without cleaning.
+        """Fallback: remove staged file when no PDF library is available.
 
         This is the last resort when no PDF library is available.
-        The file will pass through unsanitized.
+        Fail-closed: remove the staged original rather than shipping it.
         """
         _logger.warning(
-            "No PDF cleaning library available; copying PDF as-is. "
+            "No PDF cleaning library available; removing PDF (fail-closed). "
             "Install PyMuPDF for full sanitization: pip install PyMuPDF"
         )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(input_path, output_path)
+        if output_path.exists():
+            os.remove(output_path)
         return False  # Return False to indicate cleaning was not performed
 
     # ---- verification helpers ----
@@ -529,7 +551,7 @@ class PDFCleaner:
         Returns:
             Cleaned text or None if extraction failed
         """
-        if HAS_PYPDF2:
+        if HAS_PYPDF:
             try:
                 reader = PdfReader(str(input_path))
                 pages = []
@@ -575,8 +597,8 @@ class PDFCleaner:
         except Exception:
             pass
 
-        if not HAS_PYPDF2:
-            return risks or ["Cannot inspect PDF: PyPDF2 not available"]
+        if not HAS_PYPDF:
+            return risks or ["Cannot inspect PDF: pypdf not available"]
 
         try:
             reader = PdfReader(str(input_path))

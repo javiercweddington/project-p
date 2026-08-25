@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 import shutil
 import zipfile
@@ -66,13 +67,23 @@ class DOCXCleaner:
     for RSID values, tracked changes, and hidden text.
     """
 
-    # Office document core properties to clear
-    _CORE_PROPERTIES = {
-        'creator', 'last_modified_by', 'contributor',
-        'author', 'company', 'manager',
-        'description', 'subject', 'title',
-        'keywords', 'category', 'comments',
+    # python-docx core properties that contain identifier-like values
+    # and should go through the mapper instead of being blanked.
+    # Keys map to (property_name, entity_type) tuples.
+    _IDENTIFIER_PROPERTIES = {
+        'creator': ('creator', 'person'),
+        'last_modified_by': ('last_modified_by', 'person'),
+        'contributor': ('contributor', 'person'),
+        'company': ('company', 'company'),
     }
+
+    # python-docx core properties that should be blanked (non-identifiers)
+    _BLANK_PROPERTIES = {
+        'description', 'subject', 'keywords', 'category', 'comments',
+    }
+
+    # Fixed timestamp for embedded document timestamps
+    _FIXED_TIMESTAMP = "2024-01-01T00:00:00Z"
 
     # XML elements to remove from document
     _RSID_PATTERN = re.compile(r'w:rsid[\w]*\s*=\s*"[^"]*"')
@@ -99,23 +110,23 @@ class DOCXCleaner:
         """
         ext = input_path.suffix.lower()
 
-        # Legacy .doc format - can't safely clean, copy with warning
+        # Legacy .doc format - can't safely clean, remove staged file
         if ext == '.doc':
             _logger.warning(
                 "Legacy .doc format detected: %s. "
                 "Fast Save appends without removing - old text persists. "
-                "Copy-as-is with warning.",
+                "Removing staged file (fail-closed).",
                 input_path.name,
             )
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
+            if output_path.exists():
+                os.remove(output_path)
             return False
 
         if not HAS_PYTHON_DOCX:
-            _logger.warning("python-docx not available; copying DOCX as-is")
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
-            return True
+            _logger.warning("python-docx not available; removing DOCX (fail-closed)")
+            if output_path.exists():
+                os.remove(output_path)
+            return False
 
         try:
             doc = Document(str(input_path))
@@ -142,21 +153,51 @@ class DOCXCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning DOCX %s: %s", input_path, e)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
+            if output_path.exists():
+                os.remove(output_path)
             return False
 
     def _clear_properties(self, core_props) -> None:
-        """Clear core document properties."""
-        for prop_name in self._CORE_PROPERTIES:
-            setter = getattr(core_props, f'set_{prop_name}', None)
-            if setter:
-                setter('')
-            else:
-                try:
+        """Anonymize core document properties.
+
+        Identifier properties (creator, company, etc.) go through the mapper
+        to generate consistent placeholders like [PERSON_002].
+        Non-identifier properties are blanked.
+        Embedded timestamps are normalized to a fixed epoch.
+        """
+        # Anonymize identifier properties through the mapper
+        for prop_name, (_, entity_type) in self._IDENTIFIER_PROPERTIES.items():
+            try:
+                value = getattr(core_props, prop_name, None)
+                if value and str(value).strip():
+                    placeholder = self.mapper.get_or_create(
+                        entity_type=entity_type,
+                        value=str(value).strip(),
+                        source='docx_core_properties',
+                    )
+                    setattr(core_props, prop_name, placeholder)
+                else:
                     setattr(core_props, prop_name, '')
-                except (AttributeError, TypeError):
-                    pass
+            except (AttributeError, TypeError):
+                pass
+
+        # Blank non-identifier properties
+        for prop_name in self._BLANK_PROPERTIES:
+            try:
+                setattr(core_props, prop_name, '')
+            except (AttributeError, TypeError):
+                pass
+
+        # Normalize embedded timestamps to fixed epoch
+        for prop_name in ('created', 'modified', 'last_printed'):
+            try:
+                current = getattr(core_props, prop_name, None)
+                if current is None:
+                    setattr(core_props, prop_name, self._FIXED_TIMESTAMP)
+                else:
+                    setattr(core_props, prop_name, self._FIXED_TIMESTAMP)
+            except (AttributeError, TypeError):
+                pass
 
     def _clear_custom_properties(self, doc) -> None:
         """Clear custom properties from the XML."""
@@ -186,18 +227,25 @@ class DOCXCleaner:
                             if isinstance(run.text, str) and run.text:
                                 run.text = self.text_cleaner.clean_text(run.text)
 
-        # Clean headers and footers
-        # Note: python-docx exposes headers/footers through the document, not sections
-        for header in doc.headers:
-            for para in header.paragraphs:
-                for run in para.runs:
-                    if isinstance(run.text, str) and run.text:
-                        run.text = self.text_cleaner.clean_text(run.text)
-        for footer in doc.footers:
-            for para in footer.paragraphs:
-                for run in para.runs:
-                    if isinstance(run.text, str) and run.text:
-                        run.text = self.text_cleaner.clean_text(run.text)
+        # Clean headers and footers through sections
+        # python-docx does not expose doc.headers/doc.footers - must iterate sections
+        for section in doc.sections:
+            # Headers: first-page, even-page, and default (odd-page) variants
+            for header_attr in ('header', 'header_first_page', 'header_even'):
+                header = getattr(section, header_attr, None)
+                if header is not None:
+                    for para in header.paragraphs:
+                        for run in para.runs:
+                            if isinstance(run.text, str) and run.text:
+                                run.text = self.text_cleaner.clean_text(run.text)
+            # Footers: same page-variant pattern
+            for footer_attr in ('footer', 'footer_first_page', 'footer_even'):
+                footer = getattr(section, footer_attr, None)
+                if footer is not None:
+                    for para in footer.paragraphs:
+                        for run in para.runs:
+                            if isinstance(run.text, str) and run.text:
+                                run.text = self.text_cleaner.clean_text(run.text)
 
     def _clean_xml_artifacts(self, source_bytes: io.BytesIO,
                               output_path: Path) -> None:
