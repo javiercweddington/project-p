@@ -187,17 +187,17 @@ class DOCXCleaner:
                                 run.text = self.text_cleaner.clean_text(run.text)
 
         # Clean headers and footers
-        for section in doc.sections:
-            for header in section.headers:
-                for para in header.paragraphs:
-                    for run in para.runs:
-                        if isinstance(run.text, str) and run.text:
-                            run.text = self.text_cleaner.clean_text(run.text)
-            for footer in section.footers:
-                for para in footer.paragraphs:
-                    for run in para.runs:
-                        if isinstance(run.text, str) and run.text:
-                            run.text = self.text_cleaner.clean_text(run.text)
+        # Note: python-docx exposes headers/footers through the document, not sections
+        for header in doc.headers:
+            for para in header.paragraphs:
+                for run in para.runs:
+                    if isinstance(run.text, str) and run.text:
+                        run.text = self.text_cleaner.clean_text(run.text)
+        for footer in doc.footers:
+            for para in footer.paragraphs:
+                for run in para.runs:
+                    if isinstance(run.text, str) and run.text:
+                        run.text = self.text_cleaner.clean_text(run.text)
 
     def _clean_xml_artifacts(self, source_bytes: io.BytesIO,
                               output_path: Path) -> None:
