@@ -272,8 +272,6 @@ class CADCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning STEP %s: %s", input_path, e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _clean_stl(self, input_path: Path, output_path: Path) -> bool:
@@ -312,8 +310,6 @@ class CADCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning STL %s: %s", input_path, e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _clean_binary_cad(self, input_path: Path, output_path: Path, ext: str) -> bool:
@@ -341,11 +337,9 @@ class CADCleaner:
             if not HAS_OLEFILE:
                 _logger.warning(
                     "olefile not available; cannot strip OLE metadata from %s. "
-                    "Removing staged file (fail-closed).",
+                    "Fail-closed: returning False for pipeline quarantine.",
                     ext,
                 )
-                if output_path.exists():
-                    os.remove(output_path)
                 return False
 
             ole = olefile.OleFileIO(input_path)
@@ -407,15 +401,11 @@ class CADCleaner:
 
         except subprocess.TimeoutExpired:
             _logger.error("exiftool timed out for %s", input_path.name)
-            if output_path.exists():
-                os.remove(output_path)
             return False
         except Exception as e:
             _logger.error(
                 "Error stripping OLE metadata from %s: %s", input_path, e,
             )
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _remove_binary_cad_with_warning(self, input_path: Path,
@@ -424,11 +414,9 @@ class CADCleaner:
         _logger.warning(
             "Binary CAD file (%s) cannot be safely cleaned. "
             "May contain embedded metadata (author, paths, properties). "
-            "Removing staged file (fail-closed).",
+            "Fail-closed: returning False for pipeline quarantine.",
             ext,
         )
-        if output_path.exists():
-            os.remove(output_path)
         return False
 
     def _handle_zip_based_cad(self, input_path: Path,

@@ -132,7 +132,21 @@ class CleanPipeline:
             )
             self._verifier_tracker.record_change(original, placeholder, source or "")
 
-        self.mapper = mapper or EntityMapper(tracker_callback=_on_replace)
+        self.mapper = mapper
+        if self.mapper is None:
+            self.mapper = EntityMapper(tracker_callback=_on_replace)
+        else:
+            # Wire up the tracker callback even for externally-provided mappers
+            # so that replacements are counted in the diff report
+            existing_callback = self.mapper._tracker_callback
+            if existing_callback is not None:
+                # Chain callbacks: call both the existing one and our tracker
+                def _chained_callback(original: str, placeholder: str, source: str) -> None:
+                    existing_callback(original, placeholder, source)
+                    _on_replace(original, placeholder, source)
+                self.mapper._tracker_callback = _chained_callback
+            else:
+                self.mapper._tracker_callback = _on_replace
         self._entity_spans: Dict[str, List[Tuple[int, int, str, str]]] = {}
 
     def load_entity_spans(self, spans: Dict[str, List[Tuple[int, int, str, str]]]) -> None:
@@ -209,6 +223,10 @@ class CleanPipeline:
             result.errors.append(f"All {failed} files failed to clean")
             result.success = False
             return result
+
+        # Step 2b: Anonymize filenames and directory components
+        # Must run BEFORE verification so the verifier sees anonymized paths
+        self._anonymize_paths()
 
         # Step 3: Run verification
         try:
@@ -324,9 +342,6 @@ class CleanPipeline:
                 # Quarantine: move the original file outside the deliverable
                 self._quarantine_file(staging_file, rel_path)
 
-        # Anonymize filenames and directory components
-        self._anonymize_paths()
-
         return cleaned, failed
 
     def _anonymize_paths(self) -> None:
@@ -347,7 +362,15 @@ class CleanPipeline:
         for dirpath, dirnames, filenames in os.walk(self.staging_dir, topdown=False):
             current_dir = Path(dirpath)
 
-            # Skip staging root itself
+            # Check files in this directory (ALWAYS, including staging root)
+            for filename in filenames:
+                if filename.startswith('.'):
+                    continue
+                anonymized_file = self.mapper.replace_in_text(filename)
+                if anonymized_file != filename:
+                    files_to_rename.append(current_dir / filename)
+
+            # Skip staging root itself for directory renaming
             if current_dir == self.staging_dir:
                 continue
 
@@ -355,14 +378,6 @@ class CleanPipeline:
             anonymized_dir = self.mapper.replace_in_text(current_dir.name)
             if anonymized_dir != current_dir.name:
                 dirs_to_rename.append(current_dir)
-
-            # Check files in this directory
-            for filename in filenames:
-                if filename.startswith('.'):
-                    continue
-                anonymized_file = self.mapper.replace_in_text(filename)
-                if anonymized_file != filename:
-                    files_to_rename.append(current_dir / filename)
 
         # Rename files first
         for file_path in files_to_rename:

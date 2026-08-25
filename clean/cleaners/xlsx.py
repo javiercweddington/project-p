@@ -143,22 +143,18 @@ class XLSXCleaner:
         """
         ext = input_path.suffix.lower()
 
-        # Legacy BIFF format - can't safely clean, remove staged file
+        # Legacy BIFF format - can't safely clean, leave file for pipeline quarantine
         if ext == '.xls':
             _logger.warning(
                 "Legacy .xls (BIFF) format detected: %s. "
                 "BIFF slack retains deleted-cell remnants. "
-                "Removing staged file (fail-closed).",
+                "Fail-closed: returning False for pipeline quarantine.",
                 input_path.name,
             )
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
         if not HAS_OPENPYXL:
-            _logger.warning("openpyxl not available; removing Excel file (fail-closed)")
-            if output_path.exists():
-                os.remove(output_path)
+            _logger.warning("openpyxl not available; Excel file fail-closed")
             return False
 
         try:
@@ -190,8 +186,6 @@ class XLSXCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning Excel file %s: %s", input_path, e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _clear_properties(self, props) -> None:
@@ -225,12 +219,6 @@ class XLSXCleaner:
             except (AttributeError, TypeError):
                 pass
 
-        # Normalize embedded timestamps to fixed epoch
-        for prop_name in ('created', 'modified', 'lastPrinted'):
-            try:
-                setattr(props, prop_name, self._FIXED_TIMESTAMP)
-            except (AttributeError, TypeError):
-                pass
 
     def _clean_sheet_names(self, wb) -> None:
         """Clean sheet names and defined names to remove identifiers.
@@ -249,15 +237,16 @@ class XLSXCleaner:
                     ws.title = cleaned or ws.title  # Don't allow empty
 
         # Clean defined names (named ranges that may contain paths/names)
+        # In modern openpyxl, wb.defined_names is a DefinedNameDict iterable over (name, value) tuples
+        # definedNameFinder was removed in openpyxl 3.1+
         if wb.defined_names:
-            for name in list(wb.defined_names.definedNameFinder.keys()):
-                # Clean the defined name itself
+            # Collect items first since we'll modify the dict during iteration
+            defined_items = list(wb.defined_names.items())
+            for name, value in defined_items:
                 cleaned_name = self.text_cleaner.clean_text(name)
                 if cleaned_name != name:
-                    # Get the value and re-register under cleaned name
-                    old_val = wb.defined_names[name]
                     del wb.defined_names[name]
-                    wb.defined_names[cleaned_name] = old_val
+                    wb.defined_names[cleaned_name] = value
 
     def _clean_all_sheets(self, wb) -> None:
         """Clean cell content across all worksheets with bounded iteration.

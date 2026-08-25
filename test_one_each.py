@@ -117,19 +117,21 @@ def main():
 
     if result.diff_report:
         print(f"\n--- Diff Report ---")
-        print(f"  Files tracked:   {result.diff_report.files_tracked}")
-        print(f"  Files changed:   {result.diff_report.files_changed}")
-        print(f"  Files unchanged: {result.diff_report.files_unchanged}")
-        print(f"  Total changes:   {result.diff_report.total_changes}")
+        print(f"  Total files:      {result.diff_report.total_files}")
+        print(f"  Files w/ changes: {result.diff_report.files_with_changes}")
+        print(f"  Total changes:    {result.diff_report.total_changes}")
 
     if result.leakage_report:
         print(f"\n--- Leakage Report ---")
         print(f"  Total leakages:  {result.leakage_report.total_leakages}")
         print(f"  Failed checks:   {len(result.leakage_report.failed_checks)}")
-        print(f"  Passed checks:   {len(result.leakage_report.passed_checks)}")
+        passed = len(result.leakage_report.results) - len(result.leakage_report.failed_checks)
+        print(f"  Passed checks:   {passed}")
         if result.leakage_report.failed_checks:
             for check in result.leakage_report.failed_checks[:10]:
-                print(f"    - {check}")
+                print(f"    - {check.check_name}: {check.details}")
+                for hit in check.hits[:5]:
+                    print(f"      * {hit.original!r} in {hit.file_path}")
 
     if result.errors:
         print(f"\n--- Errors ---")

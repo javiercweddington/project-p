@@ -98,21 +98,17 @@ class PPTXCleaner:
         """
         ext = input_path.suffix.lower()
 
-        # Legacy .ppt format - can't safely clean, remove staged file
+        # Legacy .ppt format - can't safely clean, leave file for pipeline quarantine
         if ext == '.ppt':
             _logger.warning(
                 "Legacy .ppt format detected: %s. "
-                "Removing staged file (fail-closed).",
+                "Fail-closed: returning False for pipeline quarantine.",
                 input_path.name,
             )
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
         if not HAS_PYTHON_PPTX:
-            _logger.warning("python-pptx not available; removing PPTX (fail-closed)")
-            if output_path.exists():
-                os.remove(output_path)
+            _logger.warning("python-pptx not available; PPTX fail-closed")
             return False
 
         try:
@@ -137,8 +133,6 @@ class PPTXCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning PPTX %s: %s", input_path, e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _clear_properties(self, core_props) -> None:

@@ -117,9 +117,7 @@ class ImageCleaner:
             True if cleaning was successful
         """
         if not HAS_PIL:
-            _logger.warning("PIL not available; removing image (fail-closed)")
-            if output_path.exists():
-                os.remove(output_path)
+            _logger.warning("PIL not available; image fail-closed")
             return False
 
         try:
@@ -136,9 +134,7 @@ class ImageCleaner:
                 )
                 if self._quarantine_dir is not None:
                     self._quarantine(input_path, self._quarantine_dir)
-                # Remove the staged output file (fail-closed for images with PII)
-                if output_path.exists():
-                    os.remove(output_path)
+                # Return False so pipeline can quarantine (fail-closed for images with PII)
                 return False
 
             # Step 2: Remove metadata
@@ -151,8 +147,6 @@ class ImageCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning image %s: %s", input_path, e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _quarantine(self, input_path: Path, quarantine_dir: Path) -> None:
@@ -265,8 +259,6 @@ class ImageCleaner:
 
         except Exception as e:
             _logger.error("JPEG cleaning failed: %s", e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _clean_tiff(self, input_path: Path, output_path: Path) -> bool:
@@ -296,8 +288,6 @@ class ImageCleaner:
 
         except Exception as e:
             _logger.error("TIFF cleaning failed: %s", e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _clean_other_image(self, input_path: Path, output_path: Path) -> bool:
@@ -328,8 +318,6 @@ class ImageCleaner:
 
         except Exception as e:
             _logger.error("Image cleaning failed for %s: %s", input_path, e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _verify_jpeg_clean(self, output_path: Path) -> None:

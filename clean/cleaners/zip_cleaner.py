@@ -118,15 +118,11 @@ class ZipCleaner:
                     )
                 else:
                     _logger.warning(
-                        "Not a ZIP file: %s, removing staged file (fail-closed)",
+                        "Not a ZIP file: %s, fail-closed",
                         input_path.name,
                     )
-                    if output_path.exists():
-                        os.remove(output_path)
                     return False
             except Exception:
-                if output_path.exists():
-                    os.remove(output_path)
                 return False
 
         # Create temp directory for extraction
@@ -166,8 +162,6 @@ class ZipCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning ZIP %s: %s", input_path, e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
         finally:

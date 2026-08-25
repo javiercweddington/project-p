@@ -126,10 +126,8 @@ class FileCleanerRouter:
         if ext == '.dat':
             return self._handle_dat_file(input_path, output_path)
 
-        # Unknown type: remove staged file (fail-closed)
-        _logger.debug("Unknown file type %s; removing staged file (fail-closed)", ext)
-        if output_path.exists():
-            os.remove(output_path)
+        # Unknown type: fail-closed, let pipeline quarantine
+        _logger.debug("Unknown file type %s; fail-closed", ext)
         return False
 
     def _handle_dat_file(self, input_path: Path, output_path: Path) -> bool:
@@ -199,8 +197,6 @@ class FileCleanerRouter:
 
         except Exception as e:
             _logger.error("Failed to handle .dat file %s: %s", input_path, e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def get_cleaner_for_ext(self, ext: str):

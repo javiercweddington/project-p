@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -110,22 +111,18 @@ class DOCXCleaner:
         """
         ext = input_path.suffix.lower()
 
-        # Legacy .doc format - can't safely clean, remove staged file
+        # Legacy .doc format - can't safely clean, leave file for pipeline quarantine
         if ext == '.doc':
             _logger.warning(
                 "Legacy .doc format detected: %s. "
                 "Fast Save appends without removing - old text persists. "
-                "Removing staged file (fail-closed).",
+                "Fail-closed: returning False for pipeline quarantine.",
                 input_path.name,
             )
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
         if not HAS_PYTHON_DOCX:
-            _logger.warning("python-docx not available; removing DOCX (fail-closed)")
-            if output_path.exists():
-                os.remove(output_path)
+            _logger.warning("python-docx not available; DOCX fail-closed")
             return False
 
         try:
@@ -153,8 +150,6 @@ class DOCXCleaner:
 
         except Exception as e:
             _logger.error("Error cleaning DOCX %s: %s", input_path, e)
-            if output_path.exists():
-                os.remove(output_path)
             return False
 
     def _clear_properties(self, core_props) -> None:
@@ -189,13 +184,12 @@ class DOCXCleaner:
                 pass
 
         # Normalize embedded timestamps to fixed epoch
+        # python-docx core_properties requires datetime objects (not strings, not None)
+        # Set to a fixed datetime to remove temporal leakage
+        _fixed_dt = datetime(2024, 1, 1, 0, 0, 0)
         for prop_name in ('created', 'modified', 'last_printed'):
             try:
-                current = getattr(core_props, prop_name, None)
-                if current is None:
-                    setattr(core_props, prop_name, self._FIXED_TIMESTAMP)
-                else:
-                    setattr(core_props, prop_name, self._FIXED_TIMESTAMP)
+                setattr(core_props, prop_name, _fixed_dt)
             except (AttributeError, TypeError):
                 pass
 

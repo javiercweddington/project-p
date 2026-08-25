@@ -523,18 +523,16 @@ class PDFCleaner:
     # ---- fallback ----
 
     def _copy_as_is(self, input_path: Path, output_path: Path) -> bool:
-        """Fallback: remove staged file when no PDF library is available.
+        """Fallback: fail-closed when no PDF library is available.
 
         This is the last resort when no PDF library is available.
-        Fail-closed: remove the staged original rather than shipping it.
+        Fail-closed: return False so the pipeline can quarantine the file.
         """
         _logger.warning(
-            "No PDF cleaning library available; removing PDF (fail-closed). "
+            "No PDF cleaning library available; PDF fail-closed. "
             "Install PyMuPDF for full sanitization: pip install PyMuPDF"
         )
-        if output_path.exists():
-            os.remove(output_path)
-        return False  # Return False to indicate cleaning was not performed
+        return False  # Return False so pipeline can quarantine
 
     # ---- verification helpers ----
 
