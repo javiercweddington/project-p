@@ -25,8 +25,11 @@ from .cleaner import (
     TextCleaner,
     PDFCleaner,
     ImageCleaner,
-    AudioCleaner,
-    VideoCleaner,
+    XLSXCleaner,
+    DOCXCleaner,
+    CADCleaner,
+    PPTXCleaner,
+    ZipCleaner,
     FileCleanerRouter,
 )
 
@@ -68,8 +71,11 @@ __all__ = [
     "TextCleaner",
     "PDFCleaner",
     "ImageCleaner",
-    "AudioCleaner",
-    "VideoCleaner",
+    "XLSXCleaner",
+    "DOCXCleaner",
+    "CADCleaner",
+    "PPTXCleaner",
+    "ZipCleaner",
     "FileCleanerRouter",
     # Diff
     "ChangeRecord",

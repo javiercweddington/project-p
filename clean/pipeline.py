@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import time
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -32,6 +34,17 @@ _logger = logging.getLogger(__name__)
 
 # Default staging directory
 DEFAULT_STAGING_DIR = Path("/tmp/clean")
+
+# Fixed timestamp for cleaned output files (2024-01-01 00:00:00 UTC)
+# Normalizes filesystem mtimes to prevent temporal leakage
+CLEAN_MTIME = 1704067200  # 2024-01-01 00:00:00 UTC as Unix timestamp
+
+# Size-delta threshold: warn if cleaned file shrinks by less than this percentage
+# A cleaned PDF that shrank 2% did not lose its incremental updates
+MIN_CLEAN_SHRINK_PERCENT = 5.0
+
+# Size-delta threshold: warn if cleaned file grows (should not happen)
+MAX_CLEAN_GROWTH_PERCENT = 10.0
 
 
 class CleanResult:
@@ -224,11 +237,18 @@ class CleanPipeline:
             if not staging_file.is_file():
                 continue
 
+            # Skip hidden/audit files
+            if staging_file.name.startswith('.'):
+                continue
+
             rel_path = staging_file.relative_to(self.staging_dir)
             source_file = self.source_dir / rel_path
 
             # Get entity spans for this file
             entity_spans = self._entity_spans.get(str(rel_path), None)
+
+            # Record original size before cleaning
+            orig_size = source_file.stat().st_size
 
             # Clean in-place (staging file is both input and output)
             success = router.clean_file(
@@ -241,8 +261,13 @@ class CleanPipeline:
                 # Record hashes and sizes
                 orig_hash = compute_file_hash(source_file)
                 clean_hash = compute_file_hash(staging_file)
-                orig_size = source_file.stat().st_size
                 clean_size = staging_file.stat().st_size
+
+                # Size-delta check: verify cleaning had effect
+                self._check_size_delta(rel_path, orig_size, clean_size)
+
+                # Normalize filesystem mtime to prevent temporal leakage
+                self._normalize_mtime(staging_file)
 
                 self.tracker.finalize_file(
                     file_path=str(rel_path),
@@ -257,6 +282,67 @@ class CleanPipeline:
                 _logger.warning("Failed to clean %s", rel_path)
 
         return cleaned, failed
+
+    def _check_size_delta(self, rel_path: Path, orig_size: int, clean_size: int) -> None:
+        """Check size delta between original and cleaned file.
+
+        A cleaned PDF that shrank 2% did not lose its incremental updates.
+        A cleaned file that grew is suspicious (should not happen).
+
+        Args:
+            rel_path: Relative path for logging
+            orig_size: Original file size in bytes
+            clean_size: Cleaned file size in bytes
+        """
+        if orig_size == 0:
+            return
+
+        delta = clean_size - orig_size
+        delta_percent = (delta / orig_size) * 100
+
+        # Check for growth (should not happen after cleaning)
+        if delta_percent > MAX_CLEAN_GROWTH_PERCENT:
+            _logger.warning(
+                "Size-delta WARNING: %s grew %.1f%% (%d -> %d bytes). "
+                "Cleaning may have failed or added content.",
+                rel_path, delta_percent, orig_size, clean_size,
+            )
+        elif delta_percent > 0:
+            _logger.info(
+                "Size-delta INFO: %s grew %.1f%% (%d -> %d bytes).",
+                rel_path, delta_percent, orig_size, clean_size,
+            )
+
+        # Check for insufficient shrinkage (ghost content may remain)
+        if 0 > delta_percent > -MIN_CLEAN_SHRINK_PERCENT:
+            _logger.warning(
+                "Size-delta WARNING: %s shrank only %.1f%% (%d -> %d bytes). "
+                "Ghost content (incremental updates, pivot cache, etc.) may remain.",
+                rel_path, abs(delta_percent), orig_size, clean_size,
+            )
+        elif delta_percent <= -MIN_CLEAN_SHRINK_PERCENT:
+            _logger.info(
+                "Size-delta OK: %s shrank %.1f%% (%d -> %d bytes).",
+                rel_path, abs(delta_percent), orig_size, clean_size,
+            )
+
+    def _normalize_mtime(self, file_path: Path) -> None:
+        """Normalize filesystem mtime to prevent temporal leakage.
+
+        Filesystem modification times map your work schedule. By setting
+        all cleaned files to a fixed timestamp, we remove this correlation
+        vector.
+
+        Args:
+            file_path: Path to the file whose mtime should be normalized
+        """
+        try:
+            os.utime(file_path, (CLEAN_MTIME, CLEAN_MTIME))
+        except OSError as e:
+            _logger.debug(
+                "Failed to normalize mtime for %s: %s",
+                file_path, e,
+            )
 
     def _save_mapper(self) -> None:
         """Save the entity mapper for audit trail."""
