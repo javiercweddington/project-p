@@ -996,7 +996,8 @@ class ConsistencyChecker:
 
 def verify_clean(cleaned_dir: Path, original_dir: Path,
                  mapper: EntityMapper, project_name: str = "",
-                 tracker: Optional[ChangeTracker] = None) -> LeakageReport:
+                 tracker: Optional[ChangeTracker] = None,
+                 progress: Optional[Callable[[str], None]] = None) -> LeakageReport:
     """Run all verification checks and return a comprehensive report.
 
     This is the main entry point for verification.
@@ -1028,10 +1029,12 @@ def verify_clean(cleaned_dir: Path, original_dir: Path,
     leakage_checker = LeakageChecker(mapper)
 
     # 1. Entity leakage check (format-aware)
+    if progress: progress('Entity Leakage Check')
     leakage_result = leakage_checker.run_check(cleaned_dir, original_dir)
     report.add_result(leakage_result)
 
     # 2. Filename check
+    if progress: progress('Filename Entity Check')
     filename_hits = leakage_checker.check_filenames(cleaned_dir)
     filename_result = VerificationResult(
         check_name="Filename Entity Check",
@@ -1042,6 +1045,7 @@ def verify_clean(cleaned_dir: Path, original_dir: Path,
     report.add_result(filename_result)
 
     # 3. Metadata check
+    if progress: progress('Metadata Entity Check')
     metadata_hits = leakage_checker.check_metadata(cleaned_dir)
     metadata_result = VerificationResult(
         check_name="Metadata Entity Check",
@@ -1052,16 +1056,19 @@ def verify_clean(cleaned_dir: Path, original_dir: Path,
     report.add_result(metadata_result)
 
     # 4. Re-scan for new entities
+    if progress: progress('Re-Scan Entity Detection')
     rescaner = ReScanner(mapper)
     rescan_result = rescaner.run_check(cleaned_dir)
     report.add_result(rescan_result)
 
     # 5. Legibility check
+    if progress: progress('Legibility Check')
     legibility_checker = LegibilityChecker()
     legibility_result = legibility_checker.run_check(cleaned_dir)
     report.add_result(legibility_result)
 
     # 6. Consistency check
+    if progress: progress('Consistency Check')
     consistency_checker = ConsistencyChecker(mapper)
     consistency_result = consistency_checker.run_check(cleaned_dir)
     report.add_result(consistency_result)

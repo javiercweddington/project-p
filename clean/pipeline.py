@@ -33,6 +33,58 @@ from .verifier import verify_clean, LeakageReport, ChangeTracker as VerifierChan
 
 _logger = logging.getLogger(__name__)
 
+
+class _Progress:
+    """Minimal, dependency-free progress reporting.
+
+    On a TTY: a live single-line bar  [#####.....] 12/34 cleaning: file.pdf
+    Otherwise (piped to a log/CI): one plain line per stage, one per N items.
+    Control: PROJECT_P_PROGRESS=1 forces on, =0 forces off; default is
+    "on when stderr is a TTY, plain-line mode otherwise".
+    """
+
+    def __init__(self):
+        import sys
+        env = os.environ.get('PROJECT_P_PROGRESS', '').strip()
+        self._tty = sys.stderr.isatty()
+        self.enabled = env != '0'
+        self._live = self._tty and env != '0'
+        self._stream = sys.stderr
+        self._last_len = 0
+
+    def stage(self, label: str) -> None:
+        if not self.enabled:
+            return
+        self._clear_line()
+        self._stream.write(f'--- {label}\n')
+        self._stream.flush()
+
+    def step(self, index: int, total: int, item: str = '') -> None:
+        if not self.enabled or total <= 0:
+            return
+        if self._live:
+            width = 24
+            filled = int(width * index / total)
+            bar = '#' * filled + '.' * (width - filled)
+            line = f'[{bar}] {index}/{total} {item[:48]}'
+            pad = max(0, self._last_len - len(line))
+            self._stream.write('\r' + line + ' ' * pad)
+            self._last_len = len(line)
+            self._stream.flush()
+        elif index == total or index % 5 == 0:
+            self._stream.write(f'    {index}/{total} {item[:60]}\n')
+            self._stream.flush()
+
+    def finish(self) -> None:
+        self._clear_line()
+
+    def _clear_line(self) -> None:
+        if self._live and self._last_len:
+            self._stream.write('\r' + ' ' * self._last_len + '\r')
+            self._stream.flush()
+            self._last_len = 0
+
+
 # Default staging directory
 DEFAULT_STAGING_DIR = Path("/tmp/clean")
 
@@ -207,9 +259,11 @@ class CleanPipeline:
         result.mapper = self.mapper
 
         _logger.info("Starting clean pipeline for %s", self.project_name)
+        self._progress = _Progress()
 
         # Step 1: Copy source to staging
         try:
+            self._progress.stage(f'copying {self.source_dir.name} to staging')
             self._copy_to_staging()
         except Exception as e:
             result.errors.append(f"Failed to copy to staging: {e}")
@@ -243,6 +297,7 @@ class CleanPipeline:
 
         # Step 2c: Anonymize filenames and directory components
         # Must run BEFORE verification so the verifier sees anonymized paths
+        self._progress.stage('anonymizing file and directory names')
         self._anonymize_paths()
 
         # Step 2d: Final mtime sweep — renames and directories would
@@ -257,6 +312,8 @@ class CleanPipeline:
                 mapper=self.mapper,
                 project_name=self.project_name,
                 tracker=self._verifier_tracker,
+                progress=lambda label: self._progress.stage(
+                    f'verifying: {label}'),
             )
 
             # Final LLM gate: anything the local model can still identify
@@ -264,6 +321,7 @@ class CleanPipeline:
             # PROJECT_P_LLM_VERIFY in clean/llm_detect.py).
             try:
                 from .llm_detect import LLMCleanlinessJudge
+                self._progress.stage('verifying: LLM Cleanliness Check')
                 leakage_report.add_result(
                     LLMCleanlinessJudge(self.mapper).run_check(
                         self.staging_dir)
@@ -358,13 +416,13 @@ class CleanPipeline:
         cleaned_files: List[Tuple[Path, Path]] = []  # (staging_file, rel_path)
         mapping_count_before = self.mapper.mapping_count
 
-        for staging_file in self.staging_dir.rglob('*'):
-            if not staging_file.is_file():
-                continue
+        todo = [f for f in self.staging_dir.rglob('*')
+                if f.is_file() and not f.name.startswith('.')]
+        progress = getattr(self, '_progress', None) or _Progress()
+        progress.stage(f'cleaning {len(todo)} files (pass 1)')
 
-            # Skip hidden/audit files
-            if staging_file.name.startswith('.'):
-                continue
+        for file_index, staging_file in enumerate(todo, 1):
+            progress.step(file_index, len(todo), staging_file.name)
 
             if staging_file.suffix.lower() in IMAGE_EXTS:
                 images_cleaned += 1
@@ -429,8 +487,15 @@ class CleanPipeline:
                 "(mapper has %d entities)",
                 extra_pass, len(cleaned_files), self.mapper.mapping_count,
             )
+            progress.stage(
+                f'retroactive re-clean pass {extra_pass} '
+                f'({len(cleaned_files)} files, '
+                f'{self.mapper.mapping_count} entities)')
             still_clean: List[Tuple[Path, Path]] = []
-            for staging_file, rel_path in cleaned_files:
+            for retro_index, (staging_file, rel_path) in enumerate(
+                    cleaned_files, 1):
+                progress.step(retro_index, len(cleaned_files),
+                              staging_file.name)
                 if not staging_file.exists():
                     continue
                 success = router.clean_file(
@@ -692,7 +757,12 @@ class CleanPipeline:
             return
 
         detector = LLMEntityDetector(self.mapper, llm)
+        progress = getattr(self, '_progress', None)
         for round_num in range(1, max_rounds + 1):
+            if progress:
+                progress.stage(
+                    f'LLM discovery round {round_num} '
+                    f'({llm.model} @ {llm.base_url})')
             try:
                 new_count = detector.scan_directory(self.staging_dir)
             except Exception as e:
@@ -705,6 +775,10 @@ class CleanPipeline:
             )
             if new_count == 0:
                 break
+            if progress:
+                progress.stage(
+                    f're-cleaning after LLM round {round_num} '
+                    f'({self.mapper.mapping_count} entities)')
             failures = self._inplace_reclean()
             if failures:
                 _logger.warning(
