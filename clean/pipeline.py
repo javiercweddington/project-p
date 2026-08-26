@@ -19,13 +19,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import time
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from .anonymizer import EntityMapper, SpanBasedReplacer
+from .anonymizer import EntityMapper, SpanBasedReplacer, PLACEHOLDER_TOKEN_RE
 from .cleaner import FileCleanerRouter, TEXT_EXTS, IMAGE_EXTS
 from .diff import ChangeTracker, DiffReport, compute_file_hash, compute_text_hash
 from .verifier import verify_clean, LeakageReport, ChangeTracker as VerifierChangeTracker
@@ -121,8 +122,10 @@ class CleanPipeline:
         # Wire up the mapper so every real substitution is recorded.
         # The callback signature is: (original, placeholder, source) -> None
         def _on_replace(original: str, placeholder: str, source: str) -> None:
-            # We don't know entity_type at callback time, but we can look it up
-            mapping = mapper.get_mapping(original) if mapper else None
+            # Late-bind through self.mapper: the constructor-arg `mapper` is
+            # None when the pipeline builds its own mapper, which made every
+            # recorded change type 'unknown'.
+            mapping = self.mapper.get_mapping(original) if self.mapper else None
             entity_type = mapping.entity_type if mapping else 'unknown'
             self.tracker.record_change(
                 file_path=source or "",
@@ -220,13 +223,31 @@ class CleanPipeline:
         result.total_entities_replaced = self.tracker.total_changes
 
         if failed > 0 and cleaned == 0:
+            # Do NOT return early: verification, the diff report, and the
+            # mapper audit trail must still be produced for failed runs.
             result.errors.append(f"All {failed} files failed to clean")
-            result.success = False
-            return result
 
-        # Step 2b: Anonymize filenames and directory components
+        if getattr(self, '_images_without_ocr', 0):
+            result.errors.append(
+                f"{self._images_without_ocr} image(s) processed WITHOUT OCR "
+                f"screening — sensitive pixel text cannot be ruled out. "
+                f"Install tesseract (and pytesseract) to clear this."
+            )
+
+        # Step 2b: LLM-backed discovery of entities the deterministic
+        # detectors can't express (prose names, companies, addresses,
+        # Chinese text). BACKSTOP ONLY: deterministic replacement has
+        # already run; this loop registers what the local model still
+        # sees and re-cleans until it finds nothing new.
+        self._llm_discovery_loop(result)
+
+        # Step 2c: Anonymize filenames and directory components
         # Must run BEFORE verification so the verifier sees anonymized paths
         self._anonymize_paths()
+
+        # Step 2d: Final mtime sweep — renames and directories would
+        # otherwise keep original modification times (temporal leak).
+        self._normalize_all_mtimes()
 
         # Step 3: Run verification
         try:
@@ -237,6 +258,19 @@ class CleanPipeline:
                 project_name=self.project_name,
                 tracker=self._verifier_tracker,
             )
+
+            # Final LLM gate: anything the local model can still identify
+            # in the cleaned output is a failing hit (mode-dependent; see
+            # PROJECT_P_LLM_VERIFY in clean/llm_detect.py).
+            try:
+                from .llm_detect import LLMCleanlinessJudge
+                leakage_report.add_result(
+                    LLMCleanlinessJudge(self.mapper).run_check(
+                        self.staging_dir)
+                )
+            except Exception as e:
+                _logger.warning("LLM cleanliness check errored: %s", e)
+
             result.leakage_report = leakage_report
 
             if not leakage_report.all_passed:
@@ -273,14 +307,43 @@ class CleanPipeline:
         return result
 
     def _copy_to_staging(self) -> None:
-        """Copy source files to staging directory."""
+        """Copy source files to staging directory.
+
+        Hidden files (.env, .DS_Store, ._AppleDouble, .git, ...) are NEVER
+        copied: the cleaning loop skips dotfiles, so copying them meant they
+        shipped verbatim — including under a SUCCESS result.
+        """
         if self.staging_dir.exists():
             shutil.rmtree(self.staging_dir)
 
-        self.staging_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(self.source_dir, self.staging_dir, dirs_exist_ok=True)
+        # Clear stale quarantine/audit state from prior runs of this project
+        for stale in (self._quarantine_root() / self.project_name,
+                      self._audit_root() / self.project_name):
+            if stale.exists():
+                shutil.rmtree(stale, ignore_errors=True)
 
-        _logger.info("Copied %s to %s", self.source_dir, self.staging_dir)
+        self.staging_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            self.source_dir, self.staging_dir, dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns('.*', '__MACOSX'),
+        )
+
+        _logger.info("Copied %s to %s (hidden files excluded)",
+                     self.source_dir, self.staging_dir)
+
+    def _quarantine_root(self) -> Path:
+        """Quarantine root OUTSIDE the deliverable tree.
+
+        The staging parent (default /tmp/clean) is exactly what the compact
+        step consumes, so quarantined raw originals must not live inside it.
+        """
+        parent = self.staging_dir.parent
+        return parent.parent / (parent.name + '_quarantine')
+
+    def _audit_root(self) -> Path:
+        """Audit root OUTSIDE the deliverable tree (see _quarantine_root)."""
+        parent = self.staging_dir.parent
+        return parent.parent / (parent.name + '_audit')
 
     def _clean_all_files(self) -> Tuple[int, int]:
         """Clean all files in staging directory.
@@ -291,6 +354,9 @@ class CleanPipeline:
         router = FileCleanerRouter(self.mapper)
         cleaned = 0
         failed = 0
+        images_cleaned = 0
+        cleaned_files: List[Tuple[Path, Path]] = []  # (staging_file, rel_path)
+        mapping_count_before = self.mapper.mapping_count
 
         for staging_file in self.staging_dir.rglob('*'):
             if not staging_file.is_file():
@@ -299,6 +365,9 @@ class CleanPipeline:
             # Skip hidden/audit files
             if staging_file.name.startswith('.'):
                 continue
+
+            if staging_file.suffix.lower() in IMAGE_EXTS:
+                images_cleaned += 1
 
             rel_path = staging_file.relative_to(self.staging_dir)
             source_file = self.source_dir / rel_path
@@ -336,24 +405,101 @@ class CleanPipeline:
                     cleaned_size=clean_size,
                 )
                 cleaned += 1
+                cleaned_files.append((staging_file, rel_path))
             else:
                 failed += 1
                 _logger.warning("Failed to clean %s", rel_path)
                 # Quarantine: move the original file outside the deliverable
                 self._quarantine_file(staging_file, rel_path)
 
+        # RETROACTIVE PASSES: entities discovered mid-run (emails inside a
+        # workbook, authors in document metadata) were unknown when earlier
+        # files were cleaned. Re-clean the already-cleaned outputs in place
+        # until the mapper stops growing, so every file reflects the full
+        # entity set. (Accuracy over speed, per project policy.)
+        max_extra_passes = 2
+        prev_mapping_count = mapping_count_before
+        extra_pass = 0
+        while (self.mapper.mapping_count != prev_mapping_count
+               and extra_pass < max_extra_passes and cleaned_files):
+            prev_mapping_count = self.mapper.mapping_count
+            extra_pass += 1
+            _logger.info(
+                "Retroactive cleaning pass %d over %d files "
+                "(mapper has %d entities)",
+                extra_pass, len(cleaned_files), self.mapper.mapping_count,
+            )
+            still_clean: List[Tuple[Path, Path]] = []
+            for staging_file, rel_path in cleaned_files:
+                if not staging_file.exists():
+                    continue
+                success = router.clean_file(
+                    input_path=staging_file,
+                    output_path=staging_file,
+                    entity_spans=None,
+                )
+                if success:
+                    self._normalize_mtime(staging_file)
+                    still_clean.append((staging_file, rel_path))
+                else:
+                    cleaned -= 1
+                    failed += 1
+                    _logger.warning(
+                        "Re-clean pass failed for %s; quarantining", rel_path,
+                    )
+                    self._quarantine_file(staging_file, rel_path)
+            cleaned_files = still_clean
+
+        # Surface OCR blindness: images cleaned WITHOUT OCR screening may
+        # ship sensitive pixel text (screenshots of receipts, invoices...).
+        # This must fail the run, not scroll by as a log line.
+        # NOTE: image_ocr is an instance even when tesseract is missing,
+        # so check the functional `available` flag rather than `is None`.
+        ocr = router.image_cleaner.image_ocr
+        ocr_functional = bool(ocr) and getattr(ocr, 'available', False)
+        if images_cleaned and not ocr_functional:
+            self._images_without_ocr = images_cleaned
+        else:
+            self._images_without_ocr = 0
+
         return cleaned, failed
 
+    # Placeholder tokens and separators that may remain in a fully
+    # anonymized name; anything else is identifying residue.
+    # MUST be the prefix-anchored pattern — a loose [A-Z]+_\d+ regex let
+    # real stems like IMG_20200615 pass as "placeholders" and ship verbatim.
+    _PLACEHOLDER_TOKEN_RE = PLACEHOLDER_TOKEN_RE
+    _NAME_SEPARATOR_RE = re.compile(r'[\s\-_.,;()+&#@!~\[\]{}]+')
+
+    def _anonymize_name(self, name: str, entity_type: str) -> str:
+        """Fully anonymize one file or directory name (STRICT policy).
+
+        1. Replace mapped entities with placeholders.
+        2. If the remaining stem still carries ANY residue beyond
+           placeholders and separators — dates ("20200615"), personal
+           acronyms ("JCW"), app/vendor names ("WeChat"), unmapped CJK,
+           version markers — the whole stem is replaced with a generic
+           pseudonym (FILE_001 / DIR_001) registered in the audit mapper,
+           because filename fragments are identifying even when no mapped
+           entity matches.
+
+        The extension is always preserved.
+        """
+        from .anonymizer import anonymize_path_component
+        return anonymize_path_component(self.mapper, name, entity_type)
+
     def _anonymize_paths(self) -> None:
-        """Rename files and directories in staging to replace sensitive entities.
+        """Rename files and directories in staging so NO identifying
+        information remains in any path component.
 
         Walks the staging directory bottom-up so that child paths are renamed
-        before their parents, avoiding broken intermediate paths. Also handles
-        ZIP member names by reprocessing any .zip files through the cleaner.
+        before their parents, avoiding broken intermediate paths.
 
-        Addresses the risk that filenames like:
-            "JCW20200615 INVOICE - Acme Corp - John Smith.xlsm"
-        contain sensitive entities that would otherwise be delivered as-is.
+        STRICT policy: names are first entity-replaced; any name still
+        carrying non-placeholder residue (dates, initials like "JCW",
+        app names like "WeChat", unmapped CJK text) is replaced wholesale
+        with FILE_nnn/DIR_nnn pseudonyms. The original names are preserved
+        in the audit mapper for traceability.
         """
         # Collect all directories and files
         dirs_to_rename: List[Path] = []
@@ -366,35 +512,30 @@ class CleanPipeline:
             for filename in filenames:
                 if filename.startswith('.'):
                     continue
-                anonymized_file = self.mapper.replace_in_text(filename)
-                if anonymized_file != filename:
-                    files_to_rename.append(current_dir / filename)
+                files_to_rename.append(current_dir / filename)
 
             # Skip staging root itself for directory renaming
             if current_dir == self.staging_dir:
                 continue
-
-            # Check if directory name needs anonymization
-            anonymized_dir = self.mapper.replace_in_text(current_dir.name)
-            if anonymized_dir != current_dir.name:
-                dirs_to_rename.append(current_dir)
+            dirs_to_rename.append(current_dir)
 
         # Rename files first
         for file_path in files_to_rename:
             if not file_path.exists():
                 continue
-            anonymized_name = self.mapper.replace_in_text(file_path.name)
-            # Ensure extension is preserved properly
-            new_path = file_path.parent / anonymized_name
-            self._safe_rename(file_path, new_path, "file")
+            anonymized_name = self._anonymize_name(file_path.name, 'filename')
+            if anonymized_name != file_path.name:
+                new_path = file_path.parent / anonymized_name
+                self._safe_rename(file_path, new_path, "file")
 
         # Rename directories bottom-up
         for dir_path in dirs_to_rename:
             if not dir_path.exists():
                 continue
-            anonymized_name = self.mapper.replace_in_text(dir_path.name)
-            new_path = dir_path.parent / anonymized_name
-            self._safe_rename(dir_path, new_path, "directory")
+            anonymized_name = self._anonymize_name(dir_path.name, 'directory')
+            if anonymized_name != dir_path.name:
+                new_path = dir_path.parent / anonymized_name
+                self._safe_rename(dir_path, new_path, "directory")
 
     def _safe_rename(self, old_path: Path, new_path: Path, item_type: str) -> None:
         """Safely rename a file or directory, handling conflicts.
@@ -481,7 +622,16 @@ class CleanPipeline:
             staging_file: Path to the file in staging that failed to clean
             rel_path: Relative path within the staging directory
         """
-        quarantine_dir = self.staging_dir.parent / '_quarantine' / self.project_name
+        if not staging_file.exists():
+            # The cleaner already removed its output (fail-closed) —
+            # nothing left in the deliverable, so nothing to move.
+            _logger.debug(
+                "No staged file to quarantine for %s (already removed "
+                "fail-closed by the cleaner).", rel_path,
+            )
+            return
+
+        quarantine_dir = self._quarantine_root() / self.project_name
         quarantine_dir.mkdir(parents=True, exist_ok=True)
 
         quarantine_path = quarantine_dir / rel_path
@@ -493,9 +643,111 @@ class CleanPipeline:
                 "Quarantined %s -> %s", rel_path, quarantine_path,
             )
         except OSError as e:
+            # FAIL CLOSED: if we cannot move the raw original out of the
+            # deliverable, delete it — a warning alone left it shipping.
             _logger.warning(
-                "Failed to quarantine %s: %s", rel_path, e,
+                "Failed to quarantine %s (%s); deleting from staging "
+                "instead (fail-closed).", rel_path, e,
             )
+            try:
+                staging_file.unlink()
+            except OSError as unlink_err:
+                _logger.error(
+                    "Could not delete %s from staging either: %s — "
+                    "MANUAL REMOVAL REQUIRED.", rel_path, unlink_err,
+                )
+
+    def _llm_discovery_loop(self, result: 'CleanResult',
+                            max_rounds: int = 3) -> None:
+        """Backstop entity discovery with the local LLM (Qwen at
+        PROJECT_P_LLM_BASE), used ONLY for what deterministic detection
+        cannot express. Each round: scan cleaned text, register findings,
+        re-clean in place; stop when the model finds nothing new.
+
+        Mode (PROJECT_P_LLM_VERIFY): off = skip; auto = use when the
+        endpoint answers; required = endpoint unreachable appends an error
+        (run fails). The LLM Cleanliness Check in verification is the
+        final gate either way.
+        """
+        from .llm_detect import (LLMEntityDetector, LocalLLM,
+                                 llm_verify_mode)
+
+        mode = llm_verify_mode()
+        if mode == 'off':
+            return
+
+        llm = LocalLLM()
+        if not llm.available():
+            if mode == 'required':
+                result.errors.append(
+                    f"LLM endpoint {llm.base_url} unreachable and "
+                    f"PROJECT_P_LLM_VERIFY=required — entities beyond "
+                    f"deterministic detection were NOT discovered."
+                )
+            else:
+                _logger.info(
+                    "LLM endpoint %s unreachable; skipping LLM discovery "
+                    "(deterministic detection only).", llm.base_url,
+                )
+            return
+
+        detector = LLMEntityDetector(self.mapper, llm)
+        for round_num in range(1, max_rounds + 1):
+            try:
+                new_count = detector.scan_directory(self.staging_dir)
+            except Exception as e:
+                result.errors.append(
+                    f"LLM discovery failed mid-scan (round {round_num}): {e}"
+                )
+                return
+            _logger.info(
+                "LLM discovery round %d: %d new entities", round_num, new_count,
+            )
+            if new_count == 0:
+                break
+            failures = self._inplace_reclean()
+            if failures:
+                _logger.warning(
+                    "%d file(s) failed the post-LLM re-clean and were "
+                    "quarantined", failures,
+                )
+
+    def _inplace_reclean(self) -> int:
+        """Re-clean every file currently in staging, in place.
+
+        Used after new entities enter the mapper (LLM discovery). Files
+        that fail are quarantined (fail-closed). Returns failure count.
+        """
+        router = FileCleanerRouter(self.mapper)
+        failures = 0
+        for staging_file in list(self.staging_dir.rglob('*')):
+            if not staging_file.is_file() or staging_file.name.startswith('.'):
+                continue
+            rel_path = staging_file.relative_to(self.staging_dir)
+            success = router.clean_file(
+                input_path=staging_file,
+                output_path=staging_file,
+                entity_spans=None,
+            )
+            if success:
+                self._normalize_mtime(staging_file)
+            else:
+                failures += 1
+                _logger.warning(
+                    "In-place re-clean failed for %s; quarantining", rel_path,
+                )
+                self._quarantine_file(staging_file, rel_path)
+        return failures
+
+    def _normalize_all_mtimes(self) -> None:
+        """Normalize mtimes of EVERYTHING left in staging (files and dirs).
+
+        Per-file normalization during cleaning misses directories and any
+        path touched by the rename pass; a final sweep closes the gap.
+        """
+        for path in self.staging_dir.rglob('*'):
+            self._normalize_mtime(path)
+        self._normalize_mtime(self.staging_dir)
 
     def _normalize_mtime(self, file_path: Path) -> None:
         """Normalize filesystem mtime to prevent temporal leakage.
@@ -523,7 +775,7 @@ class CleanPipeline:
         those values, so it is placed in a separate audit directory at the
         same level as the staging parent.
         """
-        audit_dir = self.staging_dir.parent / '_audit' / self.project_name
+        audit_dir = self._audit_root() / self.project_name
         audit_dir.mkdir(parents=True, exist_ok=True)
         mapper_path = audit_dir / ".entity_mapper.json"
         try:

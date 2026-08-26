@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 from io import BytesIO
 
-from .anonymizer import EntityMapper
+from .anonymizer import EntityMapper, NON_TEXT_ENTITY_TYPES
 
 # Try optional dependencies
 try:
@@ -195,6 +195,35 @@ class LeakageChecker:
 
     # -- public API ---------------------------------------------------------
 
+    def _entity_pattern(self, original: str,
+                        entity_type: Optional[str] = None) -> re.Pattern:
+        """Boundary/variant-aware pattern for an entity.
+
+        Uses the SAME pattern builder as the anonymizer so the verifier
+        detects exactly what the cleaner is expected to replace — including
+        collapsed/hyphenated/underscored variants ('globusmedical' in an
+        email) and person name tokens — and does NOT false-positive on
+        substrings ('SA' in 'USA').
+        """
+        build = getattr(self.mapper, '_build_pattern_cached', None) \
+            or getattr(self.mapper, '_build_pattern', None)
+        if build is not None:
+            try:
+                pattern = build(original, entity_type)
+            except TypeError:
+                try:
+                    pattern = build(original)
+                except Exception:
+                    pattern = None
+            except Exception:
+                pattern = None
+            if pattern is not None:
+                return pattern
+        if len(original) < 2:
+            # Degenerate value: match nothing rather than every letter
+            return re.compile(r'(?!x)x')
+        return re.compile(re.escape(original), re.IGNORECASE)
+
     def check_text(self, cleaned_text: str, file_path: str = "") -> List[LeakageHit]:
         """Check cleaned text for any surviving original entity strings."""
         hits = []
@@ -203,14 +232,22 @@ class LeakageChecker:
             original = mapping.original
             if not original or len(original) < 2:
                 continue
+            # Audit-only path pseudonyms (filename/directory stems) are not
+            # text entities; a stem like 'in' would flag every document.
+            if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
+                continue
 
-            # Case-insensitive search
-            pattern = re.compile(re.escape(original), re.IGNORECASE)
+            pattern = self._entity_pattern(original, mapping.entity_type)
             for match in pattern.finditer(cleaned_text):
+                # Skip matches inside an already-inserted placeholder token
+                start, end = match.start(), match.end()
+                if (start > 0 and cleaned_text[start - 1] == '['
+                        and re.match(r'_\d{3,}\]', cleaned_text[end:])):
+                    continue
                 # Get context
-                start = max(0, match.start() - 30)
-                end = min(len(cleaned_text), match.end() + 30)
-                context = cleaned_text[start:end].replace('\n', ' ')
+                ctx_start = max(0, start - 30)
+                ctx_end = min(len(cleaned_text), end + 30)
+                context = cleaned_text[ctx_start:ctx_end].replace('\n', ' ')
 
                 hits.append(LeakageHit(
                     file_path=file_path,
@@ -239,62 +276,98 @@ class LeakageChecker:
         if suffix == '.pdf':
             return self.check_pdf(cleaned_path)
 
-        # Plain text files
+        # Plain text files. Try multiple encodings; a BOM-less UTF-16LE
+        # file decodes "successfully" as UTF-8 into NUL-interleaved text
+        # invisible to entity patterns, so NUL-bearing decodes are retried
+        # as UTF-16.
+        for enc in ('utf-8', 'utf-16', 'gbk', 'gb18030'):
+            try:
+                with open(cleaned_path, 'r', encoding=enc) as f:
+                    text = f.read()
+            except (UnicodeError, OSError):
+                continue
+            if enc != 'utf-16' and '\x00' in text:
+                continue
+            return self.check_text(text, f"{display_path}[{enc}]")
+
+        # Undecodable: raw-bytes scan in both byte encodings as a last
+        # resort so binary-ish files are not silently skipped.
         try:
-            with open(cleaned_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-            return self.check_text(text, display_path)
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            # Binary file - skip text-based leakage check
-            _logger.debug("Binary file, skipping text leakage check: %s", display_path)
+            data = cleaned_path.read_bytes()
+            hits = []
+            for enc in ('utf-8', 'utf-16-le'):
+                hits.extend(self.check_text(
+                    data.decode(enc, errors='replace'),
+                    f"{display_path}[raw-{enc}]"))
+            return hits
+        except OSError:
+            _logger.debug("Unreadable file, skipping: %s", display_path)
             return []
 
-    def check_pdf(self, cleaned_path: Path, max_pages: int = 10) -> List[LeakageHit]:
-        """Check a cleaned PDF for surviving entities in extracted text."""
+    def check_pdf(self, cleaned_path: Path) -> List[LeakageHit]:
+        """Check a cleaned PDF for surviving entities in extracted text.
+
+        ALL pages are checked (a page-11 leak is still a leak), and any
+        inability to verify — missing pypdf, parse failure — is itself a
+        FAILING hit rather than a silent pass.
+        """
         if not HAS_PYPDF:
-            _logger.warning("pypdf not available; skipping PDF leakage check")
-            return []
+            return [LeakageHit(
+                file_path=str(cleaned_path),
+                entity_type='unverifiable',
+                original='pypdf not available - PDF content NOT verified',
+            )]
 
         hits = []
         try:
             reader = PdfReader(str(cleaned_path))
-            for i in range(min(max_pages, len(reader.pages))):
-                text = reader.pages[i].extract_text() or ""
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ""
                 page_hits = self.check_text(text, f"{cleaned_path} (page {i+1})")
                 hits.extend(page_hits)
 
         except Exception as e:
-            _logger.debug("Failed to check PDF %s: %s", cleaned_path, e)
+            _logger.warning("Failed to check PDF %s: %s", cleaned_path, e)
+            hits.append(LeakageHit(
+                file_path=str(cleaned_path),
+                entity_type='unverifiable',
+                original=f'PDF text extraction failed: {e}',
+            ))
 
         return hits
 
     # -- filename check -----------------------------------------------------
 
     def check_filenames(self, cleaned_dir: Path) -> List[LeakageHit]:
-        """Check that no mapped entity appears in any output file path.
+        """Check that no mapped entity appears in any output path.
 
-        Every mapped original entity is tested against every output file
-        path (including all path components).  If an entity is found in a
-        filename the check immediately records a hit.
+        Every mapped original entity (variant-aware) is tested against every
+        output path — FILES AND DIRECTORIES, including empty entity-named
+        directories that a file-only scan would miss.
         """
         hits = []
+        # Collect all relative paths once (files + dirs)
+        rel_paths = [
+            str(p.relative_to(cleaned_dir)) for p in cleaned_dir.rglob('*')
+        ]
         for mapping in self.mapper.mappings:
             original = mapping.original
             if not original or len(original) < 2:
                 continue
 
-            pattern = re.compile(re.escape(original), re.IGNORECASE)
-            for file_path in cleaned_dir.rglob('*'):
-                if not file_path.is_file():
-                    continue
-                # Check the full relative path string
-                rel = str(file_path.relative_to(cleaned_dir))
+            if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
+                # Old path stems: literal match only — variant/token
+                # patterns false-positive on the FILE_nnn pseudonyms.
+                pattern = re.compile(re.escape(original), re.IGNORECASE)
+            else:
+                pattern = self._entity_pattern(original, mapping.entity_type)
+            for rel in rel_paths:
                 if pattern.search(rel):
                     hits.append(LeakageHit(
                         file_path=rel,
                         entity_type=mapping.entity_type,
                         original=original,
-                        context=f"Entity found in filename: {rel}",
+                        context=f"Entity found in path: {rel}",
                     ))
         return hits
 
@@ -320,7 +393,7 @@ class LeakageChecker:
                 hits.extend(self._check_office_metadata(file_path, rel))
             elif suffix in ('.jpg', '.jpeg', '.png', '.tiff', '.bmp'):
                 hits.extend(self._check_image_metadata(file_path, rel))
-            elif suffix in ('.doc', '.xls', '.ppt'):
+            elif suffix in ('.doc', '.xls', '.ppt', '.sldprt', '.sldasm'):
                 hits.extend(self._check_ole_metadata(file_path, rel))
             elif suffix in ('.step', '.stp'):
                 hits.extend(self._check_step_metadata(file_path, rel))
@@ -335,19 +408,26 @@ class LeakageChecker:
         try:
             with zipfile.ZipFile(path, 'r') as zf:
                 for member_name in zf.namelist():
-                    # We care about XML members that carry user-visible text
                     member_lower = member_name.lower()
-                    if not member_lower.endswith('.xml'):
-                        continue
                     try:
-                        xml_bytes = zf.read(member_name)
-                        xml_text = xml_bytes.decode('utf-8', errors='replace')
+                        member_bytes = zf.read(member_name)
                     except Exception:
                         continue
-                    member_hits = self.check_text(
-                        xml_text, f"{display_path}::{member_name}"
-                    )
-                    hits.extend(member_hits)
+                    if member_lower.endswith(('.xml', '.rels', '.vml')):
+                        # XML-ish members: text + relationship targets
+                        # (.rels carries mailto:/hyperlink leaks)
+                        xml_text = member_bytes.decode('utf-8', errors='replace')
+                        hits.extend(self.check_text(
+                            xml_text, f"{display_path}::{member_name}"
+                        ))
+                    else:
+                        # Binary members (vbaProject.bin, embedded media):
+                        # scan raw bytes in UTF-8 and UTF-16LE decodings.
+                        for enc in ('utf-8', 'utf-16-le'):
+                            text = member_bytes.decode(enc, errors='replace')
+                            hits.extend(self.check_text(
+                                text, f"{display_path}::{member_name}::{enc}"
+                            ))
         except zipfile.BadZipFile:
             _logger.debug("Not a valid ZIP: %s", path)
         return hits
@@ -437,19 +517,26 @@ class LeakageChecker:
         return hits
 
     def _check_ole_metadata(self, path: Path, rel: str) -> List[LeakageHit]:
-        """Check OLE2 compound documents for property streams.
+        """Check OLE2 compound documents for entity strings.
 
-        OLE files start with the magic \xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1.
-        We do a best-effort scan of the raw bytes for entity strings.
+        OLE property-set strings (Author, Company, LastSavedBy) are stored
+        UTF-16LE (or a legacy codepage), NOT UTF-8 — a UTF-8-only decode is
+        blind to exactly the values that matter (e.g. 'Dylan Li' in a .ppt).
+        The WHOLE file is scanned in both encodings.
         """
         hits = []
         try:
-            with open(path, 'rb') as f:
-                data = f.read(65536)  # Read first 64 KB
-            text = data.decode('utf-8', errors='replace')
-            hits.extend(self.check_text(text, f"{rel}::OLE"))
-        except Exception:
-            pass
+            data = path.read_bytes()
+            for enc, tag in (('utf-8', 'OLE'), ('utf-16-le', 'OLE-utf16')):
+                text = data.decode(enc, errors='replace')
+                hits.extend(self.check_text(text, f"{rel}::{tag}"))
+        except Exception as e:
+            _logger.warning("Could not scan OLE file %s: %s", rel, e)
+            hits.append(LeakageHit(
+                file_path=rel,
+                entity_type='unverifiable',
+                original=f'OLE scan failed: {e}',
+            ))
         return hits
 
     def _check_step_metadata(self, path: Path, rel: str) -> List[LeakageHit]:
@@ -506,10 +593,13 @@ class ReScanner:
     """
 
     # Common words that might be in placeholder text but aren't real entities
-    _PLACEHOLDER_PATTERN = re.compile(r'\[\w+_\d{3}\]')
+    _PLACEHOLDER_PATTERN = re.compile(r'\[\w+_\d{3,}\]')
 
     def __init__(self, mapper: EntityMapper):
         self.mapper = mapper
+        # New-entity discoveries are collected here as advisories rather
+        # than failing hits (detector false-positive rates are high).
+        self._advisory_hits: List[LeakageHit] = []
 
     def rescan_text(self, cleaned_text: str, file_path: str = "") -> List[LeakageHit]:
         """Scan cleaned text for entities using GLiNER or regex fallback."""
@@ -530,16 +620,19 @@ class ReScanner:
         hits = []
         for entity in entities:
             if self.mapper.has_entity(entity.value):
-                # Known entity that survived - leakage
+                # Known entity that survived - leakage (FAILS the run)
                 hits.append(LeakageHit(
                     file_path=source,
                     entity_type=entity.entity_type,
                     original=entity.value,
                     context=entity.context,
                 ))
-            elif entity.entity_type.lower() in ('person', 'organization', 'email'):
-                # NEW entity discovered after cleaning - at least fail-warn
-                hits.append(LeakageHit(
+            elif entity.entity_type.lower() in ('person', 'organization',
+                                                'company', 'email'):
+                # NEW entity discovered after cleaning — reported as an
+                # ADVISORY (detector false-positive rates are too high to
+                # hard-fail, but silence would hide real detection gaps).
+                self._advisory_hits.append(LeakageHit(
                     file_path=source,
                     entity_type=f"new_{entity.entity_type}",
                     original=entity.value,
@@ -565,8 +658,10 @@ class ReScanner:
                     entity_type=entity.entity_type,
                     original=entity.value,
                 ))
-            elif getattr(entity, 'entity_type', '').lower() in ('person', 'organization', 'email'):
-                hits.append(LeakageHit(
+            elif getattr(entity, 'entity_type', '').lower() in ('person', 'organization', 'company', 'email'):
+                # Advisory only: the regex fallback false-positives on
+                # ordinary prose, so it must not hard-fail the run.
+                self._advisory_hits.append(LeakageHit(
                     file_path=source,
                     entity_type=f"new_{entity.entity_type}",
                     original=entity.value,
@@ -575,10 +670,42 @@ class ReScanner:
 
         return hits
 
+    # Office ZIP formats whose XML members should be text-extracted
+    _OFFICE_ZIP_EXTENSIONS = LeakageChecker._OFFICE_ZIP_EXTENSIONS
+
+    def _extract_file_text(self, cleaned_file: Path) -> Optional[str]:
+        """Best-effort text extraction for rescanning (utf-8 + Office ZIP)."""
+        suffix = cleaned_file.suffix.lower()
+        if suffix in self._OFFICE_ZIP_EXTENSIONS:
+            try:
+                parts = []
+                with zipfile.ZipFile(cleaned_file, 'r') as zf:
+                    for member in zf.namelist():
+                        if member.lower().endswith('.xml'):
+                            try:
+                                parts.append(
+                                    zf.read(member).decode('utf-8',
+                                                           errors='replace'))
+                            except Exception:
+                                pass
+                return '\n'.join(parts)
+            except zipfile.BadZipFile:
+                return None
+        try:
+            with open(cleaned_file, 'r', encoding='utf-8') as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return None
+
     def run_check(self, cleaned_dir: Path) -> VerificationResult:
-        """Run re-scan on all text files in cleaned directory."""
+        """Run re-scan on all text-extractable files in cleaned directory.
+
+        Known-entity survivals FAIL; newly detected entities are advisory
+        (reported in the details, not as failing hits).
+        """
         all_hits = []
         file_count = 0
+        self._advisory_hits = []
 
         for cleaned_file in cleaned_dir.rglob('*'):
             if not cleaned_file.is_file():
@@ -590,23 +717,30 @@ class ReScanner:
             ):
                 continue
 
-            try:
-                with open(cleaned_file, 'r', encoding='utf-8') as f:
-                    text = f.read()
-
-                rel_path = str(cleaned_file.relative_to(cleaned_dir))
-                hits = self.rescan_text(text, rel_path)
-                all_hits.extend(hits)
-                file_count += 1
-
-            except (UnicodeDecodeError, UnicodeEncodeError):
+            text = self._extract_file_text(cleaned_file)
+            if text is None:
                 continue
+
+            rel_path = str(cleaned_file.relative_to(cleaned_dir))
+            all_hits.extend(self.rescan_text(text, rel_path))
+            file_count += 1
+
+        advisory_summary = ""
+        if self._advisory_hits:
+            samples = ', '.join(sorted({
+                f"{h.original!r}" for h in self._advisory_hits})[:8])
+            advisory_summary = (
+                f" | ADVISORY: {len(self._advisory_hits)} new possible "
+                f"entities detected post-clean (not failing): {samples}"
+            )
 
         passed = len(all_hits) == 0
         return VerificationResult(
             check_name="Re-Scan Entity Detection",
             passed=passed,
-            details=f"Re-scanned {file_count} files with {'GLiNER' if HAS_GLINER else 'regex'}",
+            details=(f"Re-scanned {file_count} files with "
+                     f"{'GLiNER' if HAS_GLINER else 'regex'}"
+                     f"{advisory_summary}"),
             hits=all_hits,
         )
 
@@ -624,13 +758,35 @@ class LegibilityChecker:
         '.xlsm', '.docm', '.pptm',
     }
 
+    # Extensions treated as text for legibility purposes; other unknown
+    # formats are binary and must NOT be utf-8-read (that false-failed
+    # every valid .SLDPRT/.STL/media file).
+    _TEXT_EXTENSIONS = {
+        '.txt', '.csv', '.tsv', '.log', '.md', '.rst', '.json', '.xml',
+        '.yaml', '.yml', '.toml', '.html', '.css', '.js', '.py', '.step',
+        '.stp', '.iges', '.igs', '.obj', '.dxf', '.err',
+    }
+
     def check_text_file(self, path: Path) -> bool:
-        """Check that a text file is readable and non-empty."""
+        """Check that a text file is readable (any supported encoding)
+        and non-empty. UTF-8-only reading false-failed valid GBK/UTF-16
+        outputs."""
+        for enc in ('utf-8', 'utf-16', 'gbk', 'gb18030'):
+            try:
+                with open(path, 'r', encoding=enc) as f:
+                    content = f.read()
+                if enc != 'utf-16' and '\x00' in content:
+                    continue
+                return len(content) > 0
+            except (UnicodeError, OSError):
+                continue
+        return False
+
+    def check_binary_file(self, path: Path) -> bool:
+        """Minimal legibility for binary formats we can't parse: non-empty."""
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            return len(content) > 0
-        except Exception:
+            return path.stat().st_size > 0
+        except OSError:
             return False
 
     def check_office_zip(self, path: Path) -> bool:
@@ -644,6 +800,14 @@ class LegibilityChecker:
                 # At least one XML member should exist
                 names = zf.namelist()
                 return any(n.lower().endswith('.xml') for n in names)
+        except Exception:
+            return False
+
+    def check_zip_valid(self, path: Path) -> bool:
+        """Check that a generic ZIP archive is structurally sound."""
+        try:
+            with zipfile.ZipFile(path, 'r') as zf:
+                return zf.testzip() is None
         except Exception:
             return False
 
@@ -692,8 +856,14 @@ class LegibilityChecker:
                 is_legible = self.check_image(file_path)
             elif ext in self._OFFICE_ZIP_EXTENSIONS:
                 is_legible = self.check_office_zip(file_path)
-            else:
+            elif ext == '.zip':
+                is_legible = self.check_zip_valid(file_path)
+            elif ext in self._TEXT_EXTENSIONS:
                 is_legible = self.check_text_file(file_path)
+            else:
+                # Binary/unknown format: utf-8-reading it would false-fail
+                # every valid CAD/media file. Require only that it's non-empty.
+                is_legible = self.check_binary_file(file_path)
 
             if not is_legible:
                 rel = str(file_path.relative_to(cleaned_dir))
@@ -740,9 +910,18 @@ class ConsistencyChecker:
         """
         hits = []
 
-        # Build a map of placeholder -> files it appears in
+        # Build a map of placeholder -> files it appears in.
+        # Restrict to the prefixes this pipeline actually mints so legit
+        # bracketed tokens in documents (e.g. part refs like [REV_002])
+        # are not false-flagged as unknown placeholders.
+        from .anonymizer import ENTITY_PREFIX_MAP, _DEFAULT_PREFIX
+        known_prefixes = '|'.join(
+            sorted(set(list(ENTITY_PREFIX_MAP.values()) + [_DEFAULT_PREFIX]))
+        )
         placeholder_files: Dict[str, Set[str]] = defaultdict(set)
-        placeholder_pattern = re.compile(r'\[(\w+)_(\d{3})\]')
+        placeholder_pattern = re.compile(
+            rf'\[(?:{known_prefixes})_(\d{{3,}})\]'
+        )
 
         # Collect all text content per file (using format-aware extraction)
         file_texts: Dict[str, str] = {}
@@ -780,30 +959,16 @@ class ConsistencyChecker:
                 placeholder = match.group(0)
                 placeholder_files[placeholder].add(rel)
 
-        # Check 1: Original entity text should NOT appear in any cleaned file
-        for mapping in self.mapper.mappings:
-            original = mapping.original
-            expected_placeholder = mapping.placeholder
+        # NOTE: leakage of original entity text is the LeakageChecker's job
+        # (with boundary/variant-aware patterns); re-scanning here with bare
+        # substrings double-counted every hit and false-positived on short
+        # entities, so that duplicate pass was removed.
 
-            if not original or len(original) < 2:
-                continue
-
-            pattern = re.compile(re.escape(original), re.IGNORECASE)
-            for rel, text in file_texts.items():
-                if pattern.search(text):
-                    hits.append(LeakageHit(
-                        file_path=rel,
-                        entity_type=mapping.entity_type,
-                        original=original,
-                        context=f"Original entity found instead of placeholder {expected_placeholder}",
-                    ))
-
-        # Check 2: Verify placeholders are used consistently
-        # (same placeholder should not appear with different meanings)
+        # Verify placeholders are consistent: every pipeline-format
+        # placeholder appearing in the output must exist in the mapping.
         for placeholder, files in placeholder_files.items():
             original = self.mapper.resolve(placeholder)
             if original is None:
-                # Placeholder exists in output but not in our mapping - suspicious
                 for rel in files:
                     hits.append(LeakageHit(
                         file_path=rel,
@@ -847,6 +1012,18 @@ def verify_clean(cleaned_dir: Path, original_dir: Path,
         LeakageReport with all verification results
     """
     report = LeakageReport(project_name=project_name or cleaned_dir.name)
+
+    # Coverage guard: an EMPTY output directory must not verify green —
+    # "checked 0 files, 0 leaks" is vacuous, not a pass.
+    file_count = sum(1 for f in cleaned_dir.rglob('*') if f.is_file())
+    if file_count == 0:
+        report.add_result(VerificationResult(
+            check_name="Output Coverage Check",
+            passed=False,
+            details="Cleaned output contains ZERO files — nothing to verify "
+                    "(all inputs failed or were quarantined).",
+        ))
+        return report
 
     leakage_checker = LeakageChecker(mapper)
 

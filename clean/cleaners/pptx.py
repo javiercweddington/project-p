@@ -98,12 +98,14 @@ class PPTXCleaner:
         """
         ext = input_path.suffix.lower()
 
-        # Legacy .ppt format - can't safely clean, leave file for pipeline quarantine
+        # Legacy .ppt: quarantined by policy. These decks are largely
+        # Mandarin content that a binary entity scan cannot vouch for;
+        # the plan is an LLM-based (Qwen) review path for legacy OLE
+        # decks rather than shipping on a weak byte-level check.
         if ext == '.ppt':
             _logger.warning(
-                "Legacy .ppt format detected: %s. "
-                "Fail-closed: returning False for pipeline quarantine.",
-                input_path.name,
+                "Legacy .ppt %s quarantined by policy (Mandarin content — "
+                "pending LLM-based legacy review path).", input_path.name,
             )
             return False
 
@@ -137,10 +139,36 @@ class PPTXCleaner:
 
     def _clear_properties(self, core_props) -> None:
         """Clear core document properties."""
-        for prop_name in self._CORE_PROPERTIES:
+        # Identifier properties go through the mapper (consistent
+        # placeholders); python-pptx exposes dc:creator as `author`.
+        for prop_name, entity_type in (('author', 'person'),
+                                       ('last_modified_by', 'person')):
+            try:
+                value = getattr(core_props, prop_name, None)
+                if value and str(value).strip():
+                    setattr(core_props, prop_name, self.mapper.get_or_create(
+                        entity_type=entity_type, value=str(value).strip(),
+                        source='pptx_core_properties'))
+                else:
+                    setattr(core_props, prop_name, '')
+            except (AttributeError, TypeError):
+                pass
+
+        for prop_name in ('comments', 'category', 'content_status',
+                          'identifier', 'keywords', 'language', 'subject',
+                          'title', 'version'):
             try:
                 setattr(core_props, prop_name, '')
             except (AttributeError, TypeError):
+                pass
+
+        # Timestamps require datetime objects; normalize to fixed epoch
+        from datetime import datetime as _dt
+        fixed = _dt(2024, 1, 1, 0, 0, 0)
+        for prop_name in ('created', 'modified', 'last_printed'):
+            try:
+                setattr(core_props, prop_name, fixed)
+            except (AttributeError, TypeError, ValueError):
                 pass
 
     def _clean_all_slides(self, prs) -> None:
@@ -193,45 +221,107 @@ class PPTXCleaner:
                 with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as dst_zf:
                     for entry in src_zf.infolist():
                         if entry.filename.endswith('/'):
-                            dst_zf.writestr(entry, b'')
                             continue
 
+                        name_lower = entry.filename.lower()
                         data = src_zf.read(entry.filename)
 
-                        # Clean slide XML files
-                        if entry.filename.startswith('ppt/slides/slide'):
+                        if name_lower.endswith(('.xml', '.rels')):
                             try:
                                 text = data.decode('utf-8')
-                                cleaned = self._clean_slide_xml(text)
-                                if cleaned != text:
-                                    _logger.debug(
-                                        "Cleaned XML artifacts from %s",
-                                        entry.filename,
-                                    )
-                                data = cleaned.encode('utf-8')
+
+                                if name_lower.startswith('ppt/slides/slide'):
+                                    text = self._clean_slide_xml(text)
+
+                                # Catch-all visible-text pass over every
+                                # text-bearing part (slides, notes, masters,
+                                # layouts): grouped shapes and other content
+                                # python-pptx never handed us live in <a:t>.
+                                if name_lower.startswith(
+                                        ('ppt/slides/', 'ppt/notesslides/',
+                                         'ppt/slidemasters/',
+                                         'ppt/slidelayouts/')):
+                                    text = self._clean_visible_text_xml(
+                                        text, 'a:t')
+
+                                if name_lower == 'docprops/app.xml':
+                                    text = self._clean_app_xml(text)
+
+                                if name_lower.endswith('.rels'):
+                                    text = self._clean_rel_targets(text)
+
+                                data = text.encode('utf-8')
                             except Exception:
                                 pass
 
-                        # Clean slide layout XML (for hidden slides)
-                        if entry.filename == 'ppt/slides/_rels/slide*.xml.rels':
-                            try:
-                                text = data.decode('utf-8')
-                                # Clean relationships that reference hidden content
-                                cleaned = self._clean_relationships(text)
-                                data = cleaned.encode('utf-8')
-                            except Exception:
-                                pass
+                        # Fixed member timestamp: never leak the run date.
+                        info = zipfile.ZipInfo(
+                            filename=entry.filename,
+                            date_time=(2024, 1, 1, 0, 0, 0),
+                        )
+                        info.compress_type = zipfile.ZIP_DEFLATED
+                        dst_zf.writestr(info, data)
 
-                        dst_zf.writestr(entry, data)
+        except Exception:
+            # Fail closed: never write the un-scrubbed bytes.
+            if output_path.exists():
+                output_path.unlink()
+            raise
 
-        except Exception as e:
-            _logger.error(
-                "Failed to clean XML artifacts: %s. Saving original instead.",
-                e,
-            )
-            source_bytes.seek(0)
-            with open(output_path, 'wb') as f:
-                f.write(source_bytes.read())
+    def _clean_visible_text_xml(self, xml_text: str, tag: str) -> str:
+        """Entity-clean the inner text of every <tag>...</tag> element."""
+        from xml.sax.saxutils import escape, unescape
+
+        def _sub(m: re.Match) -> str:
+            raw = unescape(m.group(2))
+            cleaned_text = self.text_cleaner.clean_text(raw)
+            if cleaned_text == raw:
+                return m.group(0)
+            return m.group(1) + escape(cleaned_text) + m.group(3)
+
+        return re.sub(
+            rf'(<{tag}(?:\s[^>]*)?>)(.*?)(</{tag}>)',
+            _sub, xml_text, flags=re.DOTALL,
+        )
+
+    def _clean_rel_targets(self, xml_text: str) -> str:
+        """Entity-clean Target="..." values (mailto:, entity URLs)."""
+        from xml.sax.saxutils import escape, unescape
+
+        def _sub(m: re.Match) -> str:
+            raw = unescape(m.group(2))
+            cleaned_text = self.text_cleaner.clean_text(raw)
+            if cleaned_text == raw:
+                return m.group(0)
+            return m.group(1) + escape(cleaned_text) + m.group(3)
+
+        return re.sub(r'(Target=")([^"]*)(")', _sub, xml_text)
+
+    def _clean_app_xml(self, xml_text: str) -> str:
+        """Scrub docProps/app.xml: Company/Manager pseudonymized, tool
+        fingerprints blanked, slide-title lists entity-cleaned."""
+        from xml.sax.saxutils import unescape
+        cleaned = xml_text
+
+        for tag, entity_type in (('Company', 'company'),
+                                 ('Manager', 'person')):
+            def _sub(m: re.Match, _etype=entity_type) -> str:
+                value = unescape(m.group(2)).strip()
+                if not value:
+                    return m.group(0)
+                placeholder = self.mapper.get_or_create(
+                    entity_type=_etype, value=value,
+                    source='pptx_app_properties')
+                return f"{m.group(1)}{placeholder}{m.group(3)}"
+            cleaned = re.sub(rf'(<{tag}>)([^<]*)(</{tag}>)', _sub, cleaned)
+
+        for tag in ('Template', 'HyperlinkBase', 'TotalTime',
+                    'Application', 'AppVersion'):
+            cleaned = re.sub(rf'<{tag}>[^<]*</{tag}>',
+                             f'<{tag}></{tag}>', cleaned)
+
+        cleaned = self._clean_visible_text_xml(cleaned, 'vt:lpstr')
+        return cleaned
 
     def _clean_slide_xml(self, xml_text: str) -> str:
         """Clean slide XML to remove sensitive artifacts.
@@ -251,8 +341,8 @@ class PPTXCleaner:
             cleaned,
         )
 
-        # Clean up extra whitespace
-        cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+        # NOTE: no whitespace collapsing — it corrupted text content in
+        # xml:space="preserve" runs.
 
         return cleaned
 

@@ -29,10 +29,71 @@ ENTITY_PREFIX_MAP = {
     'phone': 'PHONE',
     'address': 'ADDRESS',
     'sensitive_doc': 'DOCREF',
+    'account': 'ACCOUNT',
+    'filename': 'FILE',
+    'directory': 'DIR',
 }
+
+# Entity types recorded for the audit trail only — NEVER used for text
+# replacement. Filename stems can be short/generic ("in", "report"), so
+# letting them into replace_in_text would corrupt ordinary document text.
+NON_TEXT_ENTITY_TYPES = frozenset({'filename', 'directory'})
 
 # Default prefix for unknown entity types
 _DEFAULT_PREFIX = 'ENTITY'
+
+# The ONLY placeholder shapes this pipeline mints, anchored to the actual
+# prefixes and CASE-SENSITIVE. A loose [A-Z]+_\d+ pattern let real names
+# like IMG_20200615 or ACME_2020 masquerade as placeholders and bypass the
+# strict filename policy entirely.
+_ALL_PREFIXES = sorted(set(ENTITY_PREFIX_MAP.values()) | {_DEFAULT_PREFIX})
+PLACEHOLDER_TOKEN_RE = re.compile(
+    r'\[?(?:' + '|'.join(_ALL_PREFIXES) + r')_\d{3,}\]?'
+)
+PLACEHOLDER_VALUE_RE = re.compile(
+    r'^\[?(?:' + '|'.join(_ALL_PREFIXES) + r')_\d{3,}\]?$'
+)
+
+# Person-name tokens that are also common English words; matching these
+# standalone would corrupt ordinary prose ('Will Smith' -> every "will").
+PERSON_TOKEN_STOPWORDS = frozenset({
+    'will', 'bill', 'mark', 'grant', 'frank', 'rose', 'may', 'june',
+    'jack', 'art', 'gene', 'ray', 'rich', 'sunny', 'young', 'long',
+    'white', 'black', 'brown', 'green', 'stone', 'wood', 'hill', 'park',
+    'price', 'love', 'joy', 'guy', 'norm', 'dean', 'earl', 'king',
+})
+
+
+# Separators that may remain in a fully anonymized path component
+NAME_SEPARATOR_RE = re.compile(r'[\s\-_.,;()+&#@!~\[\]{}]+')
+
+
+def anonymize_path_component(mapper: 'EntityMapper', name: str,
+                             entity_type: str) -> str:
+    """Fully anonymize one file/directory/zip-member name (STRICT policy).
+
+    Entity-replace first; if the stem still carries ANY residue beyond
+    placeholders and separators (dates, initials, app names, unmapped CJK),
+    the whole stem becomes a FILE_nnn/DIR_nnn pseudonym registered in the
+    audit mapper. The extension is preserved.
+    """
+    import os as _os
+    if entity_type == 'filename':
+        stem, ext = _os.path.splitext(name)
+    else:
+        stem, ext = name, ''
+
+    replaced = mapper.replace_in_text(stem, source='path_anonymization')
+
+    residue = PLACEHOLDER_TOKEN_RE.sub('', replaced)
+    residue = NAME_SEPARATOR_RE.sub('', residue)
+    if residue:
+        placeholder = mapper.get_or_create(
+            entity_type, stem, source='path_anonymization',
+        )
+        replaced = placeholder.strip('[]')
+
+    return replaced + ext
 
 
 @dataclass
@@ -82,84 +143,109 @@ class EntityMapper:
 
         Addresses cases where "Globus Medical" appears as "globusmedical",
         "globus_medical", "globus-medical", etc. in emails, URLs, or
-        concatenated text.
+        concatenated text. Trailing punctuation is stripped from variants
+        so "NOA Labs Ltd." also matches "NOA Labs Ltd" and "noalabsltd".
 
         Returns a list of unique variants (deduplicated, lowercase).
         """
         variants = set()
-        variants.add(original.lower().strip())
+        base = original.lower().strip()
+        variants.add(base)
 
-        # Remove spaces, hyphens, underscores for concatenated forms
-        collapsed = re.sub(r'[\s\-_]+', '', original).lower().strip()
-        if collapsed and len(collapsed) >= 2:
-            variants.add(collapsed)
+        # Variant without trailing punctuation ("Ltd." -> "Ltd")
+        base_nopunct = base.rstrip('.,;:')
+        if len(base_nopunct) >= 2:
+            variants.add(base_nopunct)
 
-        # Replace spaces with hyphens
-        hyphenated = re.sub(r'\s+', '-', original).lower().strip()
-        if hyphenated != original.lower():
-            variants.add(hyphenated)
+        for stem in (base, base_nopunct):
+            if not stem:
+                continue
+            # Remove spaces, hyphens, underscores for concatenated forms.
+            # Strip trailing punctuation so 'noalabsltd.' doesn't consume
+            # the dot in 'noalabsltd.com'.
+            collapsed = re.sub(r'[\s\-_]+', '', stem).rstrip('.,;:')
+            if len(collapsed) >= 2:
+                variants.add(collapsed)
+            # Replace spaces with hyphens / underscores
+            variants.add(re.sub(r'\s+', '-', stem))
+            variants.add(re.sub(r'\s+', '_', stem))
 
-        # Replace spaces with underscores
-        underscored = re.sub(r'\s+', '_', original).lower().strip()
-        if underscored != original.lower():
-            variants.add(underscored)
+        return [v for v in variants if len(v) >= 2]
 
-        return list(variants)
+    # CJK ranges (Han, Hiragana/Katakana, Hangul): \b is meaningless between
+    # CJK characters because Python's re treats them all as word characters,
+    # so boundary-anchored patterns can NEVER match a CJK entity inside
+    # continuous CJK text.
+    _CJK_RE = re.compile(
+        r'[぀-ヿ㐀-䶿一-鿿豈-﫿가-힯]'
+    )
 
-    def _build_pattern(self, original: str) -> re.Pattern:
+    def _build_pattern_cached(self, original: str,
+                              entity_type: Optional[str] = None) -> Optional[re.Pattern]:
+        """Cached wrapper: patterns depend only on (original, entity_type),
+        so compile each exactly once. Uncached, replace_in_text recompiled
+        every pattern per call and thrashed re's 512-entry cache on large
+        mappers (quadratic slowdown on big workbooks)."""
+        cache = getattr(self, '_pattern_cache', None)
+        if cache is None:
+            cache = self._pattern_cache = {}
+        key = (original, entity_type)
+        if key not in cache:
+            cache[key] = self._build_pattern(original, entity_type)
+        return cache[key]
+
+    def _build_pattern(self, original: str,
+                       entity_type: Optional[str] = None) -> Optional[re.Pattern]:
         """Build a boundary-aware, case-insensitive regex pattern for an entity.
 
         Strategy:
-        - Variants containing spaces (e.g. "globus medical"): use \\b word
-          boundaries so they do not match inside larger words.
-        - Variants WITHOUT spaces (e.g. "globusmedical" or "sa"): use BOTH
-          \\b word boundaries (for standalone words like "SA") AND context-aware
-          boundaries (for email domains like @globusmedical.com).
-        - Pure-numeric variants: always use \\b word boundaries.
+        - CJK-containing variants: matched with NO boundaries (CJK scripts
+          have no word delimiters; boundary anchors would prevent any match
+          inside continuous CJK text).
+        - All other variants: lookaround boundaries applied only on sides
+          that end in a word character, so entities with leading/trailing
+          punctuation ("NOA Labs Ltd.") still match, while short entities
+          ("SA") never match inside larger words ("USA").
+        - PERSON entities additionally match their individual name tokens
+          ("Josh Woodard" also matches a bare "Woodard"), because surname-
+          only mentions identify the person just as well.
 
-        All variant patterns are joined with | (longest first) into a single
-        alternation so the regex engine tries the most specific match first.
+        All variant patterns are joined with | (longest first) so the regex
+        engine tries the most specific match first.
         """
-        variants = self._generate_variants(original)
-
-        # Separate into groups
-        spaced = []
-        no_space = []
-        pure_numeric = []
-
-        for v in variants:
-            if v.isdigit():
-                pure_numeric.append(v)
-            elif ' ' in v:
-                spaced.append(v)
-            else:
-                no_space.append(v)
+        variants = set(self._generate_variants(original))
+        if entity_type == 'person':
+            for token in re.split(r'[\s\-_]+', original.lower().strip()):
+                token = token.strip('.,;:')
+                # Skip tokens that are common English words — 'Will Smith'
+                # must not redact every occurrence of "will".
+                if len(token) >= 3 and token not in PERSON_TOKEN_STOPWORDS:
+                    variants.add(token)
 
         parts = []
-
-        # Spaced variants: standard word boundary
-        for v in sorted(spaced, key=len, reverse=True):
-            parts.append(r'\b' + re.escape(v) + r'\b')
-
-        # No-space alphabetic variants: use BOTH word boundary AND context-aware
-        for v in sorted(no_space, key=len, reverse=True):
-            escaped = re.escape(v)
-            # Word boundary pattern (for standalone words like "SA")
-            parts.append(r'\b' + escaped + r'\b')
-            # Context-aware pattern (for email domains like @globusmedical.com)
-            # Use (?<!\w) lookbehind to prevent matching inside larger words
-            # (e.g., "sa" should not match inside "USA")
-            parts.append(
-                r'(?<!\w)' + escaped + r'(?:\.|@|(?=[<>,;:\s_\-/])|$)'
-            )
-
-        # Pure numeric: word boundary
-        for v in sorted(pure_numeric, key=len, reverse=True):
-            parts.append(r'\b' + re.escape(v) + r'\b')
+        for variant in sorted(variants, key=len, reverse=True):
+            if len(variant) < 2:
+                continue
+            escaped = re.escape(variant)
+            # Multi-word entities must match across line wraps: PDF/OCR
+            # extraction routinely breaks 'Lech Alexander Murawski' onto
+            # separate lines, which a literal-space pattern never matches.
+            escaped = re.sub(r'(?:\\\s|\s)+', r'\\s+', escaped)
+            if self._CJK_RE.search(variant):
+                parts.append(escaped)
+                continue
+            # Underscore counts as a SEPARATOR (filenames like
+            # report_globusmedical_2020.pdf), so boundaries exclude it:
+            # only letters/digits block a match at the edge.
+            left = r'(?<![A-Za-z0-9])' if variant[0].isalnum() else ''
+            right = r'(?![A-Za-z0-9])' if variant[-1].isalnum() else ''
+            parts.append(left + escaped + right)
 
         if not parts:
-            # Fallback: should not happen for valid entities
-            return re.compile(re.escape(original.lower()), re.IGNORECASE)
+            # A value too short/degenerate to match safely: no pattern.
+            # (The old fallback compiled a boundary-FREE single-char pattern
+            # that replaced every occurrence of that letter in a document.)
+            return None
 
         pattern_str = '(?:' + '|'.join(parts) + ')'
         return re.compile(pattern_str, re.IGNORECASE)
@@ -179,6 +265,14 @@ class EntityMapper:
         key = value.strip().lower()
         if not key:
             return value
+
+        # Never map a placeholder itself: on re-clean passes, metadata
+        # fields already hold '[PERSON_002]'-style values — mapping those
+        # would mint chains of placeholder-for-placeholder entries.
+        # Anchored to real prefixes and case-sensitive so genuine values
+        # like 'IMG_20200615' or 'acme_2020' are still mappable.
+        if PLACEHOLDER_VALUE_RE.match(value.strip()):
+            return value.strip()
 
         if key in self._mappings:
             mapping = self._mappings[key]
@@ -205,9 +299,10 @@ class EntityMapper:
         self._mappings[key] = mapping
         self._reverse[placeholder] = value.strip()
 
-        # Notify tracker callback of the new mapping
-        if self._tracker_callback is not None:
-            self._tracker_callback(value.strip(), placeholder, source or "")
+        # NOTE: the tracker callback is deliberately NOT fired here —
+        # registration is not a substitution. Firing it on registration
+        # produced phantom "entities replaced" counts for mere seeding.
+        # replace_in_text / replace_spans fire it per actual replacement.
 
         return placeholder
 
@@ -240,24 +335,44 @@ class EntityMapper:
         if not self._mappings:
             return text
 
-        # Sort mappings by original length (descending) to handle overlaps
+        # Sort mappings by original length (descending) to handle overlaps.
+        # Audit-only types (filename/directory stems) are excluded — they
+        # are often short/generic and would corrupt normal text.
         sorted_mappings = sorted(
-            self._mappings.values(),
+            (m for m in self._mappings.values()
+             if m.entity_type not in NON_TEXT_ENTITY_TYPES),
             key=lambda m: len(m.original),
             reverse=True,
         )
 
+        placeholder_tail = re.compile(r'_\d{3,}\]')
+
         result = text
         for mapping in sorted_mappings:
-            pattern = self._build_pattern(mapping.original)
+            pattern = self._build_pattern_cached(
+                mapping.original, mapping.entity_type)
+            if pattern is None:
+                continue
 
-            # Count and record replacements for tracker
-            if self._tracker_callback is not None:
-                matches = pattern.findall(result)
-                for _ in matches:
-                    self._tracker_callback(mapping.original, mapping.placeholder, source)
+            def _substitute(match: re.Match, _mapping=mapping) -> str:
+                # Guard against corrupting an already-inserted placeholder:
+                # an entity literally named e.g. "Company" would otherwise
+                # match inside "[COMPANY_001]" (case-insensitive).
+                start, end = match.start(), match.end()
+                subject = match.string
+                if (start > 0 and subject[start - 1] == '['
+                        and placeholder_tail.match(subject, end)):
+                    return match.group(0)
 
-            result = pattern.sub(mapping.placeholder, result)
+                _mapping.occurrence_count += 1
+                if source and source not in _mapping.sources:
+                    _mapping.sources.append(source)
+                if self._tracker_callback is not None:
+                    self._tracker_callback(
+                        _mapping.original, _mapping.placeholder, source)
+                return _mapping.placeholder
+
+            result = pattern.sub(_substitute, result)
 
         return result
 
@@ -285,6 +400,8 @@ class EntityMapper:
         for start, end, entity_type in sorted_spans:
             entity_value = result[start:end]
             placeholder = self.get_or_create(entity_type, entity_value, source)
+            if self._tracker_callback is not None:
+                self._tracker_callback(entity_value, placeholder, source)
             result = result[:start] + placeholder + result[end:]
 
         return result
@@ -389,6 +506,8 @@ class SpanBasedReplacer:
                 continue
 
             placeholder = self.mapper.get_or_create(entity_type, entity_value, source)
+            if self.mapper._tracker_callback is not None:
+                self.mapper._tracker_callback(entity_value, placeholder, source)
             result = result[:start] + placeholder + result[end:]
 
         return result

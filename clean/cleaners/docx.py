@@ -70,24 +70,33 @@ class DOCXCleaner:
 
     # python-docx core properties that contain identifier-like values
     # and should go through the mapper instead of being blanked.
-    # Keys map to (property_name, entity_type) tuples.
+    # NOTE: python-docx exposes dc:creator as `author` — there is no
+    # `creator`/`contributor`/`company` attribute on CoreProperties.
+    # Company/Manager live in docProps/app.xml, handled in the ZIP pass.
     _IDENTIFIER_PROPERTIES = {
-        'creator': ('creator', 'person'),
+        'author': ('author', 'person'),
         'last_modified_by': ('last_modified_by', 'person'),
-        'contributor': ('contributor', 'person'),
-        'company': ('company', 'company'),
     }
 
     # python-docx core properties that should be blanked (non-identifiers)
     _BLANK_PROPERTIES = {
-        'description', 'subject', 'keywords', 'category', 'comments',
+        'comments', 'category', 'content_status', 'identifier',
+        'keywords', 'language', 'subject', 'title', 'version',
     }
 
     # Fixed timestamp for embedded document timestamps
-    _FIXED_TIMESTAMP = "2024-01-01T00:00:00Z"
+    # (python-docx requires a datetime object, never a string)
+    _FIXED_DT = datetime(2024, 1, 1, 0, 0, 0)
 
-    # XML elements to remove from document
-    _RSID_PATTERN = re.compile(r'w:rsid[\w]*\s*=\s*"[^"]*"')
+    # Fixed timestamp for output zip members (prevents run-date leakage)
+    _ZIP_DATE_TIME = (2024, 1, 1, 0, 0, 0)
+
+    # RSID attribute form: w:rsid="..." / w:rsidR="..." / w:rsidRDefault="..."
+    _RSID_ATTR_PATTERN = re.compile(r'\s*w:rsid[\w]*\s*=\s*"[^"]*"')
+    # RSID element forms in settings.xml: the whole <w:rsids> block plus
+    # any standalone <w:rsid w:val="..."/> elements.
+    _RSIDS_BLOCK_PATTERN = re.compile(r'<w:rsids>.*?</w:rsids>', re.DOTALL)
+    _RSID_ELEM_PATTERN = re.compile(r'<w:rsid\s[^>]*/>')
 
     def __init__(self, mapper: EntityMapper):
         self.mapper = mapper
@@ -111,15 +120,13 @@ class DOCXCleaner:
         """
         ext = input_path.suffix.lower()
 
-        # Legacy .doc format - can't safely clean, leave file for pipeline quarantine
+        # Legacy .doc: no content rewriter, but OLE properties can be
+        # zeroed and the raw streams (including Fast-Save remnants) verified
+        # free of mapped entities; ship only when that verification passes.
         if ext == '.doc':
-            _logger.warning(
-                "Legacy .doc format detected: %s. "
-                "Fast Save appends without removing - old text persists. "
-                "Fail-closed: returning False for pipeline quarantine.",
-                input_path.name,
-            )
-            return False
+            from .ole_scrub import strip_ole_properties
+            return strip_ole_properties(
+                self.mapper, input_path, output_path, input_path.name)
 
         if not HAS_PYTHON_DOCX:
             _logger.warning("python-docx not available; DOCX fail-closed")
@@ -131,10 +138,9 @@ class DOCXCleaner:
             # Clear core properties
             self._clear_properties(doc.core_properties)
 
-            # Clear custom properties
-            self._clear_custom_properties(doc)
-
             # Clean all text content
+            # (custom properties / app.xml are handled in the ZIP pass —
+            #  python-docx has no Document.custom_properties API)
             self._clean_all_text(doc)
 
             # Save to bytes for XML manipulation
@@ -185,61 +191,63 @@ class DOCXCleaner:
 
         # Normalize embedded timestamps to fixed epoch
         # python-docx core_properties requires datetime objects (not strings, not None)
-        # Set to a fixed datetime to remove temporal leakage
-        _fixed_dt = datetime(2024, 1, 1, 0, 0, 0)
         for prop_name in ('created', 'modified', 'last_printed'):
             try:
-                setattr(core_props, prop_name, _fixed_dt)
-            except (AttributeError, TypeError):
+                setattr(core_props, prop_name, self._FIXED_DT)
+            except (AttributeError, TypeError, ValueError):
                 pass
 
-    def _clear_custom_properties(self, doc) -> None:
-        """Clear custom properties from the XML."""
-        try:
-            custom_props = doc.custom_properties
-            if custom_props:
-                props_elem = custom_props._properties
-                for child in list(props_elem):
-                    props_elem.remove(child)
-        except Exception:
-            pass
+    def _clean_paragraph(self, para) -> None:
+        """Clean one paragraph, catching entities split across runs.
 
-    def _clean_all_text(self, doc) -> None:
-        """Clean text content across all paragraphs, runs, and tables."""
-        # Clean paragraphs
-        for para in doc.paragraphs:
-            for run in para.runs:
-                if isinstance(run.text, str) and run.text:
-                    run.text = self.text_cleaner.clean_text(run.text)
+        Word routinely splits an entity like 'Globus Medical' across several
+        <w:r> runs, so a run-by-run pass misses it. Strategy: clean each run
+        first; if the paragraph text as a whole STILL contains an entity,
+        collapse the paragraph into its first run with the fully cleaned
+        text (loses intra-paragraph character formatting for that paragraph
+        only — accuracy over formatting).
+        """
+        for run in para.runs:
+            if isinstance(run.text, str) and run.text:
+                run.text = self.text_cleaner.clean_text(run.text)
 
-        # Clean tables
-        for table in doc.tables:
+        if not para.runs:
+            return
+        full_text = para.text
+        cleaned_full = self.text_cleaner.clean_text(full_text)
+        if cleaned_full != full_text:
+            para.runs[0].text = cleaned_full
+            for run in para.runs[1:]:
+                run.text = ''
+
+    def _clean_block(self, container) -> None:
+        """Clean paragraphs and tables of any block container (body, cell,
+        header, footer)."""
+        for para in getattr(container, 'paragraphs', []):
+            self._clean_paragraph(para)
+        for table in getattr(container, 'tables', []):
             for row in table.rows:
                 for cell in row.cells:
-                    for para in cell.paragraphs:
-                        for run in para.runs:
-                            if isinstance(run.text, str) and run.text:
-                                run.text = self.text_cleaner.clean_text(run.text)
+                    self._clean_block(cell)
 
-        # Clean headers and footers through sections
-        # python-docx does not expose doc.headers/doc.footers - must iterate sections
+    def _clean_all_text(self, doc) -> None:
+        """Clean text content across body, tables, headers, and footers."""
+        self._clean_block(doc)
+
+        # Clean headers and footers through sections.
+        # Real python-docx attribute names: header/footer,
+        # first_page_header/first_page_footer, even_page_header/even_page_footer.
         for section in doc.sections:
-            # Headers: first-page, even-page, and default (odd-page) variants
-            for header_attr in ('header', 'header_first_page', 'header_even'):
-                header = getattr(section, header_attr, None)
-                if header is not None:
-                    for para in header.paragraphs:
-                        for run in para.runs:
-                            if isinstance(run.text, str) and run.text:
-                                run.text = self.text_cleaner.clean_text(run.text)
-            # Footers: same page-variant pattern
-            for footer_attr in ('footer', 'footer_first_page', 'footer_even'):
-                footer = getattr(section, footer_attr, None)
-                if footer is not None:
-                    for para in footer.paragraphs:
-                        for run in para.runs:
-                            if isinstance(run.text, str) and run.text:
-                                run.text = self.text_cleaner.clean_text(run.text)
+            for attr in ('header', 'first_page_header', 'even_page_header',
+                         'footer', 'first_page_footer', 'even_page_footer'):
+                part = getattr(section, attr, None)
+                if part is None:
+                    continue
+                # A linked header/footer just inherits the previous section's;
+                # cleaning it would create an unwanted override.
+                if getattr(part, 'is_linked_to_previous', False):
+                    continue
+                self._clean_block(part)
 
     def _clean_xml_artifacts(self, source_bytes: io.BytesIO,
                               output_path: Path) -> None:
@@ -259,17 +267,76 @@ class DOCXCleaner:
                 with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as dst_zf:
                     for entry in src_zf.infolist():
                         if entry.filename.endswith('/'):
-                            # Directory entry
-                            dst_zf.writestr(entry, b'')
+                            continue
+
+                        name_lower = entry.filename.lower()
+
+                        # Drop whole parts that carry sensitive content:
+                        # comments*, commentsExtended, commentsIds,
+                        # people.xml (commenter real names), custom.xml
+                        # (custom properties python-docx cannot reach).
+                        base = name_lower.rsplit('/', 1)[-1]
+                        if (base.startswith('comments')
+                                or base == 'people.xml'
+                                or name_lower == 'docprops/custom.xml'):
+                            _logger.info(
+                                "Removing sensitive part: %s", entry.filename,
+                            )
                             continue
 
                         data = src_zf.read(entry.filename)
 
-                        # Clean XML files
-                        if entry.filename.endswith('.xml'):
+                        # Clean XML/rels members
+                        if name_lower.endswith('.xml') or name_lower.endswith('.rels'):
                             try:
                                 text = data.decode('utf-8')
                                 cleaned = self._clean_xml_text(text)
+
+                                if name_lower == 'docprops/app.xml':
+                                    cleaned = self._clean_app_xml(cleaned)
+
+                                if name_lower == 'word/document.xml':
+                                    # Strip dangling comment anchors
+                                    cleaned = re.sub(
+                                        r'<w:commentR(?:eference|angeStart|angeEnd)\b[^>]*/>',
+                                        '', cleaned)
+
+                                # Catch-all visible-text pass: hyperlink
+                                # runs, text boxes, footnotes/endnotes, and
+                                # unwrapped tracked insertions all live in
+                                # <w:t> elements python-docx never handed us.
+                                base_name = name_lower.rsplit('/', 1)[-1]
+                                if (name_lower.startswith('word/')
+                                        and name_lower.endswith('.xml')
+                                        and (base_name in (
+                                            'document.xml', 'footnotes.xml',
+                                            'endnotes.xml')
+                                            or base_name.startswith(
+                                                ('header', 'footer')))):
+                                    cleaned = self._clean_visible_text_xml(
+                                        cleaned, 'w:t')
+
+                                if name_lower == '[content_types].xml':
+                                    # Drop Overrides for the parts we removed
+                                    cleaned = re.sub(
+                                        r'<Override[^>]*PartName="/(?:word/comments[^"]*|'
+                                        r'word/people\.xml|docProps/custom\.xml)"[^>]*/>',
+                                        '', cleaned)
+
+                                if name_lower.endswith('.rels'):
+                                    # Drop relationships to the removed parts
+                                    # (exact part names only — a hyperlink
+                                    # whose URL merely CONTAINS 'comments'
+                                    # must survive).
+                                    cleaned = re.sub(
+                                        r'<Relationship[^>]*Target="[^"]*/'
+                                        r'(?:comments\w*|people|custom)\.xml"'
+                                        r'[^>]*/>',
+                                        '', cleaned)
+                                    # Entity-clean remaining relationship
+                                    # targets (mailto:, entity-bearing URLs)
+                                    cleaned = self._clean_rel_targets(cleaned)
+
                                 if cleaned != text:
                                     _logger.debug(
                                         "Cleaned XML artifacts from %s",
@@ -279,44 +346,19 @@ class DOCXCleaner:
                             except Exception:
                                 pass
 
-                        # Skip comment files entirely
-                        if 'comments' in entry.filename.lower():
-                            _logger.info(
-                                "Removing comment file: %s", entry.filename,
-                            )
-                            continue
+                        # Fixed member timestamp: never leak the run date.
+                        info = zipfile.ZipInfo(
+                            filename=entry.filename,
+                            date_time=self._ZIP_DATE_TIME,
+                        )
+                        info.compress_type = zipfile.ZIP_DEFLATED
+                        dst_zf.writestr(info, data)
 
-                        # Skip digital signature files
-                        if entry.filename.startswith('word/_rels/'):
-                            # Clean relationships that reference comments
-                            try:
-                                text = data.decode('utf-8')
-                                if 'comments' in text:
-                                    _logger.info(
-                                        "Removing comment relationship from %s",
-                                        entry.filename,
-                                    )
-                                    # Remove comment relationships
-                                    import re
-                                    text = re.sub(
-                                        r'<Relationship[^>]*Id="[^"]*"[^>]*Type="[^"]*comments"[^>]*/>',
-                                        '',
-                                        text,
-                                    )
-                                    data = text.encode('utf-8')
-                            except Exception:
-                                pass
-
-                        dst_zf.writestr(entry, data)
-
-        except Exception as e:
-            _logger.error(
-                "Failed to clean XML artifacts: %s. Saving original instead.",
-                e,
-            )
-            source_bytes.seek(0)
-            with open(output_path, 'wb') as f:
-                f.write(source_bytes.read())
+        except Exception:
+            # Fail closed: never fall back to writing the un-scrubbed bytes.
+            if output_path.exists():
+                output_path.unlink()
+            raise
 
     def _clean_xml_text(self, xml_text: str) -> str:
         """Clean XML text to remove sensitive artifacts.
@@ -328,44 +370,130 @@ class DOCXCleaner:
         """
         cleaned = xml_text
 
-        # Remove all RSID attributes (fingerprinting)
-        # This includes w:rsid, w:rsidR, w:rsidRDefault, w:rsidP, w:rsidRPr
-        cleaned = self._RSID_PATTERN.sub('', cleaned)
+        # Remove all RSID attributes (fingerprinting):
+        # w:rsid, w:rsidR, w:rsidRDefault, w:rsidP, w:rsidRPr, ...
+        cleaned = self._RSID_ATTR_PATTERN.sub('', cleaned)
 
-        # Remove tracked changes - accept all insertions
-        # w:ins elements contain inserted text - keep the content, remove the wrapper
-        import re
+        # Remove RSID element forms (settings.xml stores a <w:rsids> block
+        # of <w:rsid w:val="..."/> elements the attribute pattern misses).
+        cleaned = self._RSIDS_BLOCK_PATTERN.sub('', cleaned)
+        cleaned = self._RSID_ELEM_PATTERN.sub('', cleaned)
+
+        # Remove SELF-CLOSING tracked-change markers FIRST: the block
+        # regexes below would otherwise pair a '<w:ins .../>' opener with
+        # some later '</w:ins>' and mass-delete everything in between.
+        cleaned = re.sub(r'<w:ins\b[^>]*/>', '', cleaned)
+        cleaned = re.sub(r'<w:del\b[^>]*/>', '', cleaned)
+
+        # Remove tracked changes - accept all insertions.
+        # (?=[\s>]) prevents the prefix from also matching <w:insideH>/<w:insideV>
+        # table-border elements; DOTALL handles multiline blocks.
         cleaned = re.sub(
-            r'<w:ins[^>]*>(.*?)</w:ins>',
+            r'<w:ins(?=[\s>])[^>]*>(.*?)</w:ins>',
             r'\1',
             cleaned,
+            flags=re.DOTALL,
         )
 
-        # Remove tracked changes - remove all deletions
+        # Remove tracked changes - remove all deletions (incl. w:delText)
         cleaned = re.sub(
-            r'<w:del[^>]*>.*?</w:del>',
+            r'<w:del(?=[\s>])[^>]*>.*?</w:del>',
             '',
             cleaned,
+            flags=re.DOTALL,
         )
 
-        # Remove hidden text markers (w:vanish)
-        cleaned = self._remove_vanish(cleaned)
+        # Remove hidden text markers (w:vanish), with or without attributes
+        cleaned = re.sub(r'<w:vanish\b[^>]*/?>', '', cleaned)
 
-        # Clean up extra whitespace from removals
-        cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+        # NOTE: no whitespace collapsing here — a global \s{2,} -> ' '
+        # rewrite corrupts xml:space="preserve" text content.
 
         return cleaned
 
-    def _remove_vanish(self, xml_text: str) -> str:
-        """Remove w:vanish elements that mark text as hidden.
+    def _clean_visible_text_xml(self, xml_text: str, tag: str) -> str:
+        """Entity-clean the inner text of every <tag>...</tag> element.
 
-        Hidden text (w:vanish) is still extractable even though it's
-        not visible in the document. Remove the vanish marker to make
-        the text visible (and auditable).
+        Text is XML-unescaped before matching (so 'Johnson &amp; Johnson'
+        is seen — and registered — as 'Johnson & Johnson') and re-escaped
+        on write.
         """
-        import re
-        # Remove w:vanish elements entirely
-        return re.sub(r'<w:vanish\s*/?>', '', xml_text)
+        from xml.sax.saxutils import escape, unescape
+
+        def _sub(m: re.Match) -> str:
+            raw = unescape(m.group(2))
+            cleaned_text = self.text_cleaner.clean_text(raw)
+            if cleaned_text == raw:
+                return m.group(0)
+            return m.group(1) + escape(cleaned_text) + m.group(3)
+
+        return re.sub(
+            rf'(<{tag}(?:\s[^>]*)?>)(.*?)(</{tag}>)',
+            _sub, xml_text, flags=re.DOTALL,
+        )
+
+    def _clean_rel_targets(self, xml_text: str) -> str:
+        """Entity-clean Target="..." values in relationship parts
+        (mailto: addresses and entity-bearing URLs leak otherwise)."""
+        from xml.sax.saxutils import escape, unescape
+
+        def _sub(m: re.Match) -> str:
+            raw = unescape(m.group(2))
+            cleaned_text = self.text_cleaner.clean_text(raw)
+            if cleaned_text == raw:
+                return m.group(0)
+            return m.group(1) + escape(cleaned_text) + m.group(3)
+
+        return re.sub(r'(Target=")([^"]*)(")', _sub, xml_text)
+
+    # Fields in docProps/app.xml that identify people/orgs/tooling
+    _APP_XML_IDENTIFIER_TAGS = {
+        'Company': 'company',
+        'Manager': 'person',
+    }
+    _APP_XML_BLANK_TAGS = ('Template', 'HyperlinkBase', 'TotalTime',
+                           'Application', 'AppVersion')
+
+    def _clean_app_xml(self, xml_text: str) -> str:
+        """Scrub docProps/app.xml (extended properties python-docx can't reach).
+
+        Company/Manager are pseudonymized through the mapper; tool and
+        template fingerprints are blanked.
+        """
+        cleaned = xml_text
+
+        from xml.sax.saxutils import unescape
+
+        def _pseudonymize(tag: str, entity_type: str, text: str) -> str:
+            def _sub(m: re.Match) -> str:
+                # Unescape first: 'Johnson &amp; Johnson' must register as
+                # 'Johnson & Johnson' or neither cleaner nor verifier will
+                # ever match the real value elsewhere.
+                value = unescape(m.group(2)).strip()
+                if not value:
+                    return m.group(0)
+                placeholder = self.mapper.get_or_create(
+                    entity_type=entity_type, value=value,
+                    source='docx_app_properties',
+                )
+                return f"{m.group(1)}{placeholder}{m.group(3)}"
+            return re.sub(
+                rf'(<{tag}>)([^<]*)(</{tag}>)', _sub, text,
+            )
+
+        for tag, entity_type in self._APP_XML_IDENTIFIER_TAGS.items():
+            cleaned = _pseudonymize(tag, entity_type, cleaned)
+
+        for tag in self._APP_XML_BLANK_TAGS:
+            cleaned = re.sub(
+                rf'<{tag}>[^<]*</{tag}>', f'<{tag}></{tag}>', cleaned,
+            )
+
+        # Entity-clean document-title entries (TitlesOfParts/HeadingPairs
+        # carry the title, which is often entity-bearing)
+        cleaned = self._clean_visible_text_xml(cleaned, 'vt:lpstr')
+
+        return cleaned
 
     def detect_risks(self, input_path: Path) -> List[str]:
         """Detect potential risk vectors in a Word document.

@@ -36,6 +36,8 @@ TEXT_EXTS = {
     '.sql', '.sh', '.bash', '.zsh',
     '.err',                # Creo error logs (text-based)
     '.plist',              # Apple property lists (XML or binary)
+    '.rels',               # OPC relationship parts (XML) inside archives
+    '.model',              # 3MF 3D model parts (XML) inside archives
 }
 
 IMAGE_EXTS = {
@@ -87,6 +89,13 @@ class FileCleanerRouter:
             True if cleaning was successful
         """
         ext = input_path.suffix.lower()
+
+        # OPC '_rels/.rels' files are dotfiles with an EMPTY suffix —
+        # route them as XML text explicitly or archives lose them.
+        if not ext and input_path.name.lower().endswith('.rels'):
+            return self.text_cleaner.clean_file(
+                input_path, output_path, entity_spans,
+            )
 
         # ZIP-based formats (recurse, clean members, repack)
         if ext in ZIP_EXTS:
@@ -190,10 +199,12 @@ class FileCleanerRouter:
 
             # Default: try text cleaning
             _logger.info(
-                "Unknown .dat format, attempting text cleaning: %s",
+                "Unknown .dat format: %s — fail-closed for quarantine "
+                "(latin-1 text cleaning of unknown binaries ships them "
+                "nearly raw and can corrupt them).",
                 input_path.name,
             )
-            return self.text_cleaner.clean_file(input_path, output_path)
+            return False
 
         except Exception as e:
             _logger.error("Failed to handle .dat file %s: %s", input_path, e)

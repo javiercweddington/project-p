@@ -145,16 +145,33 @@ class ZipCleaner:
                         archive_comment[:100],
                     )
 
+            # Reset per-archive counters (the cleaner instance is shared)
+            self._cleaned_count = 0
+            self._copied_count = 0
+            self._failed_count = 0
+
             # Clean each extracted file
             self._clean_extracted_files(temp_dir)
+
+            if self._failed_count:
+                # FAIL CLOSED at the archive level: members that failed were
+                # deleted from the repack set, so shipping the remainder as
+                # "cleaned" would silently gut the archive (e.g. a .3mf
+                # losing its 3D model). Quarantine the whole original.
+                _logger.warning(
+                    "%d member(s) of %s failed to clean; failing the whole "
+                    "archive for pipeline quarantine.",
+                    self._failed_count, input_path.name,
+                )
+                return False
 
             # Repack into new ZIP with clean metadata and cleaned paths
             self._repack_zip(temp_dir, output_path)
 
             _logger.info(
-                "ZIP cleaning complete: %d cleaned, %d copied, %d failed, "
+                "ZIP cleaning complete: %d cleaned, %d copied, "
                 "%d orphaned entries detected",
-                self._cleaned_count, self._copied_count, self._failed_count,
+                self._cleaned_count, self._copied_count,
                 self._orphaned_count,
             )
 
@@ -311,14 +328,30 @@ class ZipCleaner:
         return cleaned
 
     def _clean_extracted_files(self, extract_dir: Path) -> None:
-        """Clean all extracted files using the appropriate cleaner."""
+        """Clean all extracted files using the appropriate cleaner.
+
+        FAIL-CLOSED per member: a member that cannot be cleaned is DELETED
+        from the extraction dir so it is never repacked raw into the
+        "cleaned" archive. macOS resource forks (._*, __MACOSX/) are
+        likewise deleted — they carry Finder metadata and must not ship.
+        """
         for file_path in extract_dir.rglob('*'):
             if not file_path.is_file():
                 continue
 
-            # Skip hidden/system files
-            if file_path.name.startswith('._') or file_path.name.startswith('__MACOSX'):
-                self._copied_count += 1
+            rel_parts = file_path.relative_to(extract_dir).parts
+
+            # Delete macOS junk outright (metadata carriers, never needed).
+            # NOTE: __MACOSX is a DIRECTORY prefix, so check path parts,
+            # not just the basename.
+            if (file_path.name.startswith('._')
+                    or '__MACOSX' in rel_parts
+                    or file_path.name == '.DS_Store'):
+                file_path.unlink()
+                _logger.info(
+                    "Removed macOS metadata member: %s",
+                    '/'.join(rel_parts),
+                )
                 continue
 
             # Use router to clean the file in-place
@@ -331,6 +364,14 @@ class ZipCleaner:
                 self._cleaned_count += 1
             else:
                 self._failed_count += 1
+                # Fail-closed: never repack a member that failed to clean.
+                if file_path.exists():
+                    file_path.unlink()
+                _logger.warning(
+                    "Member %s failed to clean; excluded from repacked "
+                    "archive (fail-closed).",
+                    '/'.join(rel_parts),
+                )
 
     def _repack_zip(self, source_dir: Path, output_path: Path) -> None:
         """Repack cleaned files into a new ZIP with clean metadata.
@@ -349,15 +390,22 @@ class ZipCleaner:
                     continue
 
                 # Calculate archive path
-                arcname = str(file_path.relative_to(source_dir))
+                rel = file_path.relative_to(source_dir)
 
                 # Clean entry path (remove username patterns)
-                arcname = self._clean_entry_path(arcname)
+                cleaned_rel = self._clean_entry_path(str(rel))
 
-                # Anonymize entry name by replacing sensitive entities
-                # This ensures filenames like "JCW20200615 INVOICE - Acme Corp.pdf"
-                # become "JCW20200615 INVOICE - [COMPANY_001].pdf"
-                arcname = self.mapper.replace_in_text(arcname)
+                # STRICT member-name policy — same rule as staging paths:
+                # each component is entity-replaced, and any residue
+                # (dates, initials, unmapped CJK) becomes FILE_nnn/DIR_nnn.
+                from ..anonymizer import anonymize_path_component
+                parts = Path(cleaned_rel).parts
+                new_parts = []
+                for i, part in enumerate(parts):
+                    etype = 'filename' if i == len(parts) - 1 else 'directory'
+                    new_parts.append(
+                        anonymize_path_component(self.mapper, part, etype))
+                arcname = '/'.join(new_parts)
 
                 # Create clean info object with normalized timestamp
                 info = zipfile.ZipInfo(

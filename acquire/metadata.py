@@ -50,6 +50,9 @@ class ImageOCR:
     SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
 
     def __init__(self):
+        # Functional availability flag: the INSTANCE exists even when
+        # tesseract is missing, so callers must check this, not `is None`.
+        self.available = HAS_TESSERACT
         if not HAS_TESSERACT:
             _logger.warning(
                 "Tesseract OCR not available. Install with: "
@@ -75,7 +78,21 @@ class ImageOCR:
 
         try:
             img = Image.open(image_path)
-            text = pytesseract.image_to_string(img, lang=lang)
+            try:
+                text = pytesseract.image_to_string(img, lang=lang)
+            except Exception as lang_err:
+                # A missing traineddata (e.g. chi_sim not installed) raises a
+                # TesseractError; without this fallback ALL OCR silently
+                # fails on machines lacking the extra language pack.
+                if lang != 'eng':
+                    _logger.warning(
+                        "OCR with lang=%r failed (%s); retrying with 'eng'. "
+                        "Install the missing traineddata for CJK coverage.",
+                        lang, lang_err,
+                    )
+                    text = pytesseract.image_to_string(img, lang='eng')
+                else:
+                    raise
             return text.strip() if text else None
         except Exception as e:
             _logger.debug("OCR failed on %s: %s", image_path, e)

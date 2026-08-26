@@ -172,8 +172,11 @@ class PDFCleaner:
                     input_path.name, eof_count,
                 )
 
-            # Also check for multiple xref tables
-            xref_count = content.lower().count(b'xref')
+            # Also check for multiple xref tables. Do NOT count the 'xref'
+            # inside 'startxref' (present in every PDF) — that false-flagged
+            # every single-revision file.
+            import re as _re
+            xref_count = len(_re.findall(rb'(?<!start)xref', content.lower()))
             if xref_count > 1:
                 _logger.warning(
                     "PDF %s has %d xref tables (incremental updates confirmed).",
@@ -189,150 +192,307 @@ class PDFCleaner:
     def _clean_with_pymupdf(self, input_path: Path, output_path: Path) -> bool:
         """Use PyMuPDF for full PDF sanitization.
 
-        Uses redaction annotations to remove entity text from the original
-        document, preserving layout and CJK text. This is superior to the
-        extract-and-rebuild approach which destroys formatting and drops CJK.
+        Uses redaction annotations to REPLACE entity text with its placeholder
+        in the original document, preserving layout and CJK text. This is
+        superior to the extract-and-rebuild approach, which destroys
+        formatting and drops CJK.
 
-        This addresses incremental updates by applying redactions which
-        replace content streams rather than overlaying black boxes.
+        Steps:
+        1. doc.scrub() when available (metadata, XMP, JavaScript, attachments,
+           hidden text, thumbnails) with explicit fallbacks otherwise.
+        2. Delete annotations and form widgets (popup text / field values leak).
+        3. Redact every mapped entity (plus its no-space/hyphen/underscore
+           variants) with the placeholder as replacement text.
+        4. Full fresh save (garbage=4) — discards incremental-update history.
+        5. Self-verify the OUTPUT: if any mapped entity is still extractable,
+           delete the output and fail closed.
         """
+        doc = None
         try:
             doc = fitz.open(str(input_path))
 
-            # Check for embedded files using correct API
-            embfile_names = doc.embfile_names()
-            if embfile_names:
-                _logger.warning(
-                    "PDF %s has %d embedded files (will be removed)",
-                    input_path.name, len(embfile_names),
-                )
-
-            # Check for JavaScript
-            js_list = doc.get_js()
-            if js_list:
-                _logger.warning(
-                    "PDF %s has JavaScript (will be removed)",
-                    input_path.name,
-                )
-
-            # Check for digital signatures (correct API: doc.is_signed is a method in newer versions)
-            try:
-                if hasattr(doc, 'is_signed') and callable(doc.is_signed):
-                    is_signed = doc.is_signed()
-                else:
-                    is_signed = getattr(doc, 'is_signed', False)
-                if is_signed:
+            if doc.is_encrypted:
+                if not doc.authenticate(""):
                     _logger.warning(
-                        "PDF %s has digital signature (will be removed)",
-                        input_path.name,
+                        "PDF %s is password-protected; cannot clean. "
+                        "Fail-closed for pipeline quarantine.", input_path.name,
                     )
-            except Exception:
-                pass
+                    return False
 
-            # Check for 3D annotations
-            self._check_3d_annotations(doc)
+            # Step 1: scrub document-level dangerous content.
+            # Document.scrub() removes metadata, XML/XMP metadata, JavaScript,
+            # attached/embedded files, hidden text, and thumbnails.
+            try:
+                doc.scrub()
+            except AttributeError:
+                # Older PyMuPDF without scrub(): explicit fallbacks.
+                try:
+                    for name in list(doc.embfile_names()):
+                        doc.embfile_del(name)
+                        _logger.info("Removed embedded file: %s", name)
+                except Exception as e:
+                    _logger.debug("Embedded-file removal failed: %s", e)
 
-            # Get entity terms to redact from the mapper
+            # Auto-register detectable identifiers (emails, doc codes) from
+            # the PDF's own text BEFORE building the redaction term list —
+            # otherwise a code like JCW20191226A that appears only in this
+            # PDF never enters the mapper and never gets redacted.
+            try:
+                full_text = '\n'.join(pg.get_text() for pg in doc)
+                self.text_cleaner._register_emails(
+                    full_text, source=str(input_path))
+            except Exception as e:
+                _logger.debug("PDF text pre-registration failed: %s", e)
+
+            # Step 2 + 3: per-page widget/annotation removal and redaction.
             entity_terms = self._get_entity_terms_to_redact()
+
+            # Embedded raster images (logos, stamps, signatures, photos)
+            # carry identifying content that text redaction can never reach
+            # ("NOA LABS" logo). Default: remove them all. Set
+            # PROJECT_P_PDF_KEEP_IMAGES=1 to keep (e.g. pure technical
+            # drawings you have separately vetted).
+            keep_images = os.environ.get(
+                'PROJECT_P_PDF_KEEP_IMAGES', '0') == '1'
 
             for page_num in range(len(doc)):
                 page = doc[page_num]
 
-                # Remove annotations using correct API (iterate page.annots)
-                annots = list(page.annots()) if page.annots() else []
-                if annots:
-                    _logger.debug(
-                        "Removing %d annotations from page %d",
-                        len(annots), page_num + 1,
-                    )
-                    while page.annots():
-                        page.delete_annot(page.annots()[0])
+                if not keep_images:
+                    for img_info in list(page.get_images(full=True)):
+                        xref = img_info[0]
+                        try:
+                            page.delete_image(xref)
+                            _logger.info(
+                                "Removed embedded image xref %d from page %d",
+                                xref, page_num + 1,
+                            )
+                            continue
+                        except Exception:
+                            pass
+                        # Fallback 1: swap in a blank 1x1 pixmap. Never use
+                        # rect-redaction here — apply_redactions() also wipes
+                        # TEXT intersecting the image bbox (logos overlapping
+                        # the header ate the words next to them).
+                        try:
+                            blank = fitz.Pixmap(fitz.csGRAY, (0, 0, 1, 1), 0)
+                            blank.clear_with(255)
+                            page.replace_image(xref, pixmap=blank)
+                            _logger.info(
+                                "Blanked embedded image xref %d on page %d",
+                                xref, page_num + 1,
+                            )
+                        except Exception as e:
+                            _logger.warning(
+                                "Could not remove or blank image xref %d on "
+                                "page %d (%s) — failing closed.",
+                                xref, page_num + 1, e,
+                            )
+                            # Unremovable image content = unverifiable PDF
+                            return False
 
-                # Extract text and clean it to find entities present
-                text = page.get_text()
-
-                # Also extract form field values
+                # Delete form widgets first (field values leak).
                 try:
-                    widgets = page.widgets()
+                    for widget in list(page.widgets() or []):
+                        try:
+                            page.delete_widget(widget)
+                        except Exception:
+                            pass
                 except Exception:
-                    widgets = None
+                    pass
 
-                if widgets:
-                    for widget in widgets:
-                        field_value = widget.field_value or ""
-                        if field_value:
-                            text += "\n" + field_value
+                # Delete existing annotations (comments/popups leak).
+                try:
+                    for annot in list(page.annots() or []):
+                        try:
+                            page.delete_annot(annot)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
-                # Clean text to determine which entities are present
-                cleaned_text = self.text_cleaner.clean_text(text)
+                # Word boxes for match expansion: search_for() returns the
+                # rect of the SUBSTRING only, which leaves fragments like
+                # 'ander' behind when 'Alex' matches inside 'Alexander'.
+                # Expanding each match to the full word boxes it touches
+                # removes the whole word cleanly.
+                try:
+                    word_boxes = page.get_text('words')
+                except Exception:
+                    word_boxes = []
 
-                # Find entity terms that appear in this page and redact them
-                for term in entity_terms:
+                def _expand_to_words(rect):
+                    """Expand a match rect to the word boxes it touches,
+                    returning (expanded_rect, joined_word_text)."""
+                    expanded = fitz.Rect(rect)
+                    touched = []
+                    for wb in word_boxes:
+                        wrect = fitz.Rect(wb[:4])
+                        if wrect.intersects(rect):
+                            expanded |= wrect
+                            touched.append(wb[4])
+                    return expanded, ' '.join(touched)
+
+                # Add a redaction for every occurrence of every entity term,
+                # inserting the placeholder as the replacement text.
+                # search_for() is a boundary-FREE substring search (token
+                # 'ann' matches inside 'planning'), so every hit must be
+                # validated against the anonymizer's boundary-aware pattern
+                # on the words it actually touches before we redact them —
+                # otherwise ordinary words get destroyed.
+                added_redactions = False
+                for term, placeholder, boundary_pattern in entity_terms:
                     try:
                         occurrences = page.search_for(term)
-                        if occurrences:
-                            _logger.debug(
-                                "Redacting '%s' (%d occurrences) on page %d",
-                                term, len(occurrences), page_num + 1,
-                            )
-                            for rect in occurrences:
-                                page.add_redact_annot(rect)
                     except Exception:
-                        pass
-
-                # Apply all redaction annotations (replaces content, not overlay)
-                if page.annots():
+                        continue
+                    for rect in occurrences:
+                        target, touched_text = _expand_to_words(rect)
+                        if (boundary_pattern is not None and touched_text
+                                and not boundary_pattern.search(touched_text)):
+                            # Substring-only hit inside larger words
+                            # ('ann' in 'planning'): skip.
+                            continue
+                        try:
+                            page.add_redact_annot(
+                                target, text=placeholder, fontsize=6,
+                            )
+                            added_redactions = True
+                        except Exception:
+                            # Fall back to plain removal if replacement
+                            # text insertion is unsupported.
+                            page.add_redact_annot(target)
+                            added_redactions = True
+                if added_redactions:
                     page.apply_redactions()
 
-            # Clear document metadata
-            doc.set_metadata(["", "", "", "", "", "", "", ""])
+            # Step 4: clear Info dict + XMP (again, post-scrub for safety)
+            doc.set_metadata({})
+            try:
+                doc.del_xml_metadata()
+            except Exception:
+                pass
 
-            # Save with garbage collection (removes unused objects)
+            # Full fresh save discards prior revisions (incremental updates).
+            # Save via a temp file: PyMuPDF refuses a full save onto the
+            # file it has open (input == output on re-clean passes).
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            doc.save(str(output_path), garbage=4, deflate=True, clean=True)
-            doc.close()
+            tmp_path = output_path.with_name(output_path.name + '.cleantmp')
+            try:
+                doc.save(str(tmp_path), garbage=4, deflate=True, clean=True)
+                doc.close()
+                doc = None
+                os.replace(tmp_path, output_path)
+            except Exception:
+                # Never leave a partial temp file inside the deliverable
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                raise
+
+            # Step 5: self-verify the output; fail closed on any residual.
+            residual = self._pdf_residual_entities(output_path)
+            if residual:
+                _logger.warning(
+                    "PDF %s still contains entity text after redaction "
+                    "(%s); deleting output, fail-closed for quarantine. "
+                    "(Likely split across line breaks or embedded in images.)",
+                    input_path.name, ', '.join(sorted(residual)[:5]),
+                )
+                output_path.unlink(missing_ok=True)
+                return False
 
             return True
 
         except Exception as e:
             _logger.error("PyMuPDF cleaning failed: %s", e)
             return False
+        finally:
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
 
-    def _get_entity_terms_to_redact(self) -> List[str]:
-        """Get list of entity terms that should be redacted from PDFs.
+    def _get_entity_terms_to_redact(self) -> List[Tuple[str, str, object]]:
+        """Get (search_term, placeholder, boundary_pattern) triples.
 
-        Returns terms from the entity mapper that need to be searched for
-        and redacted in PDF pages.
+        Includes each mapped entity's original text plus its collapsed /
+        hyphenated / underscored variants and (stopword-filtered) person
+        name tokens. Each triple carries the anonymizer's boundary-aware
+        compiled pattern so hits from PyMuPDF's boundary-free substring
+        search can be validated before redacting. Longest terms first.
         """
-        terms = []
+        from ..anonymizer import NON_TEXT_ENTITY_TYPES, PERSON_TOKEN_STOPWORDS
+        import re as _re
 
-        # EntityMapper stores mappings in _mappings: Dict[str, EntityMapping]
-        # where EntityMapping has .original (the original entity text)
-        if hasattr(self.mapper, '_mappings'):
-            for mapping in self.mapper._mappings.values():
-                original = mapping.original
-                if original and len(original.strip()) > 0:
-                    terms.append(original)
+        triples = []
+        seen = set()
+        for mapping in self.mapper.mappings:
+            if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
+                continue
+            original = (mapping.original or '').strip()
+            if len(original) < 2:
+                continue
 
-        return list(set(terms))  # Deduplicate
+            build = getattr(self.mapper, '_build_pattern_cached', None)
+            boundary_pattern = None
+            if build is not None:
+                try:
+                    boundary_pattern = build(original, mapping.entity_type)
+                except Exception:
+                    boundary_pattern = None
+            if boundary_pattern is None:
+                continue  # degenerate value; nothing safe to search for
 
-    def _check_3d_annotations(self, doc) -> None:
-        """Check for U3D/PRC 3D model annotations."""
-        for page_num in range(len(doc)):
-            page = doc[page_num]
+            variants = {original}
+            generate = getattr(self.mapper, '_generate_variants', None)
+            if generate is not None:
+                try:
+                    variants.update(generate(original))
+                except Exception:
+                    pass
+            # Person entities also redact by individual name token
+            # ("Alex Murawski" must catch "Lech Alexander Murawski").
+            if mapping.entity_type == 'person':
+                for token in _re.split(r'[\s\-_]+', original.lower()):
+                    token = token.strip('.,;:')
+                    if len(token) >= 3 and token not in PERSON_TOKEN_STOPWORDS:
+                        variants.add(token)
+
+            for variant in variants:
+                key = variant.lower()
+                if len(variant) >= 2 and key not in seen:
+                    seen.add(key)
+                    triples.append(
+                        (variant, mapping.placeholder, boundary_pattern))
+        triples.sort(key=lambda p: len(p[0]), reverse=True)
+        return triples
+
+    def _pdf_residual_entities(self, pdf_path: Path) -> set:
+        """Extract all text from a PDF and return mapped entities still present."""
+        residual = set()
+        try:
+            check_doc = fitz.open(str(pdf_path))
             try:
-                annots = list(page.annots()) if page.annots() else []
-                if annots:
-                    for annot in annots:
-                        # annot.info is a dict with annotation properties
-                        info = annot.info
-                        if info.get("subtype") == "3D":
-                            _logger.warning(
-                                "Page %d: U3D/PRC 3D model embedded (will be removed)",
-                                page_num + 1,
-                            )
-            except Exception:
-                pass
+                full_text = '\n'.join(
+                    page.get_text() for page in check_doc
+                ).lower()
+            finally:
+                check_doc.close()
+        except Exception as e:
+            _logger.warning("Could not self-verify PDF %s: %s", pdf_path, e)
+            return {'<unverifiable>'}
+
+        seen_patterns = set()
+        for term, _ph, boundary_pattern in self._get_entity_terms_to_redact():
+            if id(boundary_pattern) in seen_patterns:
+                continue
+            seen_patterns.add(id(boundary_pattern))
+            # Boundary-aware residual check: a bare substring test would
+            # flag 'ann' inside 'planning' and false-quarantine clean PDFs.
+            if boundary_pattern.search(full_text):
+                residual.add(term)
+        return residual
 
     # ---- pdfminer + reportlab strategy ----
 
@@ -343,17 +503,15 @@ class PDFCleaner:
         This is lossy for formatting but correct for sanitization.
         """
         try:
-            # Extract text from each page
-            page_texts = []
-            for page_num in range(100):  # Limit pages
-                try:
-                    text = extract_text(str(input_path), page_numbers=[page_num])
-                    if text:
-                        page_texts.append(self.text_cleaner.clean_text(text))
-                    else:
-                        break
-                except Exception:
-                    break
+            # Extract the WHOLE document in one pass and split on form feeds.
+            # (The previous per-page loop capped at 100 pages and stopped at
+            # the first empty page, silently truncating documents.)
+            full_text = extract_text(str(input_path)) or ""
+            page_texts = [
+                self.text_cleaner.clean_text(page_text,
+                                             source=str(input_path))
+                for page_text in full_text.split('\f')
+            ]
 
             # Rebuild PDF with reportlab
             c = canvas.Canvas(str(output_path))
@@ -430,11 +588,48 @@ class PDFCleaner:
             with open(output_path, 'wb') as f:
                 writer.write(f)
 
+            # Self-verify: pypdf cannot rewrite page content text, so if any
+            # mapped entity remains extractable in the output, we must NOT
+            # ship it. Delete the output and fail closed for quarantine.
+            residual = self._pypdf_residual_entities(output_path)
+            if residual:
+                _logger.warning(
+                    "pypdf strategy cannot remove entity text still present "
+                    "in %s (%s); deleting output, fail-closed for quarantine. "
+                    "Install PyMuPDF for content redaction.",
+                    input_path.name, ', '.join(sorted(residual)[:5]),
+                )
+                output_path.unlink(missing_ok=True)
+                return False
+
             return True
 
         except Exception as e:
             _logger.error("pypdf cleaning failed: %s", e)
             return False
+
+    def _pypdf_residual_entities(self, pdf_path: Path) -> set:
+        """Extract all text via pypdf and return mapped entities still present."""
+        residual = set()
+        try:
+            reader = PdfReader(str(pdf_path))
+            full_text = '\n'.join(
+                (page.extract_text() or '') for page in reader.pages
+            ).lower()
+        except Exception as e:
+            _logger.warning("Could not self-verify PDF %s: %s", pdf_path, e)
+            return {'<unverifiable>'}
+
+        seen_patterns = set()
+        for term, _ph, boundary_pattern in self._get_entity_terms_to_redact():
+            if id(boundary_pattern) in seen_patterns:
+                continue
+            seen_patterns.add(id(boundary_pattern))
+            # Boundary-aware residual check: a bare substring test would
+            # flag 'ann' inside 'planning' and false-quarantine clean PDFs.
+            if boundary_pattern.search(full_text):
+                residual.add(term)
+        return residual
 
     def _remove_page_annotations(self, page, page_num: int) -> None:
         """Remove all annotations from a page."""

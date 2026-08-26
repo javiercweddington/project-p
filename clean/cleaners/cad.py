@@ -89,9 +89,6 @@ _METADATA_ENTITY_TYPE_MAP = {
     'organization': 'company',
     'manager': 'person',
     'product': 'product',
-    'creator_tool': 'product',
-    'name': 'product',
-    'value': 'product',
 }
 
 # Metadata fields to blank/normalize rather than register as entities
@@ -106,19 +103,31 @@ class CADCleaner:
     """Clean CAD files using CADMetadataExtractor from acquire/metadata.py."""
 
     STEP_FILE_NAME_RE = re.compile(
-        r"FILE_NAME\s*\(\s*'([^']*?)'\s*,\s*'([^']*?)'\s*,\s*([^;]*?)\s*\);",
-        re.MULTILINE,
+        r"FILE_NAME\s*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,([^;]*?)\)\s*;",
+        re.DOTALL,
     )
 
+    # FILE_DESCRIPTION((description...), 'implementation_level');
     STEP_FILE_DESCRIPTION_RE = re.compile(
-        r"FILE_DESCRIPTION\s*\([^;]*\);",
-        re.MULTILINE,
+        r"FILE_DESCRIPTION\s*\(\s*\((.*?)\)\s*,\s*'([^']*)'\s*\)\s*;",
+        re.DOTALL,
     )
 
+    # Real STEP syntax: PRODUCT('id', 'name', 'description', (#ref, ...))
+    # — three quoted fields followed by a reference set, NOT four quoted fields.
     STEP_PRODUCT_RE = re.compile(
-        r"PRODUCT\s*\(\s*'([^']*?)'\s*,\s*'([^']*?)'\s*,\s*'([^']*?)'\s*,\s*'([^']*?)'\s*\)",
-        re.MULTILINE,
+        r"PRODUCT\s*\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,",
     )
+
+    # Generic STEP labels that must never be registered as entities
+    # (they appear thousands of times in ordinary files).
+    _STEP_GENERIC_NAMES = {
+        'none', 'part', 'assembly', 'unknown', 'default', 'solid', 'body',
+        'component', 'product', 'shape', 'open cascade step translator',
+        'lens', 'cover', 'plate', 'housing', 'bracket', 'frame', 'panel',
+        'screw', 'washer', 'gasket', 'base', 'top', 'bottom', 'left',
+        'right', 'front', 'back', 'inner', 'outer', 'main',
+    }
 
     STL_SOLID_RE = re.compile(
         r'^solid\s+\S+',
@@ -245,27 +254,52 @@ class CADCleaner:
         try:
             # Read with fail-open encoding and preserved line endings
             text, enc = _read_text_file(input_path)
+            source = str(input_path)
 
-            # Rewrite FILE_NAME header: replace author/org/timestamp
-            text = self.STEP_FILE_NAME_RE.sub(
-                lambda m: "FILE_NAME('Cleaned STEP', '2024-01-01', 'Project P');",
-                text,
-            )
+            # Rewrite FILE_NAME with the MANDATORY 7-field form:
+            # (name, time_stamp, (author), (organization),
+            #  preprocessor_version, originating_system, authorization)
+            # Name is text-cleaned (may carry product identifiers);
+            # timestamp is normalized; author/org/tool fields are blanked.
+            def _file_name_sub(m: re.Match) -> str:
+                cleaned_name = self.text_cleaner.clean_text(m.group(1), source=source)
+                return (
+                    f"FILE_NAME('{cleaned_name}', '2024-01-01T00:00:00', "
+                    f"(''), (''), '', '', '');"
+                )
+            text = self.STEP_FILE_NAME_RE.sub(_file_name_sub, text, count=1)
 
-            # Rewrite FILE_DESCRIPTION
-            text = self.STEP_FILE_DESCRIPTION_RE.sub(
-                lambda m: "FILE_DESCRIPTION(('Cleaned'), '2;1');",
-                text,
-            )
+            # Rewrite FILE_DESCRIPTION: clean the description strings,
+            # preserve the implementation level (schema-relevant).
+            def _file_desc_sub(m: re.Match) -> str:
+                cleaned_desc = self.text_cleaner.clean_text(m.group(1), source=source)
+                return f"FILE_DESCRIPTION(({cleaned_desc}), '{m.group(2)}');"
+            text = self.STEP_FILE_DESCRIPTION_RE.sub(_file_desc_sub, text, count=1)
 
-            # Rewrite PRODUCT entities (name, description, formation_date, id)
-            text = self.STEP_PRODUCT_RE.sub(
-                lambda m: "PRODUCT('Cleaned', '', '', '')",
-                text,
-            )
+            # Pseudonymize PRODUCT id/name fields through the mapper so the
+            # same part gets the same placeholder across all files. Generic
+            # labels ('NONE', 'PART', ...) are never registered.
+            def _product_sub(m: re.Match) -> str:
+                # STEP escapes apostrophes as '' — a statement containing
+                # them would mis-span the quoted-field regex and corrupt
+                # the geometry file; leave such statements untouched.
+                if "''" in m.group(0):
+                    return m.group(0)
+
+                def anon(value: str) -> str:
+                    stripped = value.strip()
+                    if (len(stripped) >= 3
+                            and stripped.lower() not in self._STEP_GENERIC_NAMES):
+                        return self.mapper.get_or_create(
+                            'product', stripped, source=source)
+                    return value
+                cleaned_desc = self.text_cleaner.clean_text(m.group(3), source=source)
+                return (f"PRODUCT('{anon(m.group(1))}', '{anon(m.group(2))}', "
+                        f"'{cleaned_desc}',")
+            text = self.STEP_PRODUCT_RE.sub(_product_sub, text)
 
             # Now apply general text cleaning for any remaining entities
-            text = self.text_cleaner.clean_text(text)
+            text = self.text_cleaner.clean_text(text, source=source)
 
             _write_text_file(output_path, text, encoding=enc)
             return True
@@ -283,13 +317,36 @@ class CADCleaner:
         """
         try:
             with open(input_path, 'rb') as f:
-                header = f.read(80)
+                sample = f.read(512)
 
-            # Binary STL: first 80 bytes are header, followed by 4-byte int (triangle count)
-            # ASCII STL: starts with "solid "
-            if header[:6] == b'solid ':
-                # ASCII STL: text clean (fail-open encoding)
-                return self.text_cleaner.clean_file(input_path, output_path)
+            # ASCII STL starts with "solid " AND the following bytes are text.
+            # A binary STL whose 80-byte header happens to start with "solid "
+            # would corrupt if treated as text, so also require the sample to
+            # be NUL-free and decodable.
+            is_ascii_stl = False
+            # Accept 'solid' followed by space OR newline (nameless ASCII
+            # STLs are legal: 'solid\n...') — requiring the trailing space
+            # misrouted them to the binary path, corrupting geometry.
+            if (sample[:5] == b'solid'
+                    and (len(sample) == 5 or sample[5:6] in b' \t\r\n')
+                    and b'\x00' not in sample):
+                try:
+                    sample.decode('utf-8')
+                    is_ascii_stl = True
+                except UnicodeDecodeError:
+                    is_ascii_stl = False
+
+            if is_ascii_stl:
+                # ASCII STL: clean the solid/endsolid names, then entity-clean
+                text, enc = _read_text_file(input_path)
+                source = str(input_path)
+                text = re.sub(r'^(solid)[ \t]+[^\r\n]*', r'\1 cleaned',
+                              text, flags=re.MULTILINE)
+                text = re.sub(r'^(endsolid)[ \t]+[^\r\n]*', r'\1 cleaned',
+                              text, flags=re.MULTILINE)
+                text = self.text_cleaner.clean_text(text, source=source)
+                _write_text_file(output_path, text, encoding=enc)
+                return True
             else:
                 # Binary STL: replace header with exactly 80 bytes, copy rest
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -299,11 +356,8 @@ class CADCleaner:
                     rest = fin.read()
 
                 with open(output_path, 'wb') as fout:
-                    # Write clean header - MUST be exactly 80 bytes
-                    clean_header = b'Cleaned STL - Project P'
-                    clean_header = clean_header.ljust(80, b'\x00')
-                    assert len(clean_header) == 80, f"Header is {len(clean_header)} bytes, expected 80"
-                    fout.write(clean_header)
+                    # Clean header - the format mandates exactly 80 bytes
+                    fout.write(b'Cleaned STL - Project P'.ljust(80, b'\x00')[:80])
                     fout.write(rest)
 
                 return True
@@ -325,15 +379,23 @@ class CADCleaner:
         # Other binary CAD: fail-closed
         return self._remove_binary_cad_with_warning(input_path, output_path, ext)
 
+    # OLE property-set streams live under the \x05 prefix (not \x01).
+    _OLE_SUMMARY_STREAMS = ('\x05SummaryInformation',
+                            '\x05DocumentSummaryInformation')
+
     def _strip_ole_summary(self, input_path: Path, output_path: Path, ext: str) -> bool:
         """Strip OLE SummaryInformation streams from SolidWorks files.
 
-        Uses olefile to read and verify OLE structure, then attempts to
-        remove SummaryInformation and DocumentSummaryInformation streams.
-        Falls back to exiftool CLI if available, then to fail-closed.
+        Zero-fills the \\x05SummaryInformation / \\x05DocumentSummaryInformation
+        property streams in place (same size, so the OLE structure stays valid),
+        then verifies no mapped entity remains anywhere in the raw bytes
+        (checked in both UTF-8 and UTF-16LE). Fails closed on any doubt.
+
+        Note: exiftool is deliberately NOT used here — it cannot write
+        OLE-based CAD formats, so an exiftool round-trip can never succeed.
         """
+        temp_output: Optional[Path] = None
         try:
-            # Verify this is a valid OLE compound file
             if not HAS_OLEFILE:
                 _logger.warning(
                     "olefile not available; cannot strip OLE metadata from %s. "
@@ -342,71 +404,80 @@ class CADCleaner:
                 )
                 return False
 
-            ole = olefile.OleFileIO(input_path)
-
-            # Check for SummaryInformation streams
-            has_summary = ole.exists('\x01SummaryInformation')
-            has_doc_summary = ole.exists('\x01DocumentSummaryInformation')
-
-            if has_summary or has_doc_summary:
-                _logger.info(
-                    "Found OLE SummaryInformation in %s: Summary=%s, DocSummary=%s",
-                    input_path.name, has_summary, has_doc_summary,
-                )
-
-            ole.close()
-
-            # Try to use exiftool to strip OLE metadata (it exists on this machine)
-            import subprocess
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Copy first to avoid corrupting the original
-            temp_output = output_path.with_suffix('.tmp')
-            shutil.copy2(input_path, temp_output)
-
-            result = subprocess.run(
-                ['exiftool', '-overwrite_original',
-                 '-Title=', '-Subject=', '-Author=', '-Keywords=',
-                 '-Comments=', '-LastSavedBy=', '-Company=',
-                 '-Manager=', '-Category=',
-                 f'-all=', str(temp_output)],
-                capture_output=True, text=True, timeout=30,
-            )
-
-            if result.returncode == 0:
-                # Rename temp to final output
-                temp_output.rename(output_path)
-                _logger.info(
-                    "Stripped OLE metadata from %s via exiftool", input_path.name,
-                )
-                return True
-            else:
+            try:
+                with olefile.OleFileIO(str(input_path)) as ole:
+                    present = [s for s in self._OLE_SUMMARY_STREAMS if ole.exists(s)]
+                    sizes = {s: ole.get_size(s) for s in present}
+            except Exception as e:
+                # Not an OLE2 file (newer SolidWorks container, etc.) —
+                # we cannot enumerate or scrub its metadata. Fail closed.
                 _logger.warning(
-                    "exiftool failed for %s: %s", input_path.name, result.stderr,
+                    "%s is not a readable OLE2 file (%s); cannot scrub metadata. "
+                    "Fail-closed: returning False for pipeline quarantine.",
+                    input_path.name, e,
                 )
-                # Clean up temp file
-                if temp_output.exists():
-                    temp_output.unlink()
+                return False
 
-            # Fallback: copy as-is with warning (the metadata is extracted
-            # during acquisition, so entities are still registered)
-            _logger.warning(
-                "Could not strip OLE metadata from %s. "
-                "Copying as-is (metadata was extracted during acquisition).",
-                ext,
-            )
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(input_path, output_path)
+            temp_output = output_path.with_name(output_path.name + '.cleantmp')
+            shutil.copyfile(input_path, temp_output)
+
+            if present:
+                _logger.info(
+                    "Zero-filling OLE property streams in %s: %s",
+                    input_path.name, [s.lstrip('\x05') for s in present],
+                )
+                ole = olefile.OleFileIO(str(temp_output), write_mode=True)
+                try:
+                    for stream in present:
+                        ole.write_stream(stream, b'\x00' * sizes[stream])
+                finally:
+                    ole.close()
+
+            # Verification: no mapped entity may remain in the raw bytes.
+            if self._binary_contains_mapped_entity(temp_output.read_bytes()):
+                _logger.warning(
+                    "Mapped entity text remains in %s after OLE scrub "
+                    "(embedded strings outside property streams). "
+                    "Fail-closed: returning False for pipeline quarantine.",
+                    input_path.name,
+                )
+                temp_output.unlink()
+                return False
+
+            os.replace(temp_output, output_path)
+            temp_output = None
             return True
 
-        except subprocess.TimeoutExpired:
-            _logger.error("exiftool timed out for %s", input_path.name)
-            return False
         except Exception as e:
             _logger.error(
                 "Error stripping OLE metadata from %s: %s", input_path, e,
             )
             return False
+        finally:
+            if temp_output is not None and temp_output.exists():
+                temp_output.unlink()
+
+    def _binary_contains_mapped_entity(self, data: bytes) -> bool:
+        """Check raw bytes for any mapped entity in UTF-8 or UTF-16LE form.
+
+        Case-insensitive for ASCII characters (bytes.lower() lowercases
+        ASCII only, which matches how the entity needles are encoded).
+        """
+        lowered = data.lower()
+        for mapping in self.mapper.mappings:
+            value = mapping.original.strip()
+            if len(value) < 3:
+                continue
+            for enc in ('utf-8', 'utf-16-le'):
+                try:
+                    needle = value.lower().encode(enc)
+                except Exception:
+                    continue
+                if needle and needle in lowered:
+                    return True
+        return False
 
     def _remove_binary_cad_with_warning(self, input_path: Path,
                                          output_path: Path, ext: str) -> bool:
