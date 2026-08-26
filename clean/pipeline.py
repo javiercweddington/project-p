@@ -396,12 +396,12 @@ class CleanPipeline:
         step consumes, so quarantined raw originals must not live inside it.
         """
         parent = self.staging_dir.parent
-        return parent.parent / (parent.name + '_quarantine')
+        return parent / (parent.name + '_quarantine')
 
     def _audit_root(self) -> Path:
         """Audit root OUTSIDE the deliverable tree (see _quarantine_root)."""
         parent = self.staging_dir.parent
-        return parent.parent / (parent.name + '_audit')
+        return parent / (parent.name + '_audit')
 
     def _clean_all_files(self) -> Tuple[int, int]:
         """Clean all files in staging directory.
