@@ -331,6 +331,13 @@ class CleanPipeline:
         self._sample_audit_result = None
         self._llm_sample_audit(result)
 
+        # Step 2f: comb & destroy — run the deterministic leakage checks
+        # early, eliminate every reported residual with targeted repairs
+        # (media metadata re-encode, confirmed-value binary surgery), and
+        # quarantine anything unrepairable. Final verification then sees
+        # a tree with no KNOWN deterministic residual.
+        self._comb_residuals(result)
+
         # Step 3: Run verification
         try:
             leakage_report = verify_clean(
@@ -422,16 +429,20 @@ class CleanPipeline:
     def _quarantine_root(self) -> Path:
         """Quarantine root OUTSIDE the deliverable tree.
 
-        The staging parent (default /tmp/clean) is exactly what the compact
-        step consumes, so quarantined raw originals must not live inside it.
+        The staging parent (default /tmp/clean, or e.g. ~/cleaned) is
+        exactly what gets consumed/shipped as the deliverable set, so
+        quarantined raw originals must not live inside it: the root is a
+        SIBLING of the staging parent (/tmp/clean -> /tmp/clean_quarantine).
+        The old `parent / name_quarantine` put raw originals INSIDE the
+        deliverable tree (seen live: ~/cleaned/cleaned_quarantine).
         """
         parent = self.staging_dir.parent
-        return parent / (parent.name + '_quarantine')
+        return parent.with_name(parent.name + '_quarantine')
 
     def _audit_root(self) -> Path:
         """Audit root OUTSIDE the deliverable tree (see _quarantine_root)."""
         parent = self.staging_dir.parent
-        return parent / (parent.name + '_audit')
+        return parent.with_name(parent.name + '_audit')
 
     def _clean_all_files(self, max_extra_passes: int = 2) -> Tuple[int, int]:
         """Clean all files in staging directory.
@@ -1156,6 +1167,40 @@ class CleanPipeline:
                      f"leak value(s); re-cleaned {len(recleaned)} file(s)"),
             hits=hits,
         )
+
+    def _comb_residuals(self, result: 'CleanResult') -> None:
+        """Comb & destroy (PROJECT_P_COMB, default on): pre-verify the
+        deterministic checks, repair every reported residual in place,
+        quarantine what cannot be repaired. See clean/comber.py."""
+        if os.environ.get('PROJECT_P_COMB', '1') == '0':
+            return
+        from .verifier import LeakageChecker
+        from .comber import comb_residuals
+
+        progress = getattr(self, '_progress', None)
+        if progress:
+            progress.stage('comb & destroy: scanning for residuals')
+        try:
+            checker = LeakageChecker(self.mapper)
+            hits = list(checker.run_check(
+                self.staging_dir, self.source_dir).hits)
+            hits += checker.check_metadata(self.staging_dir)
+            if not hits:
+                return
+            if progress:
+                progress.stage(
+                    f'comb & destroy: repairing {len(hits)} residual(s)')
+            summary = comb_residuals(
+                self.mapper, self.staging_dir, hits,
+                quarantine=lambda f: self._quarantine_file(
+                    f, f.relative_to(self.staging_dir)))
+            _logger.info(
+                "Comb & destroy: %(repaired)d repaired, "
+                "%(quarantined)d quarantined, %(skipped)d skipped",
+                summary)
+        except Exception as e:
+            # Never let the comber kill a run — verification still gates.
+            _logger.warning("Comb & destroy errored: %s", e)
 
     def _inplace_reclean(self) -> int:
         """Re-clean every file currently in staging, in place.

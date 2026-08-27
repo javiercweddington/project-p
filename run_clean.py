@@ -82,6 +82,12 @@ def main() -> int:
                              'cost); judge: LLM audits EVERY finished file '
                              'once; auto/required: LLM also joins up-front '
                              'discovery.')
+    parser.add_argument('--comb', choices=['on', 'off'], default='on',
+                        help='Comb & destroy (default on): pre-verify the '
+                             'deterministic checks, repair every reported '
+                             'residual in place (media metadata re-encode, '
+                             'confirmed-value binary surgery), quarantine '
+                             'what cannot be repaired.')
     parser.add_argument('--opaque-binary',
                         choices=['quarantine', 'ship-scanned'],
                         default='quarantine',
@@ -105,6 +111,7 @@ def main() -> int:
     # at import/instantiation time)
     os.environ['PROJECT_P_LLM_VERIFY'] = args.llm
     os.environ['PROJECT_P_OPAQUE_BINARY'] = args.opaque_binary
+    os.environ['PROJECT_P_COMB'] = '1' if args.comb == 'on' else '0'
     if args.llm_base:
         os.environ['PROJECT_P_LLM_BASE'] = args.llm_base
     if args.llm_model:

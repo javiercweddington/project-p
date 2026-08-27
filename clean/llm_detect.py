@@ -184,13 +184,14 @@ def _llm_scan_cap() -> int:
 
 
 def _llm_max_tokens() -> int:
-    """Reply-token budget (PROJECT_P_LLM_MAX_TOKENS, default 2000).
-    Must stay generous enough that a thinking-mode model still reaches
-    its JSON — a truncated reply is a FAILED scan, not an empty one."""
+    """Reply-token budget (PROJECT_P_LLM_MAX_TOKENS, default 4096).
+    A truncated reply is a FAILED scan, not an empty one — and
+    product-dense spreadsheets overflowed 2000 tokens live (structured
+    JSON is verbose: ~25 tokens per entity)."""
     try:
-        return max(64, int(os.environ.get('PROJECT_P_LLM_MAX_TOKENS', '2000')))
+        return max(64, int(os.environ.get('PROJECT_P_LLM_MAX_TOKENS', '4096')))
     except ValueError:
-        return 2000
+        return 4096
 
 
 def _detect_system_prompt() -> str:
