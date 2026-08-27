@@ -12,6 +12,7 @@ All checks are deterministic and can run in CI on every commit.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import struct
 import zipfile
@@ -192,8 +193,31 @@ class LeakageChecker:
 
     def __init__(self, mapper: EntityMapper):
         self.mapper = mapper
+        self._prefilter_cache: dict = {}
 
     # -- public API ---------------------------------------------------------
+
+    def _prefilter_tokens(self, original: str) -> tuple:
+        """Cheap substring keys that MUST appear in a text for the entity's
+        boundary pattern to possibly match.
+
+        Variant generation (collapsed/hyphenated/underscored, flexible
+        whitespace, person name tokens) only rewrites SEPARATORS — the
+        alphanumeric/CJK tokens themselves are never altered — so if no
+        token of the original occurs as a plain substring of the
+        lowercased text, running the (expensive) compiled pattern is
+        provably pointless. Returns () when no token is long enough to
+        be selective; callers must then run the pattern unconditionally.
+        """
+        cached = self._prefilter_cache.get(original)
+        if cached is not None:
+            return cached
+        tokens = tuple(
+            t for t in re.findall(r'\w+', original.lower())
+            if len(t) >= (2 if re.search(r'[^\W\da-z_]', t) else 3)
+        )
+        self._prefilter_cache[original] = tokens
+        return tokens
 
     def _entity_pattern(self, original: str,
                         entity_type: Optional[str] = None) -> re.Pattern:
@@ -227,6 +251,11 @@ class LeakageChecker:
     def check_text(self, cleaned_text: str, file_path: str = "") -> List[LeakageHit]:
         """Check cleaned text for any surviving original entity strings."""
         hits = []
+        # One lowercase copy for the substring prefilter: with a large
+        # mapper (100+ entities) the per-entity compiled patterns are the
+        # dominant verification cost on multi-MB files (CAD text, raw
+        # binary scans); the prefilter skips patterns that cannot match.
+        text_lower = cleaned_text.lower()
 
         for mapping in self.mapper.mappings:
             original = mapping.original
@@ -235,6 +264,10 @@ class LeakageChecker:
             # Audit-only path pseudonyms (filename/directory stems) are not
             # text entities; a stem like 'in' would flag every document.
             if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
+                continue
+
+            tokens = self._prefilter_tokens(original)
+            if tokens and not any(tok in text_lower for tok in tokens):
                 continue
 
             pattern = self._entity_pattern(original, mapping.entity_type)
@@ -595,11 +628,26 @@ class ReScanner:
     # Common words that might be in placeholder text but aren't real entities
     _PLACEHOLDER_PATTERN = re.compile(r'\[\w+_\d{3,}\]')
 
+    # Machine-generated CAD text (coordinate streams) is worthless to NER
+    # and enormous — a 3.4MB STEP file is ~10K GLiNER chunks. The Entity
+    # Leakage Check still regex-scans these files in FULL; skipping them
+    # here loses nothing that check covers.
+    _NER_SKIP_EXTENSIONS = {'.step', '.stp', '.igs', '.iges'}
+
     def __init__(self, mapper: EntityMapper):
         self.mapper = mapper
         # New-entity discoveries are collected here as advisories rather
         # than failing hits (detector false-positive rates are high).
         self._advisory_hits: List[LeakageHit] = []
+        # NER re-scan input cap (chars). Known-entity survival is
+        # redundantly covered by the full-text Entity Leakage Check, so
+        # capping the (advisory-oriented) NER pass trades no hard
+        # guarantee for a large speedup on huge extracted texts.
+        try:
+            self._max_rescan_chars = int(os.environ.get(
+                'PROJECT_P_RESCAN_MAX_CHARS', '20000'))
+        except ValueError:
+            self._max_rescan_chars = 20000
 
     def rescan_text(self, cleaned_text: str, file_path: str = "") -> List[LeakageHit]:
         """Scan cleaned text for entities using GLiNER or regex fallback."""
@@ -711,15 +759,20 @@ class ReScanner:
             if not cleaned_file.is_file():
                 continue
 
-            if cleaned_file.suffix.lower() in (
+            suffix = cleaned_file.suffix.lower()
+            if suffix in (
                 '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff',
                 '.mp3', '.wav', '.mp4', '.avi', '.mov',
             ):
+                continue
+            if suffix in self._NER_SKIP_EXTENSIONS:
                 continue
 
             text = self._extract_file_text(cleaned_file)
             if text is None:
                 continue
+            if self._max_rescan_chars > 0:
+                text = text[:self._max_rescan_chars]
 
             rel_path = str(cleaned_file.relative_to(cleaned_dir))
             all_hits.extend(self.rescan_text(text, rel_path))
