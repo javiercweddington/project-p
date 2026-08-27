@@ -111,6 +111,28 @@ _VALUE_STOPLIST = {
     'adobe', 'acrobat', 'adobe acrobat', 'pdf', 'windows',
 }
 
+_VERSION_SUFFIX_RE = re.compile(r'^[\sv.\d()+-]+$')
+
+
+def _stoplisted(value: str) -> bool:
+    """True when a value must never be registered.
+
+    Exact stoplist hit, or a stoplisted software name followed by a
+    version-like suffix ('Openpyxl 3.1.53.1', 'Microsoft Excel 2016' —
+    seen registered live). The suffix must look like a version so real
+    names such as 'Word Industries Ltd' are NOT blocked.
+    """
+    v = value.lower().strip()
+    if v in _VALUE_STOPLIST:
+        return True
+    words = v.split()
+    for n in (1, 2):
+        if len(words) > n and ' '.join(words[:n]) in _VALUE_STOPLIST:
+            suffix = ' '.join(words[n:])
+            if _VERSION_SUFFIX_RE.match(suffix):
+                return True
+    return False
+
 # Prefix-anchored, case-sensitive (see anonymizer.PLACEHOLDER_TOKEN_RE):
 # a loose pattern here filtered real findings like IMG_20200615 out of
 # the LLM's reports.
@@ -119,7 +141,7 @@ from .anonymizer import PLACEHOLDER_VALUE_RE as _PLACEHOLDER_RE
 _DETECT_SYSTEM_PROMPT = """You are a data-privacy auditor. The user gives you text extracted from a business document that has been anonymized: placeholders like [COMPANY_001], [PERSON_002], [EMAIL_003], FILE_001 are ALREADY-anonymized content — ignore them completely.
 
 Find every piece of IDENTIFYING information that remains. Look for (in ANY language, including Chinese):
-- person: real people's names (人名), including partial names
+- person: real people's names (人名), including partial names AND names appearing in signature blocks / signature lines (签名)
 - company: company/organization names (公司名), brand names, web domains
 - email: email addresses
 - phone: phone/fax/mobile numbers (电话/手机)
@@ -400,7 +422,7 @@ def _filter_parsed(parsed_lists) -> List[Tuple[str, str]]:
             has_cjk = re.search(r'[぀-ヿ㐀-䶿一-鿿가-힯]', value)
             if len(value) < (2 if has_cjk else 3) or len(value) > 120:
                 continue
-            if value.lower() in _VALUE_STOPLIST:
+            if _stoplisted(value):
                 continue
             if _PLACEHOLDER_RE.fullmatch(value):
                 continue

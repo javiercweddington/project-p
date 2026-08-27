@@ -206,6 +206,14 @@ class XLSXCleaner:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             self._rebuild_zip_without_artifacts(output_bytes, output_path)
 
+            # Catch-all: entity text in members openpyxl never rewrites
+            # (drawings/text boxes/charts). Fail closed if the pass fails.
+            from .xml_pass import scrub_zip_xml_members
+            if not scrub_zip_xml_members(output_path, self.mapper,
+                                         input_path.name):
+                output_path.unlink(missing_ok=True)
+                return False
+
             return True
 
         except Exception as e:

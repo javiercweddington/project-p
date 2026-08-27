@@ -152,6 +152,14 @@ class DOCXCleaner:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             self._clean_xml_artifacts(output_bytes, output_path)
 
+            # Catch-all: entity text in members python-docx never visits
+            # (text boxes w:txbxContent, drawings, charts). Fail closed.
+            from .xml_pass import scrub_zip_xml_members
+            if not scrub_zip_xml_members(output_path, self.mapper,
+                                         input_path.name):
+                output_path.unlink(missing_ok=True)
+                return False
+
             return True
 
         except Exception as e:

@@ -170,16 +170,25 @@ class EntityMapper:
             variants.add(re.sub(r'\s+', '-', stem))
             variants.add(re.sub(r'\s+', '_', stem))
 
-        # XML numeric character reference form: worksheet XML stores
-        # 'Gürses' as 'G&#252;rses', which no plain-text variant matches —
-        # the value shipped inside cleaned xlsm sheets (seen live). Emit
-        # the escaped spelling for both original-case and lowercased
-        # codepoints ('Ü' -> &#220;, 'ü' -> &#252;).
+        # XML-escaped spellings — both classes shipped inside cleaned
+        # Office members (seen live):
+        # 1. numeric character references: 'Gürses' stored as
+        #    'G&#252;rses' ('Ü' -> &#220;, 'ü' -> &#252;);
+        # 2. predefined entities: 'Package & Content Development' stored
+        #    as 'Package &amp; Content Development'.
         for source_form in (original.strip(), base, base_nopunct):
-            if source_form and any(ord(ch) > 127 for ch in source_form):
+            if not source_form:
+                continue
+            if any(ord(ch) > 127 for ch in source_form):
                 escaped = ''.join(
                     ch if ord(ch) < 128 else f'&#{ord(ch)};'
                     for ch in source_form)
+                variants.add(escaped.lower())
+            if any(ch in '&<>' for ch in source_form):
+                escaped = (source_form
+                           .replace('&', '&amp;')
+                           .replace('<', '&lt;')
+                           .replace('>', '&gt;'))
                 variants.add(escaped.lower())
 
         return [v for v in variants if len(v) >= 2]

@@ -930,7 +930,7 @@ class CleanPipeline:
             return
 
         from .anonymizer import PLACEHOLDER_VALUE_RE
-        from .llm_detect import _VALUE_STOPLIST
+        from .llm_detect import _stoplisted
         try:
             auto_threshold = float(
                 os.environ.get('GLINER_AUTO_THRESHOLD', '0.80'))
@@ -955,7 +955,7 @@ class CleanPipeline:
                 has_cjk = re.search(r'[぀-ヿ㐀-䶿一-鿿가-힯]', value)
                 if len(value) < (2 if has_cjk else 3) or len(value) > 120:
                     continue
-                if value.lower() in _VALUE_STOPLIST:
+                if _stoplisted(value):
                     continue
                 if PLACEHOLDER_VALUE_RE.fullmatch(value):
                     continue

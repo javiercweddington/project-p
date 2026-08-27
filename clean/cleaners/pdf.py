@@ -508,8 +508,37 @@ class PDFCleaner:
             image_cleaner = self._get_image_cleaner()
             pages_out = []
 
+            # Embedded raster images (signatures, stamps, logos, photos)
+            # would otherwise be RENDERED INTO the page pixels — a scanned
+            # signature is identifying and OCR cannot read cursive to
+            # redact it. Same policy as the redact strategy: remove them
+            # before rendering (PROJECT_P_PDF_KEEP_IMAGES=1 to keep).
+            keep_images = os.environ.get(
+                'PROJECT_P_PDF_KEEP_IMAGES', '0') == '1'
+
             for page_num in range(len(doc)):
                 page = doc[page_num]
+
+                if not keep_images:
+                    for img_info in list(page.get_images(full=True)):
+                        xref = img_info[0]
+                        try:
+                            page.delete_image(xref)
+                            continue
+                        except Exception:
+                            pass
+                        try:
+                            blank = fitz.Pixmap(fitz.csGRAY, (0, 0, 1, 1), 0)
+                            blank.clear_with(255)
+                            page.replace_image(xref, pixmap=blank)
+                        except Exception as e:
+                            _logger.warning(
+                                "Could not remove or blank image xref %d "
+                                "on page %d of %s (%s) — failing closed.",
+                                xref, page_num + 1, input_path.name, e,
+                            )
+                            return False
+
                 pix = page.get_pixmap(
                     matrix=fitz.Matrix(zoom, zoom), alpha=False)
                 img = Image.frombytes(
