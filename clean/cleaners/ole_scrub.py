@@ -246,9 +246,47 @@ def strip_ole_properties(mapper, input_path: Path, output_path: Path,
                 present = [s for s in OLE_SUMMARY_STREAMS if ole.exists(s)]
                 sizes = {s: ole.get_size(s) for s in present}
         except Exception as e:
+            # Opaque non-OLE container (e.g. newer SolidWorks, header
+            # 7730bc22): no property streams to scrub. Default is
+            # quarantine. PROJECT_P_OPAQUE_BINARY=ship-scanned ships it
+            # after a raw-byte entity scan + embedded-image OCR gate +
+            # same-length surgery — CAVEAT: strings inside compressed
+            # streams are invisible to the scan, so this accepts a
+            # residual risk the OLE path does not.
+            if os.environ.get('PROJECT_P_OPAQUE_BINARY',
+                              'quarantine').lower() == 'ship-scanned':
+                _logger.warning(
+                    "%s is not OLE2 (%s); PROJECT_P_OPAQUE_BINARY="
+                    "ship-scanned — shipping after raw-byte scan "
+                    "(compressed streams are NOT scannable).", label, e)
+                data = input_path.read_bytes()
+                data, overwritten = overwrite_entities_in_binary(
+                    mapper, data)
+                if overwritten:
+                    _logger.info(
+                        "Overwrote %d entity occurrence(s) in opaque "
+                        "binary %s.", overwritten, label)
+                leaked = binary_contains_mapped_entity(mapper, data)
+                if leaked:
+                    _logger.warning(
+                        "Mapped entity %r visible in opaque binary %s — "
+                        "fail-closed.", leaked, label)
+                    return False
+                image_leak = embedded_image_entity_check(mapper, data,
+                                                         label)
+                if image_leak:
+                    _logger.warning(
+                        "Embedded image gate failed for opaque binary "
+                        "%s (%s) — fail-closed.", label, image_leak)
+                    return False
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(data)
+                return True
             _logger.warning(
                 "%s is not a readable OLE2 file (%s); cannot scrub. "
-                "Fail-closed for pipeline quarantine.", label, e,
+                "Fail-closed for pipeline quarantine. "
+                "(PROJECT_P_OPAQUE_BINARY=ship-scanned to ship opaque "
+                "binaries after a raw-byte scan.)", label, e,
             )
             return False
 
