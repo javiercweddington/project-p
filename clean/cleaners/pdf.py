@@ -519,6 +519,12 @@ class PDFCleaner:
             for page_num in range(len(doc)):
                 page = doc[page_num]
 
+                # Images that can be neither deleted nor blanked (e.g.
+                # inside Form XObjects in soffice-converted PDFs — seen
+                # live: 'xref not an image' on a converted .ppt) are
+                # instead COVERED on the rendered pixels below, which is
+                # security-equivalent in the raster path.
+                cover_rects = []
                 if not keep_images:
                     for img_info in list(page.get_images(full=True)):
                         xref = img_info[0]
@@ -531,18 +537,39 @@ class PDFCleaner:
                             blank = fitz.Pixmap(fitz.csGRAY, (0, 0, 1, 1), 0)
                             blank.clear_with(255)
                             page.replace_image(xref, pixmap=blank)
-                        except Exception as e:
-                            _logger.warning(
-                                "Could not remove or blank image xref %d "
-                                "on page %d of %s (%s) — failing closed.",
-                                xref, page_num + 1, input_path.name, e,
-                            )
-                            return False
+                            continue
+                        except Exception:
+                            pass
+                        try:
+                            rects = page.get_image_rects(xref)
+                        except Exception:
+                            rects = []
+                        if rects:
+                            cover_rects.extend(rects)
+                            continue
+                        _logger.warning(
+                            "Could not remove, blank, or locate image "
+                            "xref %d on page %d of %s — failing closed.",
+                            xref, page_num + 1, input_path.name,
+                        )
+                        return False
 
                 pix = page.get_pixmap(
                     matrix=fitz.Matrix(zoom, zoom), alpha=False)
                 img = Image.frombytes(
                     'RGB', (pix.width, pix.height), pix.samples)
+
+                if cover_rects:
+                    cover_draw = ImageDraw.Draw(img)
+                    for rect in cover_rects:
+                        cover_draw.rectangle(
+                            [rect.x0 * zoom, rect.y0 * zoom,
+                             rect.x1 * zoom, rect.y1 * zoom],
+                            fill=(0, 0, 0))
+                    _logger.info(
+                        "Covered %d undeletable image placement(s) on "
+                        "page %d of %s at render time.",
+                        len(cover_rects), page_num + 1, input_path.name)
 
                 # Belt 1: text-layer entity boxes (exact glyph geometry).
                 draw = ImageDraw.Draw(img)
