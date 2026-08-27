@@ -26,6 +26,8 @@ _logger = logging.getLogger(__name__)
 
 # ---- 1. ImageOCR ----
 
+import os as _os
+
 try:
     import pytesseract
     from PIL import Image
@@ -37,87 +39,254 @@ except ImportError:
     except ImportError:
         pass
 
+# RapidOCR (PaddleOCR detection/recognition models on ONNX Runtime):
+# persistent in-memory engine (no per-call subprocess), substantially
+# better CJK + screenshot accuracy than tesseract, deterministic.
+try:
+    try:
+        from rapidocr_onnxruntime import RapidOCR as _RapidOCR
+    except ImportError:
+        from rapidocr import RapidOCR as _RapidOCR  # newer package name
+    HAS_RAPIDOCR = True
+except ImportError:
+    HAS_RAPIDOCR = False
+    _RapidOCR = None
+
+_rapidocr_engine = None
+_rapidocr_failed = False
+
+
+def _get_rapidocr():
+    """Lazy RapidOCR engine singleton.
+
+    PROJECT_P_OCR_DEVICE=auto|cuda|cpu (default auto): 'cuda' asks ONNX
+    Runtime for the GPU provider — the OCR models are tiny (~20MB + CUDA
+    context), sized to fit the headroom vLLM leaves on a card. Any GPU
+    init failure falls back to CPU rather than failing the run.
+    """
+    global _rapidocr_engine, _rapidocr_failed
+    if _rapidocr_engine is not None or _rapidocr_failed:
+        return _rapidocr_engine
+    device = _os.environ.get('PROJECT_P_OCR_DEVICE', 'auto').strip().lower()
+    want_cuda = device in ('auto', 'cuda')
+    try:
+        if want_cuda:
+            try:
+                _rapidocr_engine = _RapidOCR(
+                    det_use_cuda=True, cls_use_cuda=True, rec_use_cuda=True)
+                _logger.info("RapidOCR engine initialized (CUDA requested)")
+                return _rapidocr_engine
+            except TypeError:
+                # Engine version without *_use_cuda kwargs: provider
+                # selection happens inside onnxruntime; plain init below.
+                pass
+            except Exception as e:
+                if device == 'cuda':
+                    _logger.warning(
+                        "RapidOCR CUDA init failed (%s); falling back "
+                        "to CPU.", e)
+        _rapidocr_engine = _RapidOCR()
+        _logger.info("RapidOCR engine initialized")
+    except Exception as e:
+        _logger.warning("RapidOCR unavailable (%s); falling back to "
+                        "tesseract if installed.", e)
+        _rapidocr_failed = True
+        _rapidocr_engine = None
+    return _rapidocr_engine
+
 
 class ImageOCR:
-    """Extract text from image files using Tesseract OCR.
+    """Extract text (and word boxes) from images.
 
-    Used to detect sensitive content in images that are screenshots/scans
-    of documents (invoices, receipts, payment confirmations, etc.).
-
-    Falls back gracefully if Tesseract or PIL is not available.
+    Backend (PROJECT_P_OCR_BACKEND=auto|rapidocr|tesseract, default auto):
+    RapidOCR when importable, else Tesseract. Falls back gracefully when
+    neither is available — callers must check `self.available`.
     """
 
     SUPPORTED_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp'}
 
     def __init__(self):
-        # Functional availability flag: the INSTANCE exists even when
-        # tesseract is missing, so callers must check this, not `is None`.
-        self.available = HAS_TESSERACT
-        if not HAS_TESSERACT:
+        pref = _os.environ.get(
+            'PROJECT_P_OCR_BACKEND', 'auto').strip().lower()
+        if pref == 'tesseract':
+            self.backend = 'tesseract' if HAS_TESSERACT else None
+        elif pref == 'rapidocr':
+            self.backend = 'rapidocr' if HAS_RAPIDOCR else None
+        else:  # auto
+            self.backend = ('rapidocr' if HAS_RAPIDOCR
+                            else 'tesseract' if HAS_TESSERACT else None)
+        # Functional availability flag: the INSTANCE exists even when no
+        # OCR backend is installed, so callers must check this, not `is None`.
+        self.available = self.backend is not None
+        if not self.available:
             _logger.warning(
-                "Tesseract OCR not available. Install with: "
-                "sudo apt install tesseract-ocr && pip install pytesseract pillow"
+                "No OCR backend available. Install RapidOCR "
+                "(pip install rapidocr-onnxruntime) or Tesseract "
+                "(sudo apt install tesseract-ocr && pip install pytesseract)"
             )
+
+    # -- text extraction --
 
     def extract_text(self, image_path: Path, lang: str = 'eng+chi_sim') -> Optional[str]:
         """Extract text from an image file using OCR.
 
-        Args:
-            image_path: Path to the image file.
-            lang: Language code for Tesseract (default: 'eng+chi_sim' for bilingual support).
-
-        Returns:
-            Extracted text, or None if OCR failed or is unavailable.
+        Returns extracted text, or None if OCR failed or is unavailable.
         """
-        if not HAS_TESSERACT:
-            return None
-
         if image_path.suffix.lower() not in self.SUPPORTED_EXTS:
             _logger.debug("Unsupported image format for OCR: %s", image_path.suffix)
             return None
 
-        try:
-            img = Image.open(image_path)
+        if self.backend == 'rapidocr':
+            text = self._rapidocr_text(image_path)
+            if text is not None:
+                return text
+            # engine init/inference failure: fall through to tesseract
+
+        if HAS_TESSERACT:
             try:
-                text = pytesseract.image_to_string(img, lang=lang)
-            except Exception as lang_err:
-                # A missing traineddata (e.g. chi_sim not installed) raises a
-                # TesseractError; without this fallback ALL OCR silently
-                # fails on machines lacking the extra language pack.
-                if lang != 'eng':
-                    _logger.warning(
-                        "OCR with lang=%r failed (%s); retrying with 'eng'. "
-                        "Install the missing traineddata for CJK coverage.",
-                        lang, lang_err,
-                    )
-                    text = pytesseract.image_to_string(img, lang='eng')
-                else:
-                    raise
-            return text.strip() if text else None
-        except Exception as e:
-            _logger.debug("OCR failed on %s: %s", image_path, e)
+                img = Image.open(image_path)
+                return self._tesseract_text(img, lang)
+            except Exception as e:
+                _logger.debug("OCR failed on %s: %s", image_path, e)
+        return None
+
+    def _rapidocr_text(self, image_path: Path) -> Optional[str]:
+        engine = _get_rapidocr()
+        if engine is None:
             return None
+        try:
+            result = engine(str(image_path))
+            detections = result[0] if isinstance(result, tuple) else result
+            if not detections:
+                return ''
+            lines = [str(det[1]) for det in detections if len(det) >= 2]
+            return '\n'.join(lines).strip()
+        except Exception as e:
+            _logger.debug("RapidOCR failed on %s: %s", image_path, e)
+            return None
+
+    def _tesseract_text(self, img, lang: str = 'eng+chi_sim') -> Optional[str]:
+        try:
+            text = pytesseract.image_to_string(img, lang=lang)
+        except Exception as lang_err:
+            # A missing traineddata (e.g. chi_sim not installed) raises a
+            # TesseractError; without this fallback ALL OCR silently
+            # fails on machines lacking the extra language pack.
+            if lang != 'eng':
+                _logger.warning(
+                    "OCR with lang=%r failed (%s); retrying with 'eng'. "
+                    "Install the missing traineddata for CJK coverage.",
+                    lang, lang_err,
+                )
+                text = pytesseract.image_to_string(img, lang='eng')
+            else:
+                raise
+        return text.strip() if text else None
 
     def extract_text_from_bytes(self, image_bytes: bytes, lang: str = 'eng+chi_sim') -> Optional[str]:
-        """Extract text from image bytes using OCR.
-
-        Args:
-            image_bytes: Raw image data.
-            lang: Language code for Tesseract (default: 'eng+chi_sim' for bilingual support).
-
-        Returns:
-            Extracted text, or None if OCR failed.
-        """
-        if not HAS_TESSERACT:
-            return None
-
+        """Extract text from image bytes using OCR."""
         try:
             from io import BytesIO
             img = Image.open(BytesIO(image_bytes))
-            text = pytesseract.image_to_string(img, lang=lang)
-            return text.strip() if text else None
         except Exception as e:
-            _logger.debug("OCR failed on image bytes: %s", e)
+            _logger.debug("Could not decode image bytes: %s", e)
+            return None
+        if self.backend == 'rapidocr':
+            lines = self.ocr_lines(img)
+            if lines is not None:
+                return '\n'.join(
+                    ' '.join(w[0] for w in words)
+                    for words in lines.values()).strip()
+        if HAS_TESSERACT:
+            try:
+                return self._tesseract_text(img, lang)
+            except Exception as e:
+                _logger.debug("OCR failed on image bytes: %s", e)
+        return None
+
+    # -- word boxes (for pixel redaction) --
+
+    def ocr_lines(self, image) -> Optional[dict]:
+        """OCR a PIL image into {line_key: [(word, x, y, w, h), ...]}.
+
+        The unified structure the pixel-redaction code consumes.
+        Tesseract yields true per-word boxes; RapidOCR yields line-level
+        boxes that are split into per-word boxes proportionally by
+        character count (redaction padding absorbs the estimation error;
+        over-coverage is fail-safe here).
+
+        Returns None when no OCR backend is functional.
+        """
+        if self.backend == 'rapidocr':
+            lines = self._rapidocr_lines(image)
+            if lines is not None:
+                return lines
+        if HAS_TESSERACT:
+            return self._tesseract_lines(image)
+        return None
+
+    def _rapidocr_lines(self, image) -> Optional[dict]:
+        engine = _get_rapidocr()
+        if engine is None:
+            return None
+        try:
+            import numpy as np
+            arr = np.array(image.convert('RGB'))
+            result = engine(arr)
+            detections = result[0] if isinstance(result, tuple) else result
+            lines = {}
+            if not detections:
+                return lines
+            for i, det in enumerate(detections):
+                if len(det) < 2:
+                    continue
+                box, text = det[0], str(det[1])
+                xs = [pt[0] for pt in box]
+                ys = [pt[1] for pt in box]
+                left, top = int(min(xs)), int(min(ys))
+                width = max(1, int(max(xs) - min(xs)))
+                height = max(1, int(max(ys) - min(ys)))
+                words = text.split() or [text]
+                total_chars = sum(len(w) for w in words)
+                # Proportional split of the line box across its words
+                # (gaps between words share the space of their letters).
+                entries = []
+                cursor = 0
+                for word in words:
+                    frac_start = cursor / max(1, total_chars)
+                    cursor += len(word)
+                    frac_end = cursor / max(1, total_chars)
+                    wx = left + int(frac_start * width)
+                    ww = max(1, int((frac_end - frac_start) * width))
+                    entries.append((word, wx, top, ww, height))
+                lines[(0, 0, i)] = entries
+            return lines
+        except Exception as e:
+            _logger.debug("RapidOCR line extraction failed: %s", e)
+            return None
+
+    def _tesseract_lines(self, image) -> Optional[dict]:
+        try:
+            try:
+                data = pytesseract.image_to_data(
+                    image, lang='eng+chi_sim',
+                    output_type=pytesseract.Output.DICT)
+            except pytesseract.TesseractError:
+                data = pytesseract.image_to_data(
+                    image, lang='eng',
+                    output_type=pytesseract.Output.DICT)
+            lines = {}
+            for i, word in enumerate(data['text']):
+                if not word.strip():
+                    continue
+                key = (data['block_num'][i], data['par_num'][i],
+                       data['line_num'][i])
+                lines.setdefault(key, []).append(
+                    (word, data['left'][i], data['top'][i],
+                     data['width'][i], data['height'][i]))
+            return lines
+        except Exception as e:
+            _logger.debug("Tesseract line extraction failed: %s", e)
             return None
 
 

@@ -3,24 +3,31 @@
 Test the cleaning pipeline with ONE representative file per type,
 with per-step timing instrumentation to locate choke points.
 
-Selects one file of each major type from the Globus Medical project,
-runs the full pipeline (same path as run_clean.py, including the LLM
-discovery loop and cleanliness judge), and prints a timing profile:
+Selects one file of each major type from the Globus Medical project
+(falls back to the first file per extension when the hardcoded sample
+paths are absent, so any --source directory works), runs the full
+pipeline with run_clean.py's defaults — ONE-PASS mode, LLM off — and
+prints a timing profile:
 
-  - Pipeline stages: copy, clean passes, LLM discovery, path
-    anonymization, verification, LLM judge (roughly additive).
-  - Hot functions: individual llm.chat calls, per-extension
-    clean_file / text extraction, tesseract OCR calls, GLiNER
-    load + inference. These NEST inside the stages, so their
-    totals overlap with (and explain) the stage totals.
+  - Pipeline stages: copy, up-front discovery, the single clean pass,
+    path anonymization, verification (roughly additive). The legacy
+    stages (LLM discovery loop, retroactive re-cleans) only appear
+    under --mode iterative / --llm auto|required.
+  - Hot functions: llm.chat calls (if enabled), per-extension
+    clean_file / text extraction, OCR calls (backend-agnostic
+    ImageOCR probes cover RapidOCR and tesseract; the ocr.image_to_*
+    probes fire on the tesseract backend only), GLiNER load +
+    inference. These NEST inside the stages, so their totals overlap
+    with (and explain) the stage totals.
 
 Raw durations are also dumped to /tmp/clean_test_one_each_timing.json
 so the numbers can be shared/compared across runs.
 
-Usage (on the server, with the Qwen endpoint up):
-    python test_one_each.py
-    python test_one_each.py --llm auto          # tolerate endpoint down
-    python test_one_each.py --llm-model qwen26b
+Usage:
+    python test_one_each.py                     # onepass, LLM off
+    python test_one_each.py --mode iterative    # legacy multi-pass loop
+    python test_one_each.py --llm required      # profile the LLM stages
+    python test_one_each.py --source SOME_DIR   # any project directory
 """
 
 import argparse
@@ -100,7 +107,8 @@ def install_probes():
     from clean.cleaners import router as rt
 
     # --- Pipeline stages (roughly additive; top-level view) ---
-    for name in ('_copy_to_staging', '_clean_all_files',
+    for name in ('_copy_to_staging', '_upfront_discovery',
+                 '_clean_all_files',
                  '_llm_discovery_loop', '_inplace_reclean',
                  '_anonymize_paths', '_normalize_all_mtimes',
                  '_save_mapper'):
@@ -144,9 +152,18 @@ def install_probes():
             STATS[label].append(time.perf_counter() - t0)
     ld.extract_scannable_text = extract_scannable_text
 
-    # Tesseract: acquire.metadata and clean/cleaners/image.py both call
-    # through the pytesseract module attributes at call time, so patching
-    # the module covers every OCR call in the run.
+    # OCR: ImageOCR is the backend-agnostic entry point (RapidOCR or
+    # tesseract underneath), so timing it covers both engines.
+    try:
+        from acquire import metadata as md
+        md.ImageOCR.extract_text = _timed('ocr.extract_text')(
+            md.ImageOCR.extract_text)
+        md.ImageOCR.ocr_lines = _timed('ocr.ocr_lines')(
+            md.ImageOCR.ocr_lines)
+    except ImportError:
+        pass
+
+    # Tesseract-level probes (only fire on the tesseract backend).
     try:
         import pytesseract
         pytesseract.image_to_string = _timed('ocr.image_to_string')(
@@ -221,10 +238,13 @@ def main():
     parser.add_argument('--source', default=str(SOURCE_BASE),
                         help='Project directory to sample from')
     parser.add_argument('--llm', choices=['off', 'auto', 'required'],
-                        default='required',
-                        help='LLM mode (default required, matching '
-                             'run_clean.py — the LLM steps are the prime '
-                             'profiling target)')
+                        default='off',
+                        help='LLM mode (default off, matching run_clean.py; '
+                             'pass required to profile the LLM stages)')
+    parser.add_argument('--mode', choices=['onepass', 'iterative'],
+                        default='onepass',
+                        help='Pipeline mode (default onepass, matching '
+                             'run_clean.py)')
     parser.add_argument('--llm-base', default=None)
     parser.add_argument('--llm-model', default=None)
     parser.add_argument('--llm-key', default=None)
@@ -279,8 +299,21 @@ def main():
     for ext, rel_path in SAMPLES.items():
         src = source_base / rel_path
         if not src.exists():
-            print(f"  SKIP {ext:6s}: {rel_path} (not found)")
-            continue
+            # Fallback: first file with this extension anywhere under
+            # --source (lets the test run against any project directory,
+            # not just the hardcoded Globus sample paths).
+            candidates = sorted(
+                p for p in source_base.rglob(f'*.{ext}')
+                if p.is_file() and not p.name.startswith('.'))
+            if not candidates:
+                candidates = sorted(
+                    p for p in source_base.rglob(f'*.{ext.upper()}')
+                    if p.is_file() and not p.name.startswith('.'))
+            if not candidates:
+                print(f"  SKIP {ext:6s}: {rel_path} (not found)")
+                continue
+            src = candidates[0]
+            print(f"  (fallback: using {src.relative_to(source_base)})")
 
         dst = test_dir / src.name
         shutil.copy2(src, dst)
@@ -306,10 +339,11 @@ def main():
         source_dir=test_dir,
         staging_dir=staging_dir,
         mapper=mapper,
+        one_pass=(args.mode == 'onepass'),
     )
 
     print(f"\n{'='*60}")
-    print(f"Running pipeline on {copied} files...")
+    print(f"Running pipeline on {copied} files (mode={args.mode})...")
     print(f"{'='*60}\n")
 
     start = time.time()

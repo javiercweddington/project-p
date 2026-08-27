@@ -101,6 +101,7 @@ class PDFCleaner:
     def __init__(self, mapper: EntityMapper):
         self.mapper = mapper
         self.text_cleaner = TextCleaner(mapper)
+        self._image_cleaner = None  # lazy; used by the raster strategy
 
         # Determine best available strategy
         if HAS_PYMUPDF:
@@ -112,12 +113,40 @@ class PDFCleaner:
         else:
             self._strategy = 'copy'
 
+        # Raster mode (PROJECT_P_PDF_MODE=auto|raster|redact, default auto):
+        # render pages to pixels, redact on pixels, rebuild an image-only
+        # PDF. By construction the output can contain NO ghost content
+        # (incremental updates, hidden layers, invisible text, XMP).
+        # 'auto' uses raster whenever PyMuPDF + a functional OCR backend
+        # exist; 'redact' forces the in-place text-redaction strategy.
+        self._pdf_mode = os.environ.get(
+            'PROJECT_P_PDF_MODE', 'auto').strip().lower()
+
         if self._strategy != 'pymupdf':
             _logger.warning(
                 "PDF cleaning strategy: %s. For full PDF sanitization, "
                 "install PyMuPDF: pip install PyMuPDF",
                 self._strategy,
             )
+
+    def _get_image_cleaner(self):
+        """ImageCleaner instance shared with the raster strategy (same
+        mapper, same OCR/GLiNER redaction machinery as standalone images)."""
+        if self._image_cleaner is None:
+            from .image import ImageCleaner
+            self._image_cleaner = ImageCleaner(self.mapper)
+        return self._image_cleaner
+
+    def _raster_available(self) -> bool:
+        if not HAS_PYMUPDF:
+            return False
+        try:
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            return False
+        cleaner = self._get_image_cleaner()
+        ocr = getattr(cleaner, 'image_ocr', None)
+        return bool(ocr) and getattr(ocr, 'available', False)
 
     def clean_file(self, input_path: Path, output_path: Path,
                    entity_spans: Optional[List[Tuple[int, int, str, str]]] = None) -> bool:
@@ -135,6 +164,16 @@ class PDFCleaner:
         self._detect_incremental_updates(input_path)
 
         try:
+            if (self._pdf_mode in ('auto', 'raster')
+                    and self._raster_available()):
+                if self._clean_raster(input_path, output_path):
+                    return True
+                if self._pdf_mode == 'raster':
+                    return False  # explicit raster mode: no silent fallback
+                _logger.warning(
+                    "Raster PDF cleaning failed for %s; falling back to "
+                    "text-redaction strategy.", input_path.name,
+                )
             if self._strategy == 'pymupdf':
                 return self._clean_with_pymupdf(input_path, output_path)
             elif self._strategy == 'pdfminer_reportlab':
@@ -412,6 +451,168 @@ class PDFCleaner:
                     doc.close()
                 except Exception:
                     pass
+
+    # ---- raster strategy (render -> redact pixels -> image-only PDF) ----
+
+    def _clean_raster(self, input_path: Path, output_path: Path) -> bool:
+        """Rasterize every page, redact on pixels, rebuild an image-only PDF.
+
+        By construction the output contains ONLY rendered pixels: no
+        incremental-update history, hidden layers, invisible text, form
+        fields, embedded files, JavaScript, or XMP can survive.
+
+        Two redaction belts per page:
+        1. Text layer (exact, free): every mapped entity located via
+           search_for(), expanded to full word boxes, blacked out —
+           boundary-validated exactly like the redact strategy.
+        2. Pixels: the shared ImageCleaner redaction (OCR words + mapper
+           patterns + shape rules + GLiNER), including its re-OCR
+           verification. Covers text that exists only as pixels (stamps,
+           logos, embedded scans) and anything extraction missed.
+
+        Tuning: PROJECT_P_PDF_RASTER_DPI (default 200),
+        PROJECT_P_PDF_RASTER_QUALITY (JPEG quality, default 80).
+        """
+        import io
+        from PIL import Image, ImageDraw
+
+        try:
+            dpi = int(os.environ.get('PROJECT_P_PDF_RASTER_DPI', '200'))
+        except ValueError:
+            dpi = 200
+        try:
+            jpeg_quality = int(os.environ.get(
+                'PROJECT_P_PDF_RASTER_QUALITY', '80'))
+        except ValueError:
+            jpeg_quality = 80
+        zoom = dpi / 72.0
+
+        doc = None
+        newdoc = None
+        try:
+            doc = fitz.open(str(input_path))
+            if doc.is_encrypted:
+                if not doc.authenticate(""):
+                    _logger.warning(
+                        "PDF %s is password-protected; cannot rasterize. "
+                        "Fail-closed for pipeline quarantine.",
+                        input_path.name,
+                    )
+                    return False
+            if len(doc) == 0:
+                _logger.warning("PDF %s has no pages; fail-closed.",
+                                input_path.name)
+                return False
+
+            entity_terms = self._get_entity_terms_to_redact()
+            image_cleaner = self._get_image_cleaner()
+            pages_out = []
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                pix = page.get_pixmap(
+                    matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                img = Image.frombytes(
+                    'RGB', (pix.width, pix.height), pix.samples)
+
+                # Belt 1: text-layer entity boxes (exact glyph geometry).
+                draw = ImageDraw.Draw(img)
+                try:
+                    word_boxes = page.get_text('words')
+                except Exception:
+                    word_boxes = []
+                for term, _placeholder, boundary_pattern in entity_terms:
+                    try:
+                        occurrences = page.search_for(term)
+                    except Exception:
+                        continue
+                    for rect in occurrences:
+                        expanded = fitz.Rect(rect)
+                        touched = []
+                        for wb in word_boxes:
+                            wrect = fitz.Rect(wb[:4])
+                            if wrect.intersects(rect):
+                                expanded |= wrect
+                                touched.append(wb[4])
+                        if (boundary_pattern is not None and touched
+                                and not boundary_pattern.search(
+                                    ' '.join(touched))):
+                            # Substring-only hit inside larger words
+                            continue
+                        draw.rectangle(
+                            [expanded.x0 * zoom - 2, expanded.y0 * zoom - 2,
+                             expanded.x1 * zoom + 2, expanded.y1 * zoom + 2],
+                            fill=(0, 0, 0))
+
+                # Belt 2: pixel-level redaction shared with image files
+                # (OCR + mapper patterns + shape rules + GLiNER + verify).
+                redaction = image_cleaner.redact_pil(
+                    img,
+                    source_name=f'{input_path.name}#page{page_num + 1}')
+                if redaction is None:
+                    _logger.warning(
+                        "Could not verify pixel redaction for %s page %d "
+                        "— fail-closed.", input_path.name, page_num + 1,
+                    )
+                    return False
+                redacted_img, _had_redactions, _word_count = redaction
+                pages_out.append(
+                    (redacted_img, page.rect.width, page.rect.height))
+
+            doc.close()
+            doc = None
+
+            # Rebuild: one image per page, original page dimensions.
+            newdoc = fitz.open()
+            for page_img, width_pt, height_pt in pages_out:
+                new_page = newdoc.new_page(width=width_pt, height=height_pt)
+                buf = io.BytesIO()
+                page_img.save(buf, 'JPEG', quality=jpeg_quality)
+                new_page.insert_image(new_page.rect, stream=buf.getvalue())
+
+            # Neutral metadata with FIXED dates: a fresh timestamp would
+            # leak when the cleaning run happened (same policy as the
+            # pipeline's mtime normalization).
+            newdoc.set_metadata({
+                'creationDate': 'D:20240101000000Z',
+                'modDate': 'D:20240101000000Z',
+                'producer': '', 'creator': '',
+                'title': '', 'author': '', 'subject': '', 'keywords': '',
+            })
+            try:
+                newdoc.del_xml_metadata()
+            except Exception:
+                pass
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = output_path.with_name(output_path.name + '.cleantmp')
+            try:
+                newdoc.save(str(tmp_path), garbage=4, deflate=True)
+                newdoc.close()
+                newdoc = None
+                os.replace(tmp_path, output_path)
+            except Exception:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+                raise
+
+            _logger.info(
+                "Rasterized %s: %d page(s) at %d dpi -> image-only PDF",
+                input_path.name, len(pages_out), dpi,
+            )
+            return True
+
+        except Exception as e:
+            _logger.error(
+                "Raster PDF cleaning failed for %s: %s", input_path.name, e)
+            return False
+        finally:
+            for handle in (doc, newdoc):
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except Exception:
+                        pass
 
     def _get_entity_terms_to_redact(self) -> List[Tuple[str, str, object]]:
         """Get (search_term, placeholder, boundary_pattern) triples.

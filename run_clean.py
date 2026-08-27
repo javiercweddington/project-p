@@ -2,21 +2,29 @@
 """
 Server entrypoint for the cleaning pipeline.
 
-Wires the local Qwen endpoint (OpenAI-compatible, default
-http://localhost:8000/v1, model qwen27b) into the full clean run:
-deterministic detectors -> LLM discovery loop -> strict path
-anonymization -> verification suite incl. the LLM cleanliness gate.
+Default flow (--mode onepass, --llm off): up-front discovery
+(deterministic detectors + CV/OCR) -> ONE clean pass -> strict path
+anonymization -> verification suite -> review_candidates.json for the
+human-in-the-loop correction cycle (edit it, re-run with --seed-file).
+
+The LLM net (local Qwen, OpenAI-compatible, default
+http://localhost:8000/v1, model qwen27b) is opt-in via --llm
+auto/required; chunk requests run concurrently
+(PROJECT_P_LLM_CONCURRENCY, default 8).
 
 Examples:
-    # Clean one project directory with seeded entities
+    # Clean one project directory with seeded entities (no LLM)
     python run_clean.py \
         --source '/media/sparrows/KINGSTON/Globus Medical - AR Combiner' \
         --project 'AR_Combiner' \
         --seed 'company=Globus Medical' --seed 'product=AR Combiner'
 
-    # Different endpoint/model/key
-    python run_clean.py --source DIR --llm-model qwen27b \
-        --llm-base http://localhost:8000/v1 --llm-key not-needed
+    # Correction pass after human review of the candidates file
+    python run_clean.py --source DIR \
+        --seed-file /tmp/clean_audit/AR_Combiner/review_candidates.json
+
+    # With the LLM discovery + cleanliness gate enabled
+    python run_clean.py --source DIR --llm required --llm-model qwen27b
 
 Exit code 0 only when every file cleaned AND all verification checks
 (including the LLM gate) passed. Failed/unverifiable files are moved to
@@ -46,10 +54,23 @@ def main() -> int:
                         metavar='TYPE=VALUE',
                         help="Seed entity, e.g. --seed 'company=Acme Corp' "
                              "(repeatable)")
+    parser.add_argument('--seed-file', default=None, metavar='PATH',
+                        help='JSON file of entities to seed (the '
+                             'review_candidates.json a previous run wrote, '
+                             'after human editing, or any JSON with an '
+                             '"entities" list of {"type","value"} objects)')
+    parser.add_argument('--mode', choices=['onepass', 'iterative'],
+                        default='onepass',
+                        help='onepass (default): discover up front, clean '
+                             'once, verify once — no retroactive re-cleans. '
+                             'iterative: legacy loop (re-clean until the '
+                             'mapper stops growing).')
     parser.add_argument('--llm', choices=['off', 'auto', 'required'],
-                        default='required',
-                        help='LLM discovery/verification mode '
-                             '(default: required — endpoint down fails the run)')
+                        default='off',
+                        help='LLM discovery/verification mode (default: off '
+                             '— deterministic + CV + human review carry '
+                             'detection; pass auto/required to add the LLM '
+                             'net)')
     parser.add_argument('--llm-base', default=None,
                         help='OpenAI-compatible base URL '
                              '(default http://localhost:8000/v1)')
@@ -111,12 +132,36 @@ def main() -> int:
             entity_type.strip(), value.strip(), source='seed')
         print(f'Seeded: {value.strip()!r} -> {placeholder}')
 
+    if args.seed_file:
+        import json
+        seed_path = Path(args.seed_file)
+        if not seed_path.is_file():
+            print(f'ERROR: --seed-file not found: {seed_path}',
+                  file=sys.stderr)
+            return 2
+        with open(seed_path) as f:
+            payload = json.load(f)
+        entries = payload.get('entities', payload) if isinstance(
+            payload, dict) else payload
+        seeded = 0
+        for entry in entries:
+            entity_type = str(entry.get('type', '')).strip()
+            value = str(entry.get('value', '')).strip()
+            if not entity_type or not value:
+                continue
+            mapper.get_or_create(entity_type, value,
+                                 source=f'seed_file:{seed_path.name}')
+            seeded += 1
+        print(f'Seeded {seeded} entities from {seed_path}')
+
     pipeline = CleanPipeline(
         project_name=project,
         source_dir=source,
         staging_dir=staging,
         mapper=mapper,
+        one_pass=(args.mode == 'onepass'),
     )
+    print(f'Mode: {args.mode}')
     result = pipeline.run()
 
     print()
@@ -129,10 +174,53 @@ def main() -> int:
             print(f'  [{mark}] {check.check_name}: {check.details[:90]}')
             for hit in check.hits[:5]:
                 print(f'        - {hit.original!r} in {hit.file_path}')
+    # Human-in-the-loop review file: everything that was replaced plus
+    # every verification hit, in a format --seed-file accepts back after
+    # editing (delete wrong entries, add missed ones, re-run).
+    import json
+    review = {
+        'project': project,
+        'entities': [
+            {
+                'type': m.entity_type,
+                'value': m.original,
+                'placeholder': m.placeholder,
+                'source': getattr(m, 'source', ''),
+            }
+            for m in mapper.mappings
+        ],
+        'verification_failures': [
+            {
+                'check': check.check_name,
+                'details': check.details,
+                'hits': [
+                    {'file': hit.file_path,
+                     'type': hit.entity_type,
+                     'value': hit.original}
+                    for hit in check.hits
+                ],
+            }
+            for check in (result.leakage_report.failed_checks
+                          if result.leakage_report else [])
+        ],
+    }
+    review_path = pipeline._audit_root() / project / 'review_candidates.json'
+    try:
+        review_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(review_path, 'w') as f:
+            json.dump(review, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        print(f'WARNING: could not write review file: {e}', file=sys.stderr)
+        review_path = None
+
     print()
     print(f'Deliverable: {staging}')
     print(f'Quarantine:  {pipeline._quarantine_root() / project}')
     print(f'Audit map:   {pipeline._audit_root() / project} (KEEP PRIVATE)')
+    if review_path:
+        print(f'Review file: {review_path}')
+        print('  Edit it (drop wrong entries, add missed ones), then '
+              're-run with --seed-file to apply corrections.')
 
     return 0 if result.success else 1
 

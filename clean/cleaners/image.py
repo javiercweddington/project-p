@@ -218,7 +218,23 @@ class ImageCleaner:
                 redacted_tmp.unlink()
 
     def _redact_all_text(self, input_path: Path):
-        """Black out EVERY OCR-detected text region in an image.
+        """Black out EVERY OCR-detected text region in an image file.
+
+        Returns the blacked-out PIL image, or None on failure/unverified.
+        """
+        try:
+            img = Image.open(input_path)
+            img.load()
+            work = img.convert('RGB')
+        except Exception as e:
+            _logger.warning(
+                "Full-text blackout failed for %s: %s", input_path, e,
+            )
+            return None
+        return self.redact_all_text_pil(work, source_name=input_path.name)
+
+    def redact_all_text_pil(self, work, source_name: str = '<image>'):
+        """Black out EVERY OCR-detected text region in a PIL RGB image.
 
         For document-style images this is the only redaction that is
         verifiable by construction: after blacking all word boxes, a
@@ -228,30 +244,20 @@ class ImageCleaner:
         Returns the blacked-out PIL image, or None on failure/unverified.
         """
         try:
-            import pytesseract
             from PIL import ImageDraw
         except ImportError:
             return None
+        if not (self.image_ocr and self.image_ocr.available):
+            return None
 
         try:
-            img = Image.open(input_path)
-            img.load()
-            work = img.convert('RGB')
-
             def _word_boxes(image):
-                try:
-                    data = pytesseract.image_to_data(
-                        image, lang='eng+chi_sim',
-                        output_type=pytesseract.Output.DICT)
-                except pytesseract.TesseractError:
-                    data = pytesseract.image_to_data(
-                        image, lang='eng',
-                        output_type=pytesseract.Output.DICT)
-                return [
-                    (data['left'][i], data['top'][i],
-                     data['width'][i], data['height'][i])
-                    for i, word in enumerate(data['text']) if word.strip()
-                ]
+                lines = self.image_ocr.ocr_lines(image)
+                if lines is None:
+                    raise RuntimeError('no OCR backend for word boxes')
+                return [(x, y, w, h)
+                        for words in lines.values()
+                        for (_word, x, y, w, h) in words]
 
             draw = ImageDraw.Draw(work)
             for x, y, w, h in _word_boxes(work):
@@ -265,54 +271,56 @@ class ImageCleaner:
             if residual_words > 5:
                 _logger.warning(
                     "%d words still OCR-readable after full-text blackout "
-                    "of %s", residual_words, input_path.name,
+                    "of %s", residual_words, source_name,
                 )
                 return None
             return work
 
         except Exception as e:
             _logger.warning(
-                "Full-text blackout failed for %s: %s", input_path, e,
+                "Full-text blackout failed for %s: %s", source_name, e,
             )
             return None
 
     def _ocr_redact_pixels(self, input_path: Path):
-        """OCR the image, black out entity text at word level, verify.
+        """OCR an image file, black out entity text, verify.
 
         Returns (redacted_PIL_image, had_redactions, ocr_word_count) on
         success, or None when redaction could not be verified (caller
         must fail closed).
         """
-        from ..anonymizer import NON_TEXT_ENTITY_TYPES
-        try:
-            import pytesseract
-            from PIL import ImageDraw
-        except ImportError:
-            return None
-
         try:
             img = Image.open(input_path)
             img.load()
             work = img.convert('RGB')
+        except Exception as e:
+            _logger.warning(
+                "OCR pixel redaction failed for %s: %s", input_path, e,
+            )
+            return None
+        return self.redact_pil(work, source_name=str(input_path))
 
+    def redact_pil(self, work, source_name: str = '<image>'):
+        """OCR a PIL RGB image, black out entity text at word level, verify.
+
+        Shared by image files and rasterized PDF pages. Returns
+        (redacted_PIL_image, had_redactions, ocr_word_count) on success,
+        or None when redaction could not be verified (caller must fail
+        closed).
+        """
+        from ..anonymizer import NON_TEXT_ENTITY_TYPES
+        try:
+            from PIL import ImageDraw
+        except ImportError:
+            return None
+        if not (self.image_ocr and self.image_ocr.available):
+            return None
+
+        try:
             def _ocr_lines(image):
-                try:
-                    data = pytesseract.image_to_data(
-                        image, lang='eng+chi_sim',
-                        output_type=pytesseract.Output.DICT)
-                except pytesseract.TesseractError:
-                    data = pytesseract.image_to_data(
-                        image, lang='eng',
-                        output_type=pytesseract.Output.DICT)
-                lines = {}
-                for i, word in enumerate(data['text']):
-                    if not word.strip():
-                        continue
-                    key = (data['block_num'][i], data['par_num'][i],
-                           data['line_num'][i])
-                    lines.setdefault(key, []).append(
-                        (word, data['left'][i], data['top'][i],
-                         data['width'][i], data['height'][i]))
+                lines = self.image_ocr.ocr_lines(image)
+                if lines is None:
+                    raise RuntimeError('no OCR backend for word boxes')
                 return lines
 
             def _entity_patterns():
@@ -332,7 +340,7 @@ class ImageCleaner:
             full_text = '\n'.join(
                 ' '.join(w[0] for w in words) for words in lines.values())
             self.text_cleaner._register_emails(
-                full_text, source=str(input_path))
+                full_text, source=source_name)
 
             # GENERAL image-redaction rules (mapper-independent). OCR noise
             # garbles exact values ('JCW20200803F' reads as '3cuze2e0s03*'),
@@ -379,7 +387,7 @@ class ImageCleaner:
                         line_text = ' '.join(w[0] for w in words)
                         spans = []
                         for ent in _extract_entities_with_gliner(
-                                line_text, str(input_path)):
+                                line_text, source_name):
                             for m2 in re.finditer(
                                     re.escape(ent.value), line_text, re.I):
                                 spans.append((m2.start(), m2.end()))
@@ -459,7 +467,7 @@ class ImageCleaner:
 
         except Exception as e:
             _logger.warning(
-                "OCR pixel redaction failed for %s: %s", input_path, e,
+                "OCR pixel redaction failed for %s: %s", source_name, e,
             )
             return None
 

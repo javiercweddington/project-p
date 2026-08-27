@@ -32,6 +32,7 @@ Configuration (environment variables):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -39,6 +40,7 @@ import re
 import urllib.error
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -97,6 +99,18 @@ Return [] if nothing identifying remains."""
 
 _CHUNK_SIZE = 3500
 _CHUNK_OVERLAP = 200
+
+
+def _llm_concurrency() -> int:
+    """Number of in-flight requests against the LLM endpoint.
+
+    vLLM throughput scales nearly linearly with concurrent requests;
+    sequential chunk calls leave the GPU idle between round-trips.
+    """
+    try:
+        return max(1, int(os.environ.get('PROJECT_P_LLM_CONCURRENCY', '8')))
+    except ValueError:
+        return 8
 
 
 class LocalLLM:
@@ -189,25 +203,26 @@ def _iter_chunks(text: str):
             yield chunk
 
 
-def detect_entities(llm: LocalLLM, text: str) -> List[Tuple[str, str]]:
-    """Ask the LLM for identifying entities in text.
+def _detect_chunk(llm: LocalLLM, chunk: str) -> List[Dict[str, str]]:
+    """One chunk -> parsed entity dicts. Raises on any failure
+    (fail-closed: an unparseable/failed reply is NOT 'no entities')."""
+    try:
+        reply = llm.chat(_DETECT_SYSTEM_PROMPT, chunk)
+    except Exception as e:
+        _logger.warning("LLM detection call failed: %s", e)
+        raise
+    parsed = _parse_entity_json(reply)
+    if parsed is None:
+        raise ValueError(
+            f"LLM reply unparseable (first 120 chars: {reply[:120]!r})")
+    return parsed
 
-    Returns a list of (mapper_entity_type, value) pairs, filtered for
-    junk (stoplist, placeholders, too-short values).
-    """
+
+def _filter_parsed(parsed_lists) -> List[Tuple[str, str]]:
+    """Merge parsed chunk replies into deduped (mapper_type, value) pairs."""
     found: List[Tuple[str, str]] = []
     seen = set()
-    for chunk in _iter_chunks(text):
-        try:
-            reply = llm.chat(_DETECT_SYSTEM_PROMPT, chunk)
-        except Exception as e:
-            _logger.warning("LLM detection call failed: %s", e)
-            raise
-        parsed = _parse_entity_json(reply)
-        if parsed is None:
-            # Unparseable/truncated reply = failed scan, NOT "no entities"
-            raise ValueError(
-                f"LLM reply unparseable (first 120 chars: {reply[:120]!r})")
+    for parsed in parsed_lists:
         for entity in parsed:
             raw_type = str(entity.get('type', '')).strip().lower()
             value = str(entity.get('value', '')).strip()
@@ -229,6 +244,79 @@ def detect_entities(llm: LocalLLM, text: str) -> List[Tuple[str, str]]:
             seen.add(key)
             found.append((mapper_type, value))
     return found
+
+
+def detect_entities(llm: LocalLLM, text: str) -> List[Tuple[str, str]]:
+    """Ask the LLM for identifying entities in text.
+
+    Chunk requests run concurrently (PROJECT_P_LLM_CONCURRENCY, default 8).
+    Returns a list of (mapper_entity_type, value) pairs, filtered for
+    junk (stoplist, placeholders, too-short values). Raises if ANY chunk
+    fails — a partial scan must not read as a clean scan.
+    """
+    chunks = list(_iter_chunks(text))
+    if not chunks:
+        return []
+    workers = min(_llm_concurrency(), len(chunks))
+    if workers <= 1:
+        parsed_lists = [_detect_chunk(llm, c) for c in chunks]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            # pool.map preserves chunk order and re-raises the first error
+            parsed_lists = list(pool.map(
+                lambda c: _detect_chunk(llm, c), chunks))
+    return _filter_parsed(parsed_lists)
+
+
+def detect_entities_batch(
+        llm: LocalLLM, texts: Dict[str, str],
+) -> Tuple[Dict[str, List[Tuple[str, str]]], Dict[str, Exception]]:
+    """Scan many texts with ONE shared request pool.
+
+    Flattens every (key, chunk) pair into a single pool so small files
+    ride along with big ones — per-file sequential scanning leaves the
+    endpoint idle whenever a file has fewer chunks than the concurrency.
+
+    Returns (results, errors): per-key entity pairs, and per-key first
+    exception for keys whose scan failed (callers decide whether a failed
+    key aborts the run or becomes an 'unverifiable' hit).
+    """
+    tasks: List[Tuple[str, str]] = []
+    for key, text in texts.items():
+        for chunk in _iter_chunks(text):
+            tasks.append((key, chunk))
+
+    results: Dict[str, List[Tuple[str, str]]] = {k: [] for k in texts}
+    errors: Dict[str, Exception] = {}
+    if not tasks:
+        return results, errors
+
+    parsed_by_key: Dict[str, list] = {k: [] for k in texts}
+    workers = min(_llm_concurrency(), len(tasks))
+
+    def run(task):
+        key, chunk = task
+        try:
+            return key, _detect_chunk(llm, chunk), None
+        except Exception as e:  # collected per-key, never swallowed
+            return key, None, e
+
+    if workers <= 1:
+        outcomes = [run(t) for t in tasks]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            outcomes = list(pool.map(run, tasks))
+
+    for key, parsed, err in outcomes:
+        if err is not None:
+            errors.setdefault(key, err)
+        elif parsed:
+            parsed_by_key[key].append(parsed)
+
+    for key, parsed_lists in parsed_by_key.items():
+        if key not in errors:
+            results[key] = _filter_parsed(parsed_lists)
+    return results, errors
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +344,44 @@ def _ocr_image_text(path: Path) -> Optional[str]:
         return None
 
 
+# Extraction cache: (absolute path) -> (content digest, extracted text).
+# OCR and PDF parsing are the expensive extractors and files are usually
+# unchanged between the discovery scan and the cleanliness judge; keying
+# by content digest means a re-cleaned file re-extracts automatically.
+_EXTRACT_CACHE: Dict[str, Tuple[str, Optional[str]]] = {}
+
+
+def _file_digest(path: Path) -> Optional[str]:
+    try:
+        h = hashlib.sha1()
+        with open(path, 'rb') as f:
+            for block in iter(lambda: f.read(1 << 20), b''):
+                h.update(block)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def clear_extract_cache() -> None:
+    _EXTRACT_CACHE.clear()
+
+
 def extract_scannable_text(path: Path, max_chars: int = 200_000) -> Optional[str]:
+    """Best-effort text extraction, cached by (path, content digest)."""
+    key = str(path)
+    digest = _file_digest(path)
+    if digest is not None:
+        hit = _EXTRACT_CACHE.get(key)
+        if hit is not None and hit[0] == digest:
+            return hit[1]
+    text = _extract_scannable_text_uncached(path, max_chars)
+    if digest is not None:
+        _EXTRACT_CACHE[key] = (digest, text)
+    return text
+
+
+def _extract_scannable_text_uncached(
+        path: Path, max_chars: int = 200_000) -> Optional[str]:
     """Best-effort text extraction from a cleaned file for LLM scanning."""
     suffix = path.suffix.lower()
     if suffix in _SKIP_EXTS:
@@ -317,28 +442,37 @@ class LLMEntityDetector:
     def scan_directory(self, staging_dir: Path) -> int:
         """Scan every extractable file; register new entities.
 
-        Returns the number of NEWLY registered entities.
+        Extraction is cached; all files' chunks share one concurrent
+        request pool. Returns the number of NEWLY registered entities.
+        Raises if ANY file's scan failed (fail-closed).
         """
         before = self.mapper.mapping_count
+        texts: Dict[str, str] = {}
         for file_path in sorted(staging_dir.rglob('*')):
             if not file_path.is_file() or file_path.name.startswith('.'):
                 continue
             text = extract_scannable_text(file_path)
-            if not text or not text.strip():
-                continue
-            try:
-                entities = detect_entities(self.llm, text)
-            except Exception:
-                # Endpoint died mid-scan — surface via the judge/mode logic
-                raise
+            if text and text.strip():
+                texts[str(file_path)] = text
+
+        results, errors = detect_entities_batch(self.llm, texts)
+        if errors:
+            # Endpoint died mid-scan — surface via the caller's mode logic
+            key, err = next(iter(errors.items()))
+            raise RuntimeError(
+                f"LLM scan failed for {len(errors)} file(s), "
+                f"first: {Path(key).name}: {err}") from err
+
+        for key, entities in results.items():
+            name = Path(key).name
             for entity_type, value in entities:
                 placeholder = self.mapper.get_or_create(
                     entity_type, value,
-                    source=f'llm_detection:{file_path.name}',
+                    source=f'llm_detection:{name}',
                 )
                 _logger.info(
                     "LLM detected entity %r (%s) in %s -> %s",
-                    value, entity_type, file_path.name, placeholder,
+                    value, entity_type, name, placeholder,
                 )
         return self.mapper.mapping_count - before
 
@@ -380,27 +514,30 @@ class LLMCleanlinessJudge:
             )
 
         hits: List[LeakageHit] = []
-        scanned = 0
+        texts: Dict[str, str] = {}
+        rels: Dict[str, str] = {}
         for file_path in sorted(cleaned_dir.rglob('*')):
             if not file_path.is_file() or file_path.name.startswith('.'):
                 continue
             text = extract_scannable_text(file_path)
             if not text or not text.strip():
                 continue
-            scanned += 1
-            rel = str(file_path.relative_to(cleaned_dir))
-            try:
-                entities = detect_entities(self.llm, text)
-            except Exception as e:
-                hits.append(LeakageHit(
-                    file_path=rel,
-                    entity_type='unverifiable',
-                    original=f'LLM scan failed: {e}',
-                ))
-                continue
+            key = str(file_path)
+            texts[key] = text
+            rels[key] = str(file_path.relative_to(cleaned_dir))
+        scanned = len(texts)
+
+        results, errors = detect_entities_batch(self.llm, texts)
+        for key, err in errors.items():
+            hits.append(LeakageHit(
+                file_path=rels[key],
+                entity_type='unverifiable',
+                original=f'LLM scan failed: {err}',
+            ))
+        for key, entities in results.items():
             for entity_type, value in entities:
                 hits.append(LeakageHit(
-                    file_path=rel,
+                    file_path=rels[key],
                     entity_type=f'llm_{entity_type}',
                     original=value,
                     context='Identifying information found by LLM after cleaning',

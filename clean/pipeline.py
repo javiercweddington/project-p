@@ -151,7 +151,8 @@ class CleanPipeline:
     def __init__(self, project_name: str,
                  source_dir: Path,
                  staging_dir: Optional[Path] = None,
-                 mapper: Optional[EntityMapper] = None):
+                 mapper: Optional[EntityMapper] = None,
+                 one_pass: Optional[bool] = None):
         """Initialize the cleaning pipeline.
 
         Args:
@@ -159,7 +160,16 @@ class CleanPipeline:
             source_dir: Directory containing original project files
             staging_dir: Output directory (defaults to /tmp/clean/{project_name})
             mapper: Pre-built EntityMapper (optional; will be built from flags if not provided)
+            one_pass: True = up-front discovery, then a SINGLE clean pass
+                and a single verification (no retroactive passes, no
+                iterative LLM loop; anything missed fails verification
+                instead of triggering re-cleans). None = read
+                PROJECT_P_ONE_PASS env (default off, preserving the
+                iterative behavior for library callers).
         """
+        if one_pass is None:
+            one_pass = os.environ.get('PROJECT_P_ONE_PASS', '0') == '1'
+        self.one_pass = one_pass
         self.project_name = project_name
         self.source_dir = Path(source_dir)
         self.staging_dir = Path(staging_dir) if staging_dir else (
@@ -270,8 +280,16 @@ class CleanPipeline:
             result.success = False
             return result
 
+        # Step 1b (one-pass mode): discover ALL entities up front — LLM
+        # scan plus deterministic identifier registration on the staged
+        # (still-original) content — so a single clean pass suffices and
+        # no retroactive re-cleans are needed.
+        if self.one_pass:
+            self._upfront_discovery(result)
+
         # Step 2: Clean files
-        cleaned, failed = self._clean_all_files()
+        cleaned, failed = self._clean_all_files(
+            max_extra_passes=0 if self.one_pass else 2)
         result.files_cleaned = cleaned
         result.files_failed = failed
         result.total_entities_replaced = self.tracker.total_changes
@@ -288,12 +306,15 @@ class CleanPipeline:
                 f"Install tesseract (and pytesseract) to clear this."
             )
 
-        # Step 2b: LLM-backed discovery of entities the deterministic
-        # detectors can't express (prose names, companies, addresses,
-        # Chinese text). BACKSTOP ONLY: deterministic replacement has
-        # already run; this loop registers what the local model still
-        # sees and re-cleans until it finds nothing new.
-        self._llm_discovery_loop(result)
+        # Step 2b (iterative mode only): LLM-backed discovery of entities
+        # the deterministic detectors can't express (prose names,
+        # companies, addresses, Chinese text). BACKSTOP ONLY:
+        # deterministic replacement has already run; this loop registers
+        # what the local model still sees and re-cleans until it finds
+        # nothing new. In one-pass mode discovery already ran up front
+        # and the LLM Cleanliness Check remains the (single) gate.
+        if not self.one_pass:
+            self._llm_discovery_loop(result)
 
         # Step 2c: Anonymize filenames and directory components
         # Must run BEFORE verification so the verifier sees anonymized paths
@@ -403,8 +424,13 @@ class CleanPipeline:
         parent = self.staging_dir.parent
         return parent / (parent.name + '_audit')
 
-    def _clean_all_files(self) -> Tuple[int, int]:
+    def _clean_all_files(self, max_extra_passes: int = 2) -> Tuple[int, int]:
         """Clean all files in staging directory.
+
+        Args:
+            max_extra_passes: retroactive re-clean passes allowed when the
+                mapper grew mid-run (0 in one-pass mode: discovery already
+                ran up front, and verification catches any straggler).
 
         Returns:
             Tuple of (files_cleaned, files_failed)
@@ -474,8 +500,8 @@ class CleanPipeline:
         # workbook, authors in document metadata) were unknown when earlier
         # files were cleaned. Re-clean the already-cleaned outputs in place
         # until the mapper stops growing, so every file reflects the full
-        # entity set. (Accuracy over speed, per project policy.)
-        max_extra_passes = 2
+        # entity set. (Accuracy over speed, per project policy; disabled
+        # in one-pass mode via max_extra_passes=0.)
         prev_mapping_count = mapping_count_before
         extra_pass = 0
         while (self.mapper.mapping_count != prev_mapping_count
@@ -721,6 +747,73 @@ class CleanPipeline:
                     "Could not delete %s from staging either: %s — "
                     "MANUAL REMOVAL REQUIRED.", rel_path, unlink_err,
                 )
+
+    def _upfront_discovery(self, result: 'CleanResult') -> None:
+        """One-pass mode: populate the mapper COMPLETELY before cleaning.
+
+        Runs on the staged copies while they still hold original content:
+        1. Deterministic identifier registration (emails) from every
+           file's extracted text — replaces the retroactive passes'
+           mid-run discoveries.
+        2. A single LLM discovery scan (mode-aware, see
+           PROJECT_P_LLM_VERIFY). The LLM Cleanliness Check in
+           verification remains the final gate; anything missed here
+           fails the run instead of triggering re-cleans.
+        """
+        from .llm_detect import (LLMEntityDetector, LocalLLM,
+                                 extract_scannable_text, llm_verify_mode)
+        from .cleaners.text import TextCleaner
+
+        progress = getattr(self, '_progress', None)
+        if progress:
+            progress.stage('up-front discovery: extracting text')
+
+        # Deterministic pre-registration from extracted text (also warms
+        # the extraction cache for the LLM scan below).
+        text_cleaner = TextCleaner(self.mapper)
+        todo = [f for f in sorted(self.staging_dir.rglob('*'))
+                if f.is_file() and not f.name.startswith('.')]
+        for index, file_path in enumerate(todo, 1):
+            if progress:
+                progress.step(index, len(todo), file_path.name)
+            text = extract_scannable_text(file_path)
+            if text and text.strip():
+                try:
+                    text_cleaner._register_emails(
+                        text, source=str(file_path))
+                except Exception as e:
+                    _logger.debug(
+                        "Email pre-registration failed for %s: %s",
+                        file_path.name, e)
+
+        mode = llm_verify_mode()
+        if mode == 'off':
+            return
+        llm = LocalLLM()
+        if not llm.available():
+            if mode == 'required':
+                result.errors.append(
+                    f"LLM endpoint {llm.base_url} unreachable and "
+                    f"PROJECT_P_LLM_VERIFY=required — up-front entity "
+                    f"discovery could NOT run."
+                )
+            else:
+                _logger.info(
+                    "LLM endpoint %s unreachable; up-front discovery is "
+                    "deterministic-only.", llm.base_url)
+            return
+
+        if progress:
+            progress.stage(
+                f'up-front LLM discovery ({llm.model} @ {llm.base_url})')
+        try:
+            new_count = LLMEntityDetector(self.mapper, llm).scan_directory(
+                self.staging_dir)
+            _logger.info(
+                "Up-front LLM discovery: %d new entities "
+                "(mapper now %d)", new_count, self.mapper.mapping_count)
+        except Exception as e:
+            result.errors.append(f"Up-front LLM discovery failed: {e}")
 
     def _llm_discovery_loop(self, result: 'CleanResult',
                             max_rounds: int = 3) -> None:
