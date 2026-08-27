@@ -112,11 +112,47 @@ def _llm_concurrency() -> int:
 
     vLLM throughput scales nearly linearly with concurrent requests;
     sequential chunk calls leave the GPU idle between round-trips.
+    (Measured: 8 workers gave 7.6x overlap on a 4-GPU TP server — the
+    server was not the bottleneck, so the default is 16.)
     """
     try:
-        return max(1, int(os.environ.get('PROJECT_P_LLM_CONCURRENCY', '8')))
+        return max(1, int(os.environ.get('PROJECT_P_LLM_CONCURRENCY', '16')))
     except ValueError:
-        return 8
+        return 16
+
+
+def _llm_scan_cap() -> int:
+    """Per-file char cap for LLM scanning (PROJECT_P_LLM_MAX_CHARS,
+    default 60000; <=0 disables). The deterministic Entity Leakage Check
+    scans every file in FULL — the LLM pass is a semantic auditor, and
+    capping its input trades no hard guarantee."""
+    try:
+        return int(os.environ.get('PROJECT_P_LLM_MAX_CHARS', '60000'))
+    except ValueError:
+        return 60000
+
+
+def _llm_max_tokens() -> int:
+    """Reply-token budget (PROJECT_P_LLM_MAX_TOKENS, default 2000).
+    Must stay generous enough that a thinking-mode model still reaches
+    its JSON — a truncated reply is a FAILED scan, not an empty one."""
+    try:
+        return max(64, int(os.environ.get('PROJECT_P_LLM_MAX_TOKENS', '2000')))
+    except ValueError:
+        return 2000
+
+
+def _detect_system_prompt() -> str:
+    """System prompt, with Qwen3-style thinking disabled by default.
+
+    Reasoning models emit hundreds of hidden thinking tokens before the
+    JSON (measured 31s mean per call); '/no_think' turns that off for
+    Qwen3-family models and is inert noise for others. Disable with
+    PROJECT_P_LLM_NOTHINK=0 if your model needs its reasoning budget.
+    """
+    if os.environ.get('PROJECT_P_LLM_NOTHINK', '1') != '0':
+        return _DETECT_SYSTEM_PROMPT + '\n/no_think'
+    return _DETECT_SYSTEM_PROMPT
 
 
 class LocalLLM:
@@ -213,7 +249,8 @@ def _detect_chunk(llm: LocalLLM, chunk: str) -> List[Dict[str, str]]:
     """One chunk -> parsed entity dicts. Raises on any failure
     (fail-closed: an unparseable/failed reply is NOT 'no entities')."""
     try:
-        reply = llm.chat(_DETECT_SYSTEM_PROMPT, chunk)
+        reply = llm.chat(_detect_system_prompt(), chunk,
+                         max_tokens=_llm_max_tokens())
     except Exception as e:
         _logger.warning("LLM detection call failed: %s", e)
         raise
@@ -334,7 +371,11 @@ _OFFICE_ZIP_EXTS = {'.docx', '.xlsx', '.pptx', '.xlsm', '.docm', '.pptm',
 _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.tif',
                '.webp'}
 _SKIP_EXTS = {'.mp3', '.wav', '.mp4', '.avi', '.mov', '.stl', '.sldprt',
-              '.sldasm'}
+              '.sldasm',
+              # CAD ASCII: machine-generated coordinate streams — one STEP
+              # file cost 58 of 92 judge calls for zero detection value.
+              # The Entity Leakage Check still regex-scans these in FULL.
+              '.step', '.stp', '.igs', '.iges'}
 _XML_TAG_RE = re.compile(r'<[^>]+>')
 
 
@@ -453,13 +494,14 @@ class LLMEntityDetector:
         Raises if ANY file's scan failed (fail-closed).
         """
         before = self.mapper.mapping_count
+        cap = _llm_scan_cap()
         texts: Dict[str, str] = {}
         for file_path in sorted(staging_dir.rglob('*')):
             if not file_path.is_file() or file_path.name.startswith('.'):
                 continue
             text = extract_scannable_text(file_path)
             if text and text.strip():
-                texts[str(file_path)] = text
+                texts[str(file_path)] = text[:cap] if cap > 0 else text
 
         results, errors = detect_entities_batch(self.llm, texts)
         if errors:
@@ -521,6 +563,7 @@ class LLMCleanlinessJudge:
             )
 
         hits: List[LeakageHit] = []
+        cap = _llm_scan_cap()
         texts: Dict[str, str] = {}
         rels: Dict[str, str] = {}
         for file_path in sorted(cleaned_dir.rglob('*')):
@@ -530,7 +573,7 @@ class LLMCleanlinessJudge:
             if not text or not text.strip():
                 continue
             key = str(file_path)
-            texts[key] = text
+            texts[key] = text[:cap] if cap > 0 else text
             rels[key] = str(file_path.relative_to(cleaned_dir))
         scanned = len(texts)
 
