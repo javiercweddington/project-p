@@ -179,8 +179,14 @@ class PPTXCleaner:
         with tempfile.TemporaryDirectory(prefix='ppt_raster_') as tmp:
             tmpdir = Path(tmp)
             try:
+                # Dedicated UserInstallation dir: headless servers often
+                # have no writable/unlocked default profile, which makes
+                # soffice exit nonzero with no useful stderr.
+                profile = (tmpdir / 'profile').as_uri()
                 proc = subprocess.run(
-                    [soffice, '--headless', '--convert-to', 'pdf',
+                    [soffice, '--headless', '--invisible', '--norestore',
+                     f'-env:UserInstallation={profile}',
+                     '--convert-to', 'pdf',
                      '--outdir', str(tmpdir), str(input_path)],
                     capture_output=True, timeout=300)
             except Exception as e:
