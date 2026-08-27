@@ -197,26 +197,37 @@ class LeakageChecker:
 
     # -- public API ---------------------------------------------------------
 
-    def _prefilter_tokens(self, original: str) -> tuple:
-        """Cheap substring keys that MUST appear in a text for the entity's
-        boundary pattern to possibly match.
+    def _prefilter_tokens(self, original: str,
+                          entity_type: Optional[str] = None) -> tuple:
+        """Cheap substring keys gating the entity's boundary pattern.
 
         Variant generation (collapsed/hyphenated/underscored, flexible
-        whitespace, person name tokens) only rewrites SEPARATORS — the
-        alphanumeric/CJK tokens themselves are never altered — so if no
-        token of the original occurs as a plain substring of the
-        lowercased text, running the (expensive) compiled pattern is
-        provably pointless. Returns () when no token is long enough to
-        be selective; callers must then run the pattern unconditionally.
+        whitespace) only rewrites SEPARATORS — the alphanumeric/CJK
+        tokens themselves are never altered — so a variant match always
+        contains EVERY token of the original. That means non-person
+        entities can be gated on their single most selective (longest)
+        token: short universal tokens like the 'com' of an email would
+        otherwise pass the filter in every XML blob and force a full
+        regex scan of multi-MB members for every registered email.
+
+        PERSON patterns additionally match individual name tokens, so a
+        match may contain only ONE original token — persons keep the
+        any-of-all-tokens gate.
+
+        Returns () when no token is long enough to be selective; callers
+        must then run the pattern unconditionally.
         """
-        cached = self._prefilter_cache.get(original)
+        cache_key = (original, entity_type == 'person')
+        cached = self._prefilter_cache.get(cache_key)
         if cached is not None:
             return cached
         tokens = tuple(
             t for t in re.findall(r'\w+', original.lower())
             if len(t) >= (2 if re.search(r'[^\W\da-z_]', t) else 3)
         )
-        self._prefilter_cache[original] = tokens
+        if tokens and entity_type != 'person':
+            tokens = (max(tokens, key=len),)
+        self._prefilter_cache[cache_key] = tokens
         return tokens
 
     def _entity_pattern(self, original: str,
@@ -266,7 +277,7 @@ class LeakageChecker:
             if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
                 continue
 
-            tokens = self._prefilter_tokens(original)
+            tokens = self._prefilter_tokens(original, mapping.entity_type)
             if tokens and not any(tok in text_lower for tok in tokens):
                 continue
 
