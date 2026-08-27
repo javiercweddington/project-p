@@ -43,7 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-SOURCE_BASE = Path('/media/sparrows/KINGSTON/Globus Medical - AR Combiner')
+SOURCE_BASE = Path('/media/sparrows/KINGSTON/basesamples/Globus Medical - AR Combiner')
 
 # One representative file per type
 SAMPLES = {
