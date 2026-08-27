@@ -66,23 +66,124 @@ _gliner_labels = [
     "invoice", "date", "money",
 ]
 
+# GLiNER truncates every input at 384 tokens; CJK tokenizes at ~1 token
+# per character, so chunks must stay <=384 CHARS or the tail of each
+# chunk is silently never scanned (the old 3000-char chunks scanned only
+# their first ~18%).
+_GLINER_CHUNK_CHARS = 384
+_GLINER_CHUNK_OVERLAP = 48
+
+try:
+    _gliner_batch_size = max(
+        1, int(os.environ.get("GLINER_BATCH_SIZE", "16")))
+except ValueError:
+    _gliner_batch_size = 16
+
 
 def _get_gliner_model():
-    """Get or create the GLiNER model (lazy singleton)."""
+    """Get or create the GLiNER model (lazy singleton).
+
+    GLINER_DEVICE=auto|cuda|cpu (default auto): 'auto'/'cuda' move the
+    model to GPU when torch sees one (~1GB — fits the headroom vLLM
+    leaves); any CUDA failure falls back to CPU rather than failing
+    the run.
+    """
     global _gliner_model
     if _gliner_model is not None:
-        return _gliner_model
+        return _gliner_model if isinstance(_gliner_model, GLiNER) else None
     if not HAS_GLINER:
         return None
     try:
         _logger.info("Loading GLiNER model %s ...", _gliner_model_name)
-        _gliner_model = GLiNER.from_pretrained(_gliner_model_name)
-        _logger.info("GLiNER model loaded.")
+        model = GLiNER.from_pretrained(_gliner_model_name)
+        device = os.environ.get("GLINER_DEVICE", "auto").strip().lower()
+        if device in ("auto", "cuda"):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    model = model.to("cuda")
+                    _logger.info("GLiNER model loaded on CUDA.")
+                else:
+                    if device == "cuda":
+                        _logger.warning(
+                            "GLINER_DEVICE=cuda but no CUDA device "
+                            "visible; using CPU.")
+                    _logger.info("GLiNER model loaded on CPU.")
+            except Exception as e:
+                _logger.warning(
+                    "GLiNER CUDA placement failed (%s); using CPU.", e)
+        else:
+            _logger.info("GLiNER model loaded on CPU.")
+        _gliner_model = model
         return _gliner_model
     except Exception as e:
         _logger.warning("Failed to load GLiNER model: %s", e)
         _gliner_model = object()  # sentinel to avoid retrying
         return None
+
+
+def _gliner_chunks(text: str):
+    step = _GLINER_CHUNK_CHARS - _GLINER_CHUNK_OVERLAP
+    for start in range(0, len(text), step):
+        chunk = text[start:start + _GLINER_CHUNK_CHARS]
+        if chunk.strip():
+            yield chunk
+
+
+def _gliner_predict_many(model, texts: List[str]) -> List[list]:
+    """Predict entities for many short texts, batched.
+
+    Uses batch_predict_entities in GLINER_BATCH_SIZE groups (one forward
+    pass per group — this is where the GPU pays off); falls back to
+    per-text predict_entities on older gliner versions. A failed group
+    degrades to per-text calls so one bad input can't drop its whole
+    batch's findings.
+    """
+    results: List[list] = []
+    batch_fn = getattr(model, 'batch_predict_entities', None)
+    for i in range(0, len(texts), _gliner_batch_size):
+        group = texts[i:i + _gliner_batch_size]
+        if batch_fn is not None:
+            try:
+                results.extend(batch_fn(
+                    group, _gliner_labels, threshold=_gliner_threshold))
+                continue
+            except Exception as e:
+                _logger.debug(
+                    "GLiNER batch predict failed (%s); per-text fallback.", e)
+        for text in group:
+            try:
+                results.append(model.predict_entities(
+                    text, _gliner_labels, threshold=_gliner_threshold))
+            except Exception as e:
+                _logger.debug("GLiNER prediction failed: %s", e)
+                results.append([])
+    return results
+
+
+def _hits_from_predictions(predictions, source: str, seen: set) -> List[EntityHit]:
+    """Map raw GLiNER predictions to EntityHit objects (shared filter)."""
+    hits: List[EntityHit] = []
+    for e in predictions:
+        entity_text = e['text'].strip()
+        entity_type = e['label'].lower()
+        confidence = round(float(e['score']), 3)
+        # Deduplicate: keep highest confidence for each (type, value) pair
+        key = (entity_type, entity_text.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        # Map all GLiNER entity types, not just person/organization
+        if entity_type == 'person':
+            hits.append(EntityHit(entity_type='person', value=entity_text,
+                                  source=source, confidence=confidence))
+        elif entity_type == 'organization':
+            hits.append(EntityHit(entity_type='company', value=entity_text,
+                                  source=source, confidence=confidence))
+        elif entity_type in ('email', 'phone', 'address', 'invoice', 'date', 'money'):
+            hits.append(EntityHit(entity_type=entity_type, value=entity_text,
+                                  source=source, confidence=confidence))
+    return hits
 
 
 def _extract_entities_with_gliner(text: str, source: str) -> List[EntityHit]:
@@ -102,44 +203,44 @@ def _extract_entities_with_gliner(text: str, source: str) -> List[EntityHit]:
         _logger.debug("GLiNER not available, falling back to regex-based entity detection")
         return extract_entities_from_text_regex(text, source)
 
-    hits = []
+    # 384-char chunks (full coverage within GLiNER's 384-token window),
+    # all chunks batched through the model together.
+    chunks = list(_gliner_chunks(text))
+    hits: List[EntityHit] = []
     seen = set()  # deduplicate within the same text
-    # Process text in chunks to handle long documents
-    chunk_size = 3000
-    overlap = 200
-    for start in range(0, len(text), chunk_size - overlap):
-        chunk = text[start:start + chunk_size]
-        if not chunk.strip():
-            continue
-        try:
-            for e in model.predict_entities(chunk, _gliner_labels, threshold=_gliner_threshold):
-                entity_text = e['text'].strip()
-                entity_type = e['label'].lower()
-                confidence = round(float(e['score']), 3)
-                # Deduplicate: keep highest confidence for each (type, value) pair
-                key = (entity_type, entity_text.lower())
-                if key in seen:
-                    continue
-                seen.add(key)
-                # Map all GLiNER entity types, not just person/organization
-                if entity_type == 'person':
-                    hits.append(EntityHit(entity_type='person', value=entity_text,
-                                          source=source, confidence=confidence))
-                elif entity_type == 'organization':
-                    hits.append(EntityHit(entity_type='company', value=entity_text,
-                                          source=source, confidence=confidence))
-                elif entity_type in ('email', 'phone', 'address', 'invoice', 'date', 'money'):
-                    hits.append(EntityHit(entity_type=entity_type, value=entity_text,
-                                          source=source, confidence=confidence))
-        except Exception as e:
-            _logger.debug("GLiNER prediction failed on chunk: %s", e)
-            continue
+    for predictions in _gliner_predict_many(model, chunks):
+        hits.extend(_hits_from_predictions(predictions, source, seen))
 
     if hits:
         return hits
 
     # Fallback to regex if GLiNER found nothing
     return extract_entities_from_text_regex(text, source)
+
+
+def _extract_entities_with_gliner_batch(
+        texts: List[str], source: str) -> List[List[EntityHit]]:
+    """Batch variant for many SHORT texts (e.g. OCR lines of one image).
+
+    One batched GLiNER forward pass per GLINER_BATCH_SIZE texts instead
+    of a model call per line. Returns one EntityHit list per input text
+    (same regex fallback per text as the single-text function).
+    """
+    model = _get_gliner_model()
+    if model is None:
+        return [extract_entities_from_text_regex(t, source) for t in texts]
+
+    # Guard: inputs are expected short; clip to the scannable window so
+    # a stray long line can't silently lose its tail.
+    clipped = [t[:_GLINER_CHUNK_CHARS] for t in texts]
+    all_predictions = _gliner_predict_many(model, clipped)
+    results: List[List[EntityHit]] = []
+    for text, predictions in zip(texts, all_predictions):
+        hits = _hits_from_predictions(predictions, source, seen=set())
+        if not hits:
+            hits = extract_entities_from_text_regex(text, source)
+        results.append(hits)
+    return results
 
 
 # ---- Sensitivity detection patterns ----

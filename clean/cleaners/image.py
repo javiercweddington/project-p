@@ -382,12 +382,20 @@ class ImageCleaner:
             try:
                 from acquire import catalog as _catalog
                 if getattr(_catalog, 'HAS_GLINER', False):
-                    from acquire.catalog import _extract_entities_with_gliner
-                    for key, words in lines.items():
-                        line_text = ' '.join(w[0] for w in words)
+                    from acquire.catalog import (
+                        _extract_entities_with_gliner_batch)
+                    # ONE batched NER pass over all lines of the image
+                    # (a model call per line left the GPU idle between
+                    # tiny inputs).
+                    line_items = list(lines.items())
+                    line_texts = [' '.join(w[0] for w in words)
+                                  for _key, words in line_items]
+                    per_line = _extract_entities_with_gliner_batch(
+                        line_texts, source_name)
+                    for (key, _words), line_text, ents in zip(
+                            line_items, line_texts, per_line):
                         spans = []
-                        for ent in _extract_entities_with_gliner(
-                                line_text, source_name):
+                        for ent in ents:
                             for m2 in re.finditer(
                                     re.escape(ent.value), line_text, re.I):
                                 spans.append((m2.start(), m2.end()))
