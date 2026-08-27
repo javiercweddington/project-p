@@ -80,13 +80,35 @@ _LLM_TYPE_MAP = {
     'phone': 'phone',
     'address': 'address',
     'product': 'product',
+    # Location granularity all maps to 'address' (cities/towns/countries
+    # and postal codes are identifying for a supply chain).
+    'location': 'address',
+    'city': 'address',
+    'town': 'address',
+    'country': 'address',
+    'zip': 'address',
+    'zipcode': 'address',
+    'zip code': 'address',
+    'zip_code': 'address',
+    'postal code': 'address',
+    'postal_code': 'address',
 }
 
 # Values that must never be registered (generic words the model sometimes
-# emits despite instructions).
+# emits despite instructions). Shared by the LLM paths AND GLiNER
+# auto-registration — 'client' slipped in through GLiNER (which had no
+# stoplist) and its boundary pattern then flagged/replaced the ordinary
+# word everywhere.
 _VALUE_STOPLIST = {
     'customer', 'supplier', 'company', 'contact', 'address', 'email',
     'phone', 'name', 'unknown', 'n/a', 'none', 'client', 'vendor',
+    # Software/producer strings (docProps <Application>, PDF Producer):
+    # tool fingerprints, not client-identifying — registering them turns
+    # every Office file's metadata into a permanent "leak".
+    'microsoft excel', 'microsoft word', 'microsoft powerpoint',
+    'microsoft office', 'microsoft', 'excel', 'word', 'powerpoint',
+    'openpyxl', 'libreoffice', 'openoffice', 'wps office', 'wps',
+    'adobe', 'acrobat', 'adobe acrobat', 'pdf', 'windows',
 }
 
 # Prefix-anchored, case-sensitive (see anonymizer.PLACEHOLDER_TOKEN_RE):
@@ -101,10 +123,10 @@ Find every piece of IDENTIFYING information that remains. Look for (in ANY langu
 - company: company/organization names (公司名), brand names, web domains
 - email: email addresses
 - phone: phone/fax/mobile numbers (电话/手机)
-- address: street or building addresses (地址)
+- address: street or building addresses (地址), AND standalone city/town/country names (城市/国家) AND postal/zip codes — report each as type "address"
 - product: specific named products or part designations tied to a client project
 
-Do NOT report: generic role words (customer, supplier, CEO), country/city names alone, currencies, quantities, dates alone, material names (PC, MAKROLON is a material brand — DO report material brand names as product), or anything already in [XXX_nnn] placeholder form.
+Do NOT report: generic role words (customer, supplier, CEO), software/application names (Microsoft Excel, Adobe), currencies, quantities, dates alone, material names (PC, MAKROLON is a material brand — DO report material brand names as product), or anything already in [XXX_nnn] placeholder form.
 
 Answer with ONLY a JSON array, no prose:
 [{"type":"person","value":"EXACT text as it appears"}, ...]

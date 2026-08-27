@@ -63,6 +63,7 @@ _gliner_threshold = float(os.environ.get("GLINER_THRESHOLD", "0.5"))
 # GLiNER is zero-shot and supports arbitrary label names
 _gliner_labels = [
     "person", "organization", "email", "phone", "address",
+    "location", "postal code",
     "invoice", "date", "money",
 ]
 
@@ -179,6 +180,11 @@ def _hits_from_predictions(predictions, source: str, seen: set) -> List[EntityHi
                                   source=source, confidence=confidence))
         elif entity_type == 'organization':
             hits.append(EntityHit(entity_type='company', value=entity_text,
+                                  source=source, confidence=confidence))
+        elif entity_type in ('location', 'postal code'):
+            # City/town/country names and zip codes are identifying for a
+            # supply chain; unify under 'address'.
+            hits.append(EntityHit(entity_type='address', value=entity_text,
                                   source=source, confidence=confidence))
         elif entity_type in ('email', 'phone', 'address', 'invoice', 'date', 'money'):
             hits.append(EntityHit(entity_type=entity_type, value=entity_text,
