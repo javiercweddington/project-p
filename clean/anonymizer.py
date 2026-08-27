@@ -39,6 +39,11 @@ ENTITY_PREFIX_MAP = {
 # letting them into replace_in_text would corrupt ordinary document text.
 NON_TEXT_ENTITY_TYPES = frozenset({'filename', 'directory'})
 
+# (original, is_person) -> substring needles for the replacement/verify
+# prefilter (see EntityMapper.prefilter_needles). Module-wide: originals
+# repeat across mapper instances within a run.
+_PREFILTER_NEEDLE_CACHE: Dict[Tuple[str, bool], tuple] = {}
+
 # Default prefix for unknown entity types
 _DEFAULT_PREFIX = 'ENTITY'
 
@@ -339,6 +344,44 @@ class EntityMapper:
         """Get the mapping for an entity value."""
         return self._mappings.get(value.strip().lower())
 
+    def prefilter_needles(self, original: str,
+                          entity_type: Optional[str] = None) -> tuple:
+        """Cheap substring needles gating this entity's pattern.
+
+        Same soundness argument as the verifier's prefilter: variant
+        generation only rewrites SEPARATORS, so every variant match
+        contains all original tokens — non-person entities gate on the
+        single longest token; person patterns also match lone name
+        tokens, so persons gate on any-of-all-tokens.
+
+        Tokens containing non-ASCII letters additionally contribute
+        their XML numeric-reference spelling ('gürses' AND 'g&#252;rses')
+        so escaped-form variants are never prefiltered away.
+
+        Returns () when nothing is selective enough — callers must then
+        run the pattern unconditionally.
+        """
+        cache_key = (original, entity_type == 'person')
+        cached = _PREFILTER_NEEDLE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        tokens = tuple(
+            t for t in re.findall(r'\w+', original.lower())
+            if len(t) >= (2 if re.search(r'[^\W\da-z_]', t) else 3)
+        )
+        if tokens and entity_type != 'person':
+            tokens = (max(tokens, key=len),)
+        needles = []
+        for token in tokens:
+            needles.append(token)
+            if any(ord(ch) > 127 for ch in token):
+                needles.append(''.join(
+                    ch if ord(ch) < 128 else f'&#{ord(ch)};'
+                    for ch in token))
+        needles = tuple(needles)
+        _PREFILTER_NEEDLE_CACHE[cache_key] = needles
+        return needles
+
     def replace_in_text(self, text: str, source: str = "") -> str:
         """Replace all known entities in text with their placeholders.
 
@@ -369,7 +412,19 @@ class EntityMapper:
         placeholder_tail = re.compile(r'_\d{3,}\]')
 
         result = text
+        # Prefilter against the ORIGINAL text, computed once: replacement
+        # only removes entity text and inserts ASCII placeholders (which
+        # the substitute-guard below refuses to rewrite), so a pattern
+        # whose needles are absent from the input cannot gain a match
+        # mid-loop. With 300+ entities this gate is the difference
+        # between seconds and minutes on multi-MB XML members.
+        text_lower = text.lower()
         for mapping in sorted_mappings:
+            needles = self.prefilter_needles(
+                mapping.original, mapping.entity_type)
+            if needles and not any(n in text_lower for n in needles):
+                continue
+
             pattern = self._build_pattern_cached(
                 mapping.original, mapping.entity_type)
             if pattern is None:

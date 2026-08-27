@@ -217,18 +217,10 @@ class LeakageChecker:
         Returns () when no token is long enough to be selective; callers
         must then run the pattern unconditionally.
         """
-        cache_key = (original, entity_type == 'person')
-        cached = self._prefilter_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        tokens = tuple(
-            t for t in re.findall(r'\w+', original.lower())
-            if len(t) >= (2 if re.search(r'[^\W\da-z_]', t) else 3)
-        )
-        if tokens and entity_type != 'person':
-            tokens = (max(tokens, key=len),)
-        self._prefilter_cache[cache_key] = tokens
-        return tokens
+        # Shared with the anonymizer's replacement path — including the
+        # escaped-needle handling ('gürses' AND 'g&#252;rses'), so
+        # XML-escaped variant matches are never prefiltered away.
+        return self.mapper.prefilter_needles(original, entity_type)
 
     def _entity_pattern(self, original: str,
                         entity_type: Optional[str] = None) -> re.Pattern:

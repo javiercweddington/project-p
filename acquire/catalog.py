@@ -81,6 +81,77 @@ except ValueError:
     _gliner_batch_size = 16
 
 
+def _pick_gliner_device() -> str:
+    """Resolve the GLiNER device.
+
+    GLINER_DEVICE=auto|cpu|cuda|cuda:N. 'auto'/'cuda' pick the CUDA
+    device with the MOST free memory (a vLLM tensor-parallel server
+    loads every card evenly, but GPU 0 also carries Xorg/desktop — the
+    naive .to('cuda') OOM'd there live) and fall back to CPU when no
+    card has GLINER_MIN_FREE_GB (default 1.5) available.
+    """
+    device = os.environ.get("GLINER_DEVICE", "auto").strip().lower()
+    if device == "cpu":
+        return "cpu"
+    if device.startswith("cuda:"):
+        return device  # explicit pin
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            if device == "cuda":
+                _logger.warning(
+                    "GLINER_DEVICE=cuda but no CUDA device visible; "
+                    "using CPU.")
+            return "cpu"
+        try:
+            min_free = int(float(
+                os.environ.get("GLINER_MIN_FREE_GB", "1.5")) * (1 << 30))
+        except ValueError:
+            min_free = int(1.5 * (1 << 30))
+        best, best_free = None, 0
+        for i in range(torch.cuda.device_count()):
+            try:
+                free, _total = torch.cuda.mem_get_info(i)
+            except Exception:
+                continue
+            if free > best_free:
+                best, best_free = i, free
+        if best is None or best_free < min_free:
+            _logger.warning(
+                "No CUDA device has %.1fGB free (best: %.1fGB); "
+                "GLiNER runs on CPU.", min_free / (1 << 30),
+                best_free / (1 << 30))
+            return "cpu"
+        _logger.info("GLiNER auto-picked cuda:%d (%.1fGB free).",
+                     best, best_free / (1 << 30))
+        return f"cuda:{best}"
+    except Exception as e:
+        _logger.debug("CUDA probing failed (%s); GLiNER on CPU.", e)
+        return "cpu"
+
+
+def _demote_gliner_to_cpu():
+    """CUDA OOM mid-inference: move the singleton to CPU for the rest of
+    the run. Slower but NEVER silently lossy — an empty result from an
+    OOM'd chunk would be a missed-entity fail-open."""
+    global _gliner_model
+    try:
+        _logger.warning(
+            "GLiNER hit CUDA OOM; moving model to CPU for the rest of "
+            "the run (set GLINER_DEVICE=cuda:N to pin a freer card, or "
+            "lower vLLM --gpu-memory-utilization).")
+        _gliner_model = _gliner_model.float().cpu()
+        import torch
+        torch.cuda.empty_cache()
+    except Exception as e:
+        _logger.warning("GLiNER CPU demotion failed: %s", e)
+    return _gliner_model
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    return 'out of memory' in str(exc).lower()
+
+
 def _get_gliner_model():
     """Get or create the GLiNER model (lazy singleton).
 
@@ -97,22 +168,23 @@ def _get_gliner_model():
     try:
         _logger.info("Loading GLiNER model %s ...", _gliner_model_name)
         model = GLiNER.from_pretrained(_gliner_model_name)
-        device = os.environ.get("GLINER_DEVICE", "auto").strip().lower()
-        if device in ("auto", "cuda"):
+        target = _pick_gliner_device()
+        if target != "cpu":
             try:
-                import torch
-                if torch.cuda.is_available():
-                    model = model.to("cuda")
-                    _logger.info("GLiNER model loaded on CUDA.")
-                else:
-                    if device == "cuda":
-                        _logger.warning(
-                            "GLINER_DEVICE=cuda but no CUDA device "
-                            "visible; using CPU.")
-                    _logger.info("GLiNER model loaded on CPU.")
+                model = model.to(target)
+                # fp16 halves weights AND activations — the difference
+                # between fitting and OOMing in the ~2GB headroom vLLM
+                # leaves per card. GLINER_FP16=0 to disable.
+                if os.environ.get("GLINER_FP16", "1") != "0":
+                    model = model.half()
+                _logger.info("GLiNER model loaded on %s (fp16=%s).",
+                             target,
+                             os.environ.get("GLINER_FP16", "1") != "0")
             except Exception as e:
                 _logger.warning(
-                    "GLiNER CUDA placement failed (%s); using CPU.", e)
+                    "GLiNER placement on %s failed (%s); using CPU.",
+                    target, e)
+                model = model.float().cpu()
         else:
             _logger.info("GLiNER model loaded on CPU.")
         _gliner_model = model
@@ -141,24 +213,37 @@ def _gliner_predict_many(model, texts: List[str]) -> List[list]:
     batch's findings.
     """
     results: List[list] = []
-    batch_fn = getattr(model, 'batch_predict_entities', None)
     for i in range(0, len(texts), _gliner_batch_size):
         group = texts[i:i + _gliner_batch_size]
+        batch_fn = getattr(model, 'batch_predict_entities', None)
         if batch_fn is not None:
             try:
                 results.extend(batch_fn(
                     group, _gliner_labels, threshold=_gliner_threshold))
                 continue
             except Exception as e:
-                _logger.debug(
-                    "GLiNER batch predict failed (%s); per-text fallback.", e)
+                if _is_cuda_oom(e):
+                    model = _demote_gliner_to_cpu()
+                else:
+                    _logger.debug(
+                        "GLiNER batch predict failed (%s); "
+                        "per-text fallback.", e)
         for text in group:
-            try:
-                results.append(model.predict_entities(
-                    text, _gliner_labels, threshold=_gliner_threshold))
-            except Exception as e:
-                _logger.debug("GLiNER prediction failed: %s", e)
-                results.append([])
+            for attempt in (1, 2):
+                try:
+                    results.append(model.predict_entities(
+                        text, _gliner_labels,
+                        threshold=_gliner_threshold))
+                    break
+                except Exception as e:
+                    if attempt == 1 and _is_cuda_oom(e):
+                        model = _demote_gliner_to_cpu()
+                        continue
+                    # A dropped chunk is a missed-entity risk: warn,
+                    # don't whisper.
+                    _logger.warning("GLiNER prediction failed: %s", e)
+                    results.append([])
+                    break
     return results
 
 
