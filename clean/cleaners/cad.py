@@ -386,78 +386,19 @@ class CADCleaner:
     def _strip_ole_summary(self, input_path: Path, output_path: Path, ext: str) -> bool:
         """Strip OLE SummaryInformation streams from SolidWorks files.
 
-        Zero-fills the \\x05SummaryInformation / \\x05DocumentSummaryInformation
-        property streams in place (same size, so the OLE structure stays valid),
-        then verifies no mapped entity remains anywhere in the raw bytes
-        (checked in both UTF-8 and UTF-16LE). Fails closed on any doubt.
+        Delegates to the shared OLE scrubber (ole_scrub), which zeroes
+        the property streams, performs same-length entity surgery on any
+        stray text in content streams, OCR-screens embedded preview
+        bitmaps, and verifies with boundary-aware patterns (this class's
+        old raw substring check false-quarantined clean parts on 3-letter
+        initials inside binary noise).
 
         Note: exiftool is deliberately NOT used here — it cannot write
         OLE-based CAD formats, so an exiftool round-trip can never succeed.
         """
-        temp_output: Optional[Path] = None
-        try:
-            if not HAS_OLEFILE:
-                _logger.warning(
-                    "olefile not available; cannot strip OLE metadata from %s. "
-                    "Fail-closed: returning False for pipeline quarantine.",
-                    ext,
-                )
-                return False
-
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-
-            try:
-                with olefile.OleFileIO(str(input_path)) as ole:
-                    present = [s for s in self._OLE_SUMMARY_STREAMS if ole.exists(s)]
-                    sizes = {s: ole.get_size(s) for s in present}
-            except Exception as e:
-                # Not an OLE2 file (newer SolidWorks container, etc.) —
-                # we cannot enumerate or scrub its metadata. Fail closed.
-                _logger.warning(
-                    "%s is not a readable OLE2 file (%s); cannot scrub metadata. "
-                    "Fail-closed: returning False for pipeline quarantine.",
-                    input_path.name, e,
-                )
-                return False
-
-            temp_output = output_path.with_name(output_path.name + '.cleantmp')
-            shutil.copyfile(input_path, temp_output)
-
-            if present:
-                _logger.info(
-                    "Zero-filling OLE property streams in %s: %s",
-                    input_path.name, [s.lstrip('\x05') for s in present],
-                )
-                ole = olefile.OleFileIO(str(temp_output), write_mode=True)
-                try:
-                    for stream in present:
-                        ole.write_stream(stream, b'\x00' * sizes[stream])
-                finally:
-                    ole.close()
-
-            # Verification: no mapped entity may remain in the raw bytes.
-            if self._binary_contains_mapped_entity(temp_output.read_bytes()):
-                _logger.warning(
-                    "Mapped entity text remains in %s after OLE scrub "
-                    "(embedded strings outside property streams). "
-                    "Fail-closed: returning False for pipeline quarantine.",
-                    input_path.name,
-                )
-                temp_output.unlink()
-                return False
-
-            os.replace(temp_output, output_path)
-            temp_output = None
-            return True
-
-        except Exception as e:
-            _logger.error(
-                "Error stripping OLE metadata from %s: %s", input_path, e,
-            )
-            return False
-        finally:
-            if temp_output is not None and temp_output.exists():
-                temp_output.unlink()
+        from .ole_scrub import strip_ole_properties
+        return strip_ole_properties(
+            self.mapper, input_path, output_path, input_path.name)
 
     def _binary_contains_mapped_entity(self, data: bytes) -> bool:
         """Check raw bytes for any mapped entity in UTF-8 or UTF-16LE form.

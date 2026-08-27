@@ -75,6 +75,153 @@ def binary_contains_mapped_entity(mapper, data: bytes) -> Optional[str]:
     return None
 
 
+def overwrite_entities_in_binary(mapper, data: bytes):
+    """Same-length in-place entity surgery on a binary blob.
+
+    Finds every mapped entity (case-insensitive; plain and collapsed
+    forms) in three byte views — latin-1 (single-byte/ASCII text) and
+    UTF-16LE at byte offsets 0 and 1 (legacy Office content streams) —
+    and overwrites the matched BYTES with 'X' filler of identical
+    length, so no stream offset or record size ever shifts.
+
+    Each overwrite is self-validating: the target bytes are re-decoded
+    and compared to the expected form first, so a decode-index drift
+    (astral chars in the replace-mode view) can never corrupt unrelated
+    bytes — a drifted match is skipped and left for the verify gate.
+
+    Returns (new_bytes, overwrite_count).
+    """
+    import re as _re
+    from ..anonymizer import NON_TEXT_ENTITY_TYPES
+
+    targets = []
+    for mapping in mapper.mappings:
+        if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
+            continue
+        value = mapping.original.strip().lower()
+        if len(value) < 4:
+            continue  # same threshold as the binary scan (noise guard)
+        forms = {value, _re.sub(r'[\s\-_]+', '', value)}
+        targets.append((mapping, [f for f in forms if len(f) >= 4]))
+    if not targets:
+        return data, 0
+
+    ba = bytearray(data)
+    total = 0
+
+    views = [(data.decode('latin-1').lower(), 1, 0, 'latin-1')]
+    for offset in (0, 1):
+        views.append((
+            data[offset:].decode('utf-16-le', errors='replace').lower(),
+            2, offset, 'utf-16-le'))
+
+    for text, width, base, enc in views:
+        for mapping, forms in targets:
+            for form in forms:
+                search_from = 0
+                while True:
+                    idx = text.find(form, search_from)
+                    if idx < 0:
+                        break
+                    search_from = idx + len(form)
+                    b0 = base + idx * width
+                    b1 = b0 + len(form) * width
+                    if b1 > len(ba):
+                        continue
+                    # Self-validation against decode-index drift
+                    segment = bytes(ba[b0:b1])
+                    if segment.decode(enc, errors='replace').lower() != form:
+                        continue
+                    for k in range(len(form)):
+                        pos = b0 + k * width
+                        ba[pos] = 0x58  # 'X'
+                        if width == 2:
+                            ba[pos + 1] = 0x00
+                    total += 1
+                    mapping.occurrence_count += 1
+    return bytes(ba), total
+
+
+_JPEG_SOI = b'\xff\xd8\xff'
+_JPEG_EOI = b'\xff\xd9'
+_PNG_SIG = b'\x89PNG\r\n\x1a\n'
+_PNG_END = b'IEND\xaeB`\x82'
+
+
+def _iter_embedded_images(data: bytes, max_images: int = 40):
+    """Yield JPEG/PNG blobs embedded in a binary (PPT Pictures stream,
+    SolidWorks preview bitmaps) by signature scanning."""
+    count = 0
+    pos = 0
+    while count < max_images:
+        start = data.find(_JPEG_SOI, pos)
+        if start < 0:
+            break
+        end = data.find(_JPEG_EOI, start + 3)
+        if end < 0:
+            break
+        yield data[start:end + 2]
+        count += 1
+        pos = end + 2
+    pos = 0
+    while count < max_images:
+        start = data.find(_PNG_SIG, pos)
+        if start < 0:
+            break
+        end = data.find(_PNG_END, start + 8)
+        if end < 0:
+            break
+        yield data[start:end + len(_PNG_END)]
+        count += 1
+        pos = end + len(_PNG_END)
+
+
+def embedded_image_entity_check(mapper, data: bytes,
+                                label: str) -> Optional[str]:
+    """OCR embedded raster images and check for mapped entities.
+
+    Returns None when clean/no images; the offending value on a hit; or
+    '<ocr-unavailable>' when images exist but cannot be screened
+    (callers fail closed unless PROJECT_P_REQUIRE_IMAGE_OCR=0).
+
+    Residual risk (documented): handwritten signatures inside embedded
+    images are cursive strokes OCR cannot read — this gate catches
+    TYPED text in pixels only.
+    """
+    blobs = list(_iter_embedded_images(data))
+    if not blobs:
+        return None
+    try:
+        from acquire.metadata import ImageOCR
+        ocr = ImageOCR()
+    except ImportError:
+        ocr = None
+    if not (ocr and getattr(ocr, 'available', False)):
+        if os.environ.get('PROJECT_P_REQUIRE_IMAGE_OCR', '1') == '0':
+            _logger.warning(
+                "%s has %d embedded image(s) but OCR is unavailable; "
+                "shipping WITHOUT pixel screening "
+                "(PROJECT_P_REQUIRE_IMAGE_OCR=0).", label, len(blobs))
+            return None
+        return '<ocr-unavailable>'
+    from ..anonymizer import NON_TEXT_ENTITY_TYPES
+    for blob in blobs:
+        text = ocr.extract_text_from_bytes(blob)
+        if not text:
+            continue
+        for mapping in mapper.mappings:
+            if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
+                continue
+            if len(mapping.original.strip()) < 4:
+                continue
+            build = getattr(mapper, '_build_pattern_cached', None)
+            pattern = build(mapping.original,
+                            mapping.entity_type) if build else None
+            if pattern is not None and pattern.search(text):
+                return mapping.original
+    return None
+
+
 def strip_ole_properties(mapper, input_path: Path, output_path: Path,
                          label: str) -> bool:
     """Zero OLE property streams and verify no mapped entity remains.
@@ -120,14 +267,36 @@ def strip_ole_properties(mapper, input_path: Path, output_path: Path,
             finally:
                 ole.close()
 
-        leaked = binary_contains_mapped_entity(mapper,
-                                               temp_output.read_bytes())
+        # Same-length entity surgery on content streams: matched entity
+        # bytes become 'X' filler (offsets never shift), so entity text
+        # in slide/content streams no longer forces quarantine.
+        data = temp_output.read_bytes()
+        data, overwritten = overwrite_entities_in_binary(mapper, data)
+        if overwritten:
+            _logger.info(
+                "Overwrote %d entity occurrence(s) in %s content "
+                "streams (same-length surgery).", overwritten, label)
+            temp_output.write_bytes(data)
+
+        leaked = binary_contains_mapped_entity(mapper, data)
         if leaked:
             _logger.warning(
                 "Mapped entity %r remains in %s content streams after OLE "
-                "property scrub — legacy binary content cannot be rewritten. "
+                "property scrub + surgery. "
                 "Fail-closed for pipeline quarantine.", leaked, label,
             )
+            temp_output.unlink()
+            return False
+
+        # Embedded raster images (PPT Pictures stream, SolidWorks preview
+        # bitmaps): OCR-screen for entity text; unscreenable = quarantine.
+        image_leak = embedded_image_entity_check(mapper, data, label)
+        if image_leak:
+            _logger.warning(
+                "Embedded image in %s %s — fail-closed for quarantine.",
+                label,
+                'cannot be OCR-screened' if image_leak == '<ocr-unavailable>'
+                else f'contains mapped entity {image_leak!r}')
             temp_output.unlink()
             return False
 

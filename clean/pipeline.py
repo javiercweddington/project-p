@@ -478,6 +478,22 @@ class CleanPipeline:
                 entity_spans=entity_spans,
             )
 
+            if success and not staging_file.exists():
+                # Format-converting cleaners (legacy .ppt -> image-only
+                # .pdf) write a sibling with a new extension and remove
+                # the original; track the replacement from here on.
+                converted = staging_file.with_suffix('.pdf')
+                if converted.exists():
+                    _logger.info("Tracking converted output: %s -> %s",
+                                 staging_file.name, converted.name)
+                    staging_file = converted
+                    rel_path = staging_file.relative_to(self.staging_dir)
+                else:
+                    _logger.warning(
+                        "Cleaner reported success for %s but no output "
+                        "exists; treating as failure.", rel_path)
+                    success = False
+
             if success:
                 # Record hashes and sizes
                 orig_hash = compute_file_hash(source_file)

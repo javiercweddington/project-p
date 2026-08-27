@@ -98,16 +98,12 @@ class PPTXCleaner:
         """
         ext = input_path.suffix.lower()
 
-        # Legacy .ppt: quarantined by policy. These decks are largely
-        # Mandarin content that a binary entity scan cannot vouch for;
-        # the plan is an LLM-based (Qwen) review path for legacy OLE
-        # decks rather than shipping on a weak byte-level check.
+        # Legacy .ppt: rasterize (soffice -> PDF -> render/OCR/GLiNER
+        # pixel redaction -> image-only PDF). Ghost content, Mandarin
+        # text, embedded photos and signatures are all handled at the
+        # pixel level; the deliverable becomes a .pdf sibling.
         if ext == '.ppt':
-            _logger.warning(
-                "Legacy .ppt %s quarantined by policy (Mandarin content — "
-                "pending LLM-based legacy review path).", input_path.name,
-            )
-            return False
+            return self._clean_legacy_ppt_via_raster(input_path, output_path)
 
         if not HAS_PYTHON_PPTX:
             _logger.warning("python-pptx not available; PPTX fail-closed")
@@ -144,6 +140,80 @@ class PPTXCleaner:
         except Exception as e:
             _logger.error("Error cleaning PPTX %s: %s", input_path, e)
             return False
+
+    def _clean_legacy_ppt_via_raster(self, input_path: Path,
+                                     output_path: Path) -> bool:
+        """Legacy .ppt via the raster architecture.
+
+        soffice converts the deck to PDF (text layer preserved for the
+        exact-geometry redaction belt), then the PDF raster cleaner
+        renders, redacts on pixels (OCR + mapper + shape rules + GLiNER)
+        and rebuilds an image-only PDF. Writing legacy .ppt binaries
+        back is impractical, so the deliverable is a .pdf SIBLING of
+        output_path; the pipeline detects the conversion and tracks the
+        new file. Fail-closed when LibreOffice or raster prerequisites
+        are missing.
+        """
+        import os
+        import shutil as _shutil
+        import subprocess
+        import tempfile
+
+        soffice = _shutil.which('soffice') or _shutil.which('libreoffice')
+        if soffice is None:
+            _logger.warning(
+                "Legacy .ppt %s: LibreOffice (soffice) not found — cannot "
+                "rasterize. Install libreoffice, or the deck stays "
+                "quarantined.", input_path.name)
+            return False
+
+        from .pdf import PDFCleaner
+        pdf_cleaner = PDFCleaner(self.mapper)
+        if not pdf_cleaner._raster_available():
+            _logger.warning(
+                "Legacy .ppt %s: raster prerequisites missing "
+                "(PyMuPDF + OCR backend). Fail-closed.", input_path.name)
+            return False
+
+        final_pdf = output_path.with_suffix('.pdf')
+        with tempfile.TemporaryDirectory(prefix='ppt_raster_') as tmp:
+            tmpdir = Path(tmp)
+            try:
+                proc = subprocess.run(
+                    [soffice, '--headless', '--convert-to', 'pdf',
+                     '--outdir', str(tmpdir), str(input_path)],
+                    capture_output=True, timeout=300)
+            except Exception as e:
+                _logger.error(
+                    "soffice conversion failed for %s: %s",
+                    input_path.name, e)
+                return False
+            produced = tmpdir / (input_path.stem + '.pdf')
+            if proc.returncode != 0 or not produced.exists():
+                _logger.error(
+                    "soffice could not convert %s (rc=%s): %s",
+                    input_path.name, proc.returncode,
+                    proc.stderr.decode('utf-8', 'replace')[:300])
+                return False
+
+            if not pdf_cleaner._clean_raster(produced, final_pdf):
+                final_pdf.unlink(missing_ok=True)
+                return False
+
+        # Remove the original .ppt from staging (the .pdf replaces it).
+        try:
+            if output_path.exists() and output_path != final_pdf:
+                os.remove(output_path)
+        except OSError as e:
+            _logger.warning("Could not remove converted .ppt %s: %s — "
+                            "deleting cleaned output, fail-closed.",
+                            output_path.name, e)
+            final_pdf.unlink(missing_ok=True)
+            return False
+        _logger.info(
+            "Rasterized legacy deck %s -> %s (image-only PDF)",
+            input_path.name, final_pdf.name)
+        return True
 
     def _clear_properties(self, core_props) -> None:
         """Clear core document properties."""
