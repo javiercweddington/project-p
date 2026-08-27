@@ -782,11 +782,13 @@ class CleanPipeline:
         text_cleaner = TextCleaner(self.mapper)
         todo = [f for f in sorted(self.staging_dir.rglob('*'))
                 if f.is_file() and not f.name.startswith('.')]
+        texts: Dict[Path, str] = {}
         for index, file_path in enumerate(todo, 1):
             if progress:
                 progress.step(index, len(todo), file_path.name)
             text = extract_scannable_text(file_path)
             if text and text.strip():
+                texts[file_path] = text
                 try:
                     text_cleaner._register_emails(
                         text, source=str(file_path))
@@ -794,6 +796,8 @@ class CleanPipeline:
                     _logger.debug(
                         "Email pre-registration failed for %s: %s",
                         file_path.name, e)
+
+        self._gliner_discovery(texts, progress)
 
         mode = llm_verify_mode()
         if mode in ('off', 'judge', 'sample'):
@@ -889,6 +893,101 @@ class CleanPipeline:
                     "%d file(s) failed the post-LLM re-clean and were "
                     "quarantined", failures,
                 )
+
+    # NER discoveries these types may auto-register; GLiNER's other labels
+    # (invoice/date/money) are far too generic to enter the mapper.
+    _GLINER_REGISTER_TYPES = frozenset(
+        {'person', 'company', 'email', 'phone', 'address'})
+
+    def _gliner_discovery(self, texts: Dict[Path, str], progress) -> None:
+        """Promote GLiNER to a first-class up-front discovery detector.
+
+        Person/company prose names are invisible to the deterministic
+        detectors, so with the LLM off they only entered the mapper via
+        seeds — the LLM judge kept finding exactly this class of leak
+        (CJK names/companies in the docx), and GLiNER's pixel-redaction
+        finds never propagated beyond their own image/page.
+
+        Confidence split: hits >= GLINER_AUTO_THRESHOLD (default 0.80)
+        are registered in the mapper (blocked everywhere, one pass);
+        hits between the base threshold and that are collected as
+        SUGGESTIONS surfaced in review_candidates.json for the human
+        loop. Skipped silently when GLiNER is not installed — the
+        deterministic detectors, sample audit, and review loop remain.
+        """
+        self.suggested_entities: List[Dict] = []
+        if not texts:
+            return
+        try:
+            from acquire.catalog import (_get_gliner_model, _gliner_chunks,
+                                         _gliner_predict_many,
+                                         _hits_from_predictions)
+            model = _get_gliner_model()
+        except Exception as e:
+            _logger.debug("GLiNER unavailable for discovery: %s", e)
+            return
+        if model is None:
+            return
+
+        from .anonymizer import PLACEHOLDER_VALUE_RE
+        try:
+            auto_threshold = float(
+                os.environ.get('GLINER_AUTO_THRESHOLD', '0.80'))
+        except ValueError:
+            auto_threshold = 0.80
+
+        if progress:
+            progress.stage(
+                f'up-front NER discovery (GLiNER, {len(texts)} files)')
+        registered = 0
+        for file_path, text in texts.items():
+            chunks = list(_gliner_chunks(text))
+            seen: set = set()
+            hits = []
+            for predictions in _gliner_predict_many(model, chunks):
+                hits.extend(_hits_from_predictions(
+                    predictions, str(file_path), seen))
+            for hit in hits:
+                if hit.entity_type not in self._GLINER_REGISTER_TYPES:
+                    continue
+                value = hit.value.strip()
+                has_cjk = re.search(r'[぀-ヿ㐀-䶿一-鿿가-힯]', value)
+                if len(value) < (2 if has_cjk else 3) or len(value) > 120:
+                    continue
+                if PLACEHOLDER_VALUE_RE.fullmatch(value):
+                    continue
+                if hit.confidence >= auto_threshold:
+                    self.mapper.get_or_create(
+                        hit.entity_type, value,
+                        source=f'gliner_discovery:{file_path.name}')
+                    registered += 1
+                else:
+                    self.suggested_entities.append({
+                        'type': hit.entity_type,
+                        'value': value,
+                        'confidence': hit.confidence,
+                        'file': file_path.name,
+                    })
+        # Dedupe suggestions across files/chunks: one review line per
+        # (type, value), keeping the best confidence and every file.
+        merged: Dict[Tuple[str, str], Dict] = {}
+        for suggestion in self.suggested_entities:
+            key = (suggestion['type'], suggestion['value'].lower())
+            kept = merged.get(key)
+            if kept is None:
+                kept = dict(suggestion, files=[suggestion.pop('file')])
+                merged[key] = kept
+            else:
+                kept['confidence'] = max(
+                    kept['confidence'], suggestion['confidence'])
+                if suggestion['file'] not in kept['files']:
+                    kept['files'].append(suggestion['file'])
+        self.suggested_entities = sorted(
+            merged.values(), key=lambda s: -s['confidence'])
+        _logger.info(
+            "GLiNER discovery: %d value(s) auto-registered (>=%.2f), "
+            "%d suggestion(s) for review",
+            registered, auto_threshold, len(self.suggested_entities))
 
     def _llm_sample_audit(self, result: 'CleanResult') -> None:
         """PROJECT_P_LLM_VERIFY=sample: audit ONE cleaned file per

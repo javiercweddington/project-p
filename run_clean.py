@@ -185,6 +185,9 @@ def main() -> int:
     import json
     review = {
         'project': project,
+        # GLiNER hits below the auto-register threshold: human triage —
+        # move real ones into 'entities' and re-run with --seed-file.
+        'suggested_entities': getattr(pipeline, 'suggested_entities', []),
         'entities': [
             {
                 'type': m.entity_type,

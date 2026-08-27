@@ -225,6 +225,16 @@ def _parse_entity_json(raw: str) -> Optional[List[Dict[str, str]]]:
     as a failure, not as "no entities found" (a truncated reply silently
     ending discovery would be a fail-open).
     """
+    # Structured-output replies: bare array, or the object-root wrapper
+    # {"entities": [...]} required by strict json_schema backends.
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get('entities'), list):
+        return [e for e in data['entities']
+                if isinstance(e, dict) and 'type' in e and 'value' in e]
+
     candidates = re.findall(r'\[[^\[\]]*\]', raw, re.DOTALL)
     for candidate in reversed(candidates):
         try:
@@ -262,7 +272,10 @@ def _iter_chunks(text: str):
 # hundreds-of-CoT-tokens-per-reply cost AND guarantees parseability.
 # PROJECT_P_LLM_GUIDED=0 disables; a server that rejects the parameter
 # (HTTP 4xx) automatically falls back to unguided for the rest of the run.
-_GUIDED_SCHEMA = {
+# Object-root schema: strict backends (OpenAI json_schema spec, xgrammar
+# strict mode) require the ROOT to be an object, not an array. The parser
+# accepts both the bare array and this {"entities": [...]} wrapper.
+_ENTITY_ARRAY_SCHEMA = {
     'type': 'array',
     'items': {
         'type': 'object',
@@ -271,16 +284,26 @@ _GUIDED_SCHEMA = {
             'value': {'type': 'string'},
         },
         'required': ['type', 'value'],
+        'additionalProperties': False,
     },
 }
+_GUIDED_SCHEMA = {
+    'type': 'object',
+    'properties': {'entities': _ENTITY_ARRAY_SCHEMA},
+    'required': ['entities'],
+    'additionalProperties': False,
+}
 
-# Structured-output negotiation. Different vLLM generations want different
-# request fields ('guided_json' historically, 'response_format' with
-# json_schema on newer builds) and some servers silently IGNORE unknown
-# fields (measured: guided_json accepted with HTTP 200 but the model still
-# emitted a CoT preamble). So the mode self-adapts: advance to the next
-# mode on HTTP 4xx OR when a "constrained" reply doesn't start with '['.
-_STRUCTURED_MODES = ('guided_json', 'response_format', 'off')
+# Structured-output negotiation. vLLM generations want different request
+# fields — 'structured_outputs' on current builds (0.10+; guided_json is
+# deprecated/removed there), 'guided_json' historically, OpenAI-style
+# 'response_format' in between — and servers silently IGNORE fields they
+# don't know (measured live on vLLM 0.27: guided_json AND response_format
+# both HTTP 200 with the constraint ignored). The mode self-adapts:
+# advance on HTTP 4xx OR when a "constrained" reply doesn't start with
+# JSON. PROJECT_P_LLM_GUIDED=0 disables entirely.
+_STRUCTURED_MODES = ('structured_outputs', 'guided_json',
+                     'response_format', 'off')
 _structured_idx = 0
 
 
@@ -288,12 +311,15 @@ def _structured_extra() -> Optional[Dict]:
     if os.environ.get('PROJECT_P_LLM_GUIDED', '1') == '0':
         return None
     mode = _STRUCTURED_MODES[min(_structured_idx, len(_STRUCTURED_MODES) - 1)]
+    if mode == 'structured_outputs':
+        return {'structured_outputs': {'json': _GUIDED_SCHEMA}}
     if mode == 'guided_json':
         return {'guided_json': _GUIDED_SCHEMA}
     if mode == 'response_format':
         return {'response_format': {
             'type': 'json_schema',
             'json_schema': {'name': 'entity_list',
+                            'strict': True,
                             'schema': _GUIDED_SCHEMA}}}
     return None
 
@@ -326,7 +352,7 @@ def _detect_chunk(llm: LocalLLM, chunk: str) -> List[Dict[str, str]]:
             _logger.warning("LLM detection call failed: %s", e)
             raise
         break
-    if extra is not None and not reply.lstrip().startswith('['):
+    if extra is not None and not reply.lstrip().startswith(('[', '{')):
         # Server accepted the field but ignored the constraint.
         _advance_structured_mode('constraint ignored — reply began with prose')
     parsed = _parse_entity_json(reply)

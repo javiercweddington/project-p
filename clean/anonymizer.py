@@ -170,6 +170,18 @@ class EntityMapper:
             variants.add(re.sub(r'\s+', '-', stem))
             variants.add(re.sub(r'\s+', '_', stem))
 
+        # XML numeric character reference form: worksheet XML stores
+        # 'Gürses' as 'G&#252;rses', which no plain-text variant matches —
+        # the value shipped inside cleaned xlsm sheets (seen live). Emit
+        # the escaped spelling for both original-case and lowercased
+        # codepoints ('Ü' -> &#220;, 'ü' -> &#252;).
+        for source_form in (original.strip(), base, base_nopunct):
+            if source_form and any(ord(ch) > 127 for ch in source_form):
+                escaped = ''.join(
+                    ch if ord(ch) < 128 else f'&#{ord(ch)};'
+                    for ch in source_form)
+                variants.add(escaped.lower())
+
         return [v for v in variants if len(v) >= 2]
 
     # CJK ranges (Han, Hiragana/Katakana, Hangul): \b is meaningless between
