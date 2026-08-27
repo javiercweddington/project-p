@@ -183,8 +183,9 @@ class LocalLLM:
             self._available = False
         return self._available
 
-    def chat(self, system: str, user: str, max_tokens: int = 2000) -> str:
-        payload = json.dumps({
+    def chat(self, system: str, user: str, max_tokens: int = 2000,
+             extra: Optional[Dict] = None) -> str:
+        body_fields = {
             'model': self.model,
             'messages': [
                 {'role': 'system', 'content': system},
@@ -192,7 +193,10 @@ class LocalLLM:
             ],
             'temperature': 0.0,
             'max_tokens': max_tokens,
-        }).encode('utf-8')
+        }
+        if extra:
+            body_fields.update(extra)
+        payload = json.dumps(body_fields).encode('utf-8')
         req = urllib.request.Request(
             f'{self.base_url}/chat/completions',
             data=payload,
@@ -245,12 +249,56 @@ def _iter_chunks(text: str):
             yield chunk
 
 
+# Guided decoding (vLLM `guided_json`): a grammar constraint on the output
+# tokens — the model CANNOT emit a thinking preamble or prose, only JSON
+# matching this schema, from the first token. Kills the measured
+# hundreds-of-CoT-tokens-per-reply cost AND guarantees parseability.
+# PROJECT_P_LLM_GUIDED=0 disables; a server that rejects the parameter
+# (HTTP 4xx) automatically falls back to unguided for the rest of the run.
+_GUIDED_SCHEMA = {
+    'type': 'array',
+    'items': {
+        'type': 'object',
+        'properties': {
+            'type': {'type': 'string'},
+            'value': {'type': 'string'},
+        },
+        'required': ['type', 'value'],
+    },
+}
+_guided_unsupported = False
+
+
+def _guided_extra() -> Optional[Dict]:
+    if os.environ.get('PROJECT_P_LLM_GUIDED', '1') == '0':
+        return None
+    if _guided_unsupported:
+        return None
+    return {'guided_json': _GUIDED_SCHEMA}
+
+
 def _detect_chunk(llm: LocalLLM, chunk: str) -> List[Dict[str, str]]:
     """One chunk -> parsed entity dicts. Raises on any failure
     (fail-closed: an unparseable/failed reply is NOT 'no entities')."""
+    global _guided_unsupported
+    extra = _guided_extra()
     try:
-        reply = llm.chat(_detect_system_prompt(), chunk,
-                         max_tokens=_llm_max_tokens())
+        try:
+            reply = llm.chat(_detect_system_prompt(), chunk,
+                             max_tokens=_llm_max_tokens(), extra=extra)
+        except urllib.error.HTTPError as e:
+            if extra is not None and 400 <= e.code < 500:
+                # Server rejected guided decoding — remember and retry
+                # plain (older vLLM / non-vLLM endpoints).
+                if not _guided_unsupported:
+                    _logger.warning(
+                        "Endpoint rejected guided_json (HTTP %d); "
+                        "falling back to unguided replies.", e.code)
+                _guided_unsupported = True
+                reply = llm.chat(_detect_system_prompt(), chunk,
+                                 max_tokens=_llm_max_tokens())
+            else:
+                raise
     except Exception as e:
         _logger.warning("LLM detection call failed: %s", e)
         raise
