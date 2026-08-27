@@ -787,7 +787,9 @@ class CleanPipeline:
                         file_path.name, e)
 
         mode = llm_verify_mode()
-        if mode == 'off':
+        if mode in ('off', 'judge'):
+            # 'judge' = LLM audits the finished output only; discovery
+            # stays deterministic + CV.
             return
         llm = LocalLLM()
         if not llm.available():
@@ -831,7 +833,7 @@ class CleanPipeline:
                                  llm_verify_mode)
 
         mode = llm_verify_mode()
-        if mode == 'off':
+        if mode in ('off', 'judge'):
             return
 
         llm = LocalLLM()

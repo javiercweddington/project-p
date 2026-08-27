@@ -119,6 +119,36 @@ def install_probes():
     # pipeline.run() resolves these names from its module globals /
     # class attributes at call time, so rebinding here takes effect.
     pl.verify_clean = _timed('stage:verify_clean')(pl.verify_clean)
+
+    # Per-check decomposition of verify_clean (it dominates the profile;
+    # these show WHICH check is spending the time).
+    from clean import verifier as vf
+    vf.LeakageChecker.run_check = _timed('verify:leakage')(
+        vf.LeakageChecker.run_check)
+    vf.LeakageChecker.check_filenames = _timed('verify:filenames')(
+        vf.LeakageChecker.check_filenames)
+    vf.LeakageChecker.check_metadata = _timed('verify:metadata')(
+        vf.LeakageChecker.check_metadata)
+    vf.ReScanner.run_check = _timed('verify:rescan')(
+        vf.ReScanner.run_check)
+    vf.LegibilityChecker.run_check = _timed('verify:legibility')(
+        vf.LegibilityChecker.run_check)
+    vf.ConsistencyChecker.run_check = _timed('verify:consistency')(
+        vf.ConsistencyChecker.run_check)
+
+    orig_check_file = vf.LeakageChecker.check_file
+
+    @functools.wraps(orig_check_file)
+    def check_file(self, cleaned_path, original_path, relative_path=""):
+        label = (f'verify:check_file'
+                 f'[{cleaned_path.suffix.lower() or cleaned_path.name}]')
+        t0 = time.perf_counter()
+        try:
+            return orig_check_file(self, cleaned_path, original_path,
+                                   relative_path)
+        finally:
+            STATS[label].append(time.perf_counter() - t0)
+    vf.LeakageChecker.check_file = check_file
     ld.LLMCleanlinessJudge.run_check = _timed('stage:llm_judge')(
         ld.LLMCleanlinessJudge.run_check)
     ld.LLMEntityDetector.scan_directory = _timed('stage:llm_scan_directory')(
@@ -237,10 +267,12 @@ def main():
         description='One-file-per-type pipeline run with timing profile.')
     parser.add_argument('--source', default=str(SOURCE_BASE),
                         help='Project directory to sample from')
-    parser.add_argument('--llm', choices=['off', 'auto', 'required'],
+    parser.add_argument('--llm', choices=['off', 'auto', 'required', 'judge'],
                         default='off',
-                        help='LLM mode (default off, matching run_clean.py; '
-                             'pass required to profile the LLM stages)')
+                        help='LLM mode (default off, matching run_clean.py). '
+                             'judge: LLM audits the finished output once — '
+                             'no LLM discovery; required: LLM also joins '
+                             'discovery.')
     parser.add_argument('--mode', choices=['onepass', 'iterative'],
                         default='onepass',
                         help='Pipeline mode (default onepass, matching '
@@ -278,9 +310,9 @@ def main():
     print(f'LLM endpoint: {llm.base_url} (model {llm.model}) — '
           f'{"reachable" if llm.available() else "NOT reachable"} '
           f'[mode={args.llm}]')
-    if args.llm == 'required' and not llm.available():
-        print('ERROR: --llm required but the endpoint is unreachable. '
-              'Start the Qwen server or pass --llm auto/off.',
+    if args.llm in ('required', 'judge') and not llm.available():
+        print(f'ERROR: --llm {args.llm} but the endpoint is unreachable. '
+              f'Start the Qwen server or pass --llm auto/off.',
               file=sys.stderr)
         return 2
 

@@ -52,9 +52,15 @@ DEFAULT_API_KEY = os.environ.get('PROJECT_P_LLM_API_KEY', 'not-needed')
 
 
 def llm_verify_mode() -> str:
-    """Current LLM verification mode: off | auto | required."""
+    """Current LLM verification mode: off | auto | required | judge.
+
+    judge = LLM is used ONLY for the final cleanliness check (no
+    discovery): deterministic + CV detection carry cleaning, and the
+    model audits the finished output once. Unreachable endpoint fails
+    the check (you asked for an audit; a skipped audit is not a pass).
+    """
     mode = os.environ.get('PROJECT_P_LLM_VERIFY', 'auto').strip().lower()
-    return mode if mode in ('off', 'auto', 'required') else 'auto'
+    return mode if mode in ('off', 'auto', 'required', 'judge') else 'auto'
 
 
 # Entity types the LLM may register, mapped to mapper types.
@@ -501,11 +507,12 @@ class LLMCleanlinessJudge:
                 f"LLM endpoint {self.llm.base_url} unreachable — "
                 f"cleanliness NOT verified by LLM."
             )
-            if mode == 'required':
+            if mode in ('required', 'judge'):
                 return VerificationResult(
                     check_name="LLM Cleanliness Check",
                     passed=False,
-                    details=unavailable_msg + " (PROJECT_P_LLM_VERIFY=required)",
+                    details=unavailable_msg
+                            + f" (PROJECT_P_LLM_VERIFY={mode})",
                 )
             return VerificationResult(
                 check_name="LLM Cleanliness Check",
