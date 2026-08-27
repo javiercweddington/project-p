@@ -101,7 +101,12 @@ def overwrite_entities_in_binary(mapper, data: bytes):
         value = mapping.original.strip().lower()
         if len(value) < 4:
             continue  # same threshold as the binary scan (noise guard)
+        # Separator variants too: the verify gate matches 'globus-medical'
+        # via its boundary patterns, so surgery must find the same forms
+        # or a variant spelling forces quarantine the surgery could fix.
         forms = {value, _re.sub(r'[\s\-_]+', '', value)}
+        for sep in ('-', '_', ' '):
+            forms.add(_re.sub(r'[\s\-_]+', sep, value))
         targets.append((mapping, [f for f in forms if len(f) >= 4]))
     if not targets:
         return data, 0
@@ -115,7 +120,24 @@ def overwrite_entities_in_binary(mapper, data: bytes):
             data[offset:].decode('utf-16-le', errors='replace').lower(),
             2, offset, 'utf-16-le'))
 
+    def _overwrite(b0: int, b1: int, expected: str, width: int,
+                   enc: str) -> bool:
+        if b1 > len(ba):
+            return False
+        # Self-validation against decode-index drift
+        segment = bytes(ba[b0:b1])
+        if segment.decode(enc, errors='replace').lower() != expected:
+            return False
+        for k in range(len(expected)):
+            pos = b0 + k * width
+            ba[pos] = 0x58  # 'X'
+            if width == 2:
+                ba[pos + 1] = 0x00
+        return True
+
+    build = getattr(mapper, '_build_pattern_cached', None)
     for text, width, base, enc in views:
+        # Fast pass: literal + collapsed spellings
         for mapping, forms in targets:
             for form in forms:
                 search_from = 0
@@ -124,19 +146,31 @@ def overwrite_entities_in_binary(mapper, data: bytes):
                     if idx < 0:
                         break
                     search_from = idx + len(form)
-                    b0 = base + idx * width
-                    b1 = b0 + len(form) * width
-                    if b1 > len(ba):
-                        continue
-                    # Self-validation against decode-index drift
-                    segment = bytes(ba[b0:b1])
-                    if segment.decode(enc, errors='replace').lower() != form:
-                        continue
-                    for k in range(len(form)):
-                        pos = b0 + k * width
-                        ba[pos] = 0x58  # 'X'
-                        if width == 2:
-                            ba[pos + 1] = 0x00
+                    if _overwrite(base + idx * width,
+                                  base + (idx + len(form)) * width,
+                                  form, width, enc):
+                        total += 1
+                        mapping.occurrence_count += 1
+        # Gate-alignment pass: the verify gate matches VARIANT spellings
+        # (hyphen/underscore/flexible whitespace) via the mapper's
+        # boundary patterns — surgery must remove the SAME matches or a
+        # variant forces quarantine surgery could have fixed (seen live:
+        # 'NOA Labs Lt' variant in a SolidWorks binary). Run the gate's
+        # own patterns over each text view and overwrite the match spans.
+        if build is None:
+            continue
+        for mapping, _forms in targets:
+            try:
+                pattern = build(mapping.original, mapping.entity_type)
+            except Exception:
+                pattern = None
+            if pattern is None:
+                continue
+            for match in pattern.finditer(text):
+                expected = text[match.start():match.end()]
+                if _overwrite(base + match.start() * width,
+                              base + match.end() * width,
+                              expected, width, enc):
                     total += 1
                     mapping.occurrence_count += 1
     return bytes(ba), total

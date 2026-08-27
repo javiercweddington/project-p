@@ -547,6 +547,23 @@ class PDFCleaner:
                         if rects:
                             cover_rects.extend(rects)
                             continue
+                        # get_images() sometimes lists xrefs that are not
+                        # actual image objects ('xref not an image' on all
+                        # three operations — seen live on a soffice-
+                        # converted deck, xref 97). A non-image xref
+                        # renders no pixels; skipping it strips nothing.
+                        # Only a REAL image we cannot locate fails closed.
+                        try:
+                            obj = doc.xref_object(xref, compressed=True)
+                        except Exception:
+                            obj = ''
+                        if '/Image' not in obj:
+                            _logger.info(
+                                "Skipping non-image xref %d on page %d of "
+                                "%s (listed by get_images but not an "
+                                "image object).",
+                                xref, page_num + 1, input_path.name)
+                            continue
                         _logger.warning(
                             "Could not remove, blank, or locate image "
                             "xref %d on page %d of %s — failing closed.",
