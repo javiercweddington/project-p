@@ -49,7 +49,13 @@ def binary_contains_mapped_entity(mapper, data: bytes) -> Optional[str]:
     texts = []
     for enc in ('utf-8', 'utf-16-le'):
         decoded = data.decode(enc, errors='ignore')
-        texts.append('\n'.join(printable_run.findall(decoded)))
+        # Join with NUL, not '\n': flexible-whitespace patterns were
+        # stitching "matches" from fragments at unrelated file offsets
+        # ('NOA Labs' + 'Lt' thousands of bytes apart) — a leak no
+        # same-length surgery can remove because no contiguous bytes
+        # hold it. NUL is not \s, so matches stay within one run;
+        # every contiguous (surgery-removable) leak is still caught.
+        texts.append('\x00'.join(printable_run.findall(decoded)))
     for mapping in mapper.mappings:
         if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
             continue
@@ -159,7 +165,14 @@ def overwrite_entities_in_binary(mapper, data: bytes):
         # own patterns over each text view and overwrite the match spans.
         if build is None:
             continue
+        text_lower = text.lower()
         for mapping, _forms in targets:
+            needles = ()
+            get_needles = getattr(mapper, 'prefilter_needles', None)
+            if get_needles is not None:
+                needles = get_needles(mapping.original, mapping.entity_type)
+            if needles and not any(n in text_lower for n in needles):
+                continue
             try:
                 pattern = build(mapping.original, mapping.entity_type)
             except Exception:

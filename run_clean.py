@@ -3,14 +3,20 @@
 Server entrypoint for the cleaning pipeline.
 
 Default flow (--mode onepass, --llm off): up-front discovery
-(deterministic detectors + CV/OCR) -> ONE clean pass -> strict path
-anonymization -> verification suite -> review_candidates.json for the
-human-in-the-loop correction cycle (edit it, re-run with --seed-file).
+(deterministic detectors + GLiNER NER + CV/OCR) -> ONE clean pass
+(PDFs and legacy .ppt rasterize to image-only PDFs; Office XML gets a
+raw-member catch-all incl. cross-run splices) -> strict path
+anonymization -> verification suite -> review_candidates.json (auto
+entities + GLiNER suggestions) for the human-in-the-loop correction
+cycle (edit it, re-run with --seed-file).
 
-The LLM net (local Qwen, OpenAI-compatible, default
-http://localhost:8000/v1, model qwen27b) is opt-in via --llm
-auto/required; chunk requests run concurrently
-(PROJECT_P_LLM_CONCURRENCY, default 8).
+LLM modes (local Qwen via vLLM, structured outputs auto-negotiated):
+  --llm sample   audit ONE cleaned file per type, register + fix its
+                 findings everywhere, re-check (O(types) LLM cost —
+                 the recommended accuracy net)
+  --llm judge    audit EVERY finished file once (no LLM discovery)
+  --llm auto/required   LLM also joins up-front discovery
+Chunk requests run concurrently (PROJECT_P_LLM_CONCURRENCY, default 16).
 
 Examples:
     # Clean one project directory with seeded entities (no LLM)
@@ -76,6 +82,15 @@ def main() -> int:
                              'cost); judge: LLM audits EVERY finished file '
                              'once; auto/required: LLM also joins up-front '
                              'discovery.')
+    parser.add_argument('--opaque-binary',
+                        choices=['quarantine', 'ship-scanned'],
+                        default='quarantine',
+                        help='Non-OLE binary CAD (e.g. newer SolidWorks): '
+                             'quarantine (default, fail-closed) or '
+                             'ship-scanned (same-length entity surgery + '
+                             'raw-byte verify + embedded-image OCR gate; '
+                             'compressed streams are NOT scannable — '
+                             'accepts that residual risk).')
     parser.add_argument('--llm-base', default=None,
                         help='OpenAI-compatible base URL '
                              '(default http://localhost:8000/v1)')
@@ -89,6 +104,7 @@ def main() -> int:
     # Environment wiring BEFORE importing the pipeline (modules read these
     # at import/instantiation time)
     os.environ['PROJECT_P_LLM_VERIFY'] = args.llm
+    os.environ['PROJECT_P_OPAQUE_BINARY'] = args.opaque_binary
     if args.llm_base:
         os.environ['PROJECT_P_LLM_BASE'] = args.llm_base
     if args.llm_model:
