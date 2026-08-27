@@ -325,6 +325,12 @@ class CleanPipeline:
         # otherwise keep original modification times (temporal leak).
         self._normalize_all_mtimes()
 
+        # Step 2e (sample mode): LLM audits one file per type, fixes what
+        # it finds everywhere, re-checks. Result is appended to the
+        # leakage report after verification runs.
+        self._sample_audit_result = None
+        self._llm_sample_audit(result)
+
         # Step 3: Run verification
         try:
             leakage_report = verify_clean(
@@ -349,6 +355,9 @@ class CleanPipeline:
                 )
             except Exception as e:
                 _logger.warning("LLM cleanliness check errored: %s", e)
+
+            if getattr(self, '_sample_audit_result', None) is not None:
+                leakage_report.add_result(self._sample_audit_result)
 
             result.leakage_report = leakage_report
 
@@ -787,9 +796,9 @@ class CleanPipeline:
                         file_path.name, e)
 
         mode = llm_verify_mode()
-        if mode in ('off', 'judge'):
-            # 'judge' = LLM audits the finished output only; discovery
-            # stays deterministic + CV.
+        if mode in ('off', 'judge', 'sample'):
+            # 'judge'/'sample' = LLM audits the finished output only;
+            # discovery stays deterministic + CV.
             return
         llm = LocalLLM()
         if not llm.available():
@@ -833,7 +842,7 @@ class CleanPipeline:
                                  llm_verify_mode)
 
         mode = llm_verify_mode()
-        if mode in ('off', 'judge'):
+        if mode in ('off', 'judge', 'sample'):
             return
 
         llm = LocalLLM()
@@ -880,6 +889,155 @@ class CleanPipeline:
                     "%d file(s) failed the post-LLM re-clean and were "
                     "quarantined", failures,
                 )
+
+    def _llm_sample_audit(self, result: 'CleanResult') -> None:
+        """PROJECT_P_LLM_VERIFY=sample: audit ONE cleaned file per
+        extension with the LLM, FIX what it finds, re-check.
+
+        1. Sample: per extension, the cleaned file with the most
+           extractable text.
+        2. Round 1: LLM-scan the samples. Every reported value is a leak
+           in cleaned output — register it in the mapper.
+        3. Targeted re-clean: only files whose extracted text contains a
+           found value (cheap substring test over cached extractions).
+        4. Round 2: LLM-scan the samples plus the re-cleaned files.
+           Residual findings (or failed scans) FAIL the run.
+
+        LLM cost is two bounded rounds over ~one file per type instead of
+        a judge pass over every file: O(types), not O(files).
+        """
+        from .llm_detect import (LocalLLM, detect_entities_batch,
+                                 extract_scannable_text, llm_verify_mode,
+                                 _llm_scan_cap)
+        from .verifier import VerificationResult, LeakageHit
+
+        if llm_verify_mode() != 'sample':
+            return
+        progress = getattr(self, '_progress', None)
+        llm = LocalLLM()
+        if not llm.available():
+            result.errors.append(
+                f"LLM endpoint {llm.base_url} unreachable — sample audit "
+                f"could not run (PROJECT_P_LLM_VERIFY=sample).")
+            self._sample_audit_result = VerificationResult(
+                check_name="LLM Sample Audit", passed=False,
+                details=f"Endpoint {llm.base_url} unreachable — "
+                        f"output NOT LLM-audited.")
+            return
+
+        cap = _llm_scan_cap()
+
+        def _texts(paths):
+            out = {}
+            for path in paths:
+                text = extract_scannable_text(path)
+                if text and text.strip():
+                    out[str(path)] = text[:cap] if cap > 0 else text
+            return out
+
+        all_files = [f for f in sorted(self.staging_dir.rglob('*'))
+                     if f.is_file() and not f.name.startswith('.')]
+        texts_all = _texts(all_files)
+
+        # One sample per extension: the file with the MOST extractable
+        # text (best odds of exposing that type's leak pattern).
+        best: Dict[str, Path] = {}
+        for f in all_files:
+            text = texts_all.get(str(f))
+            if not text:
+                continue
+            ext = f.suffix.lower()
+            if ext not in best or len(text) > len(texts_all[str(best[ext])]):
+                best[ext] = f
+        samples = list(best.values())
+        if not samples:
+            self._sample_audit_result = VerificationResult(
+                check_name="LLM Sample Audit", passed=True,
+                details="No text-extractable files to sample")
+            return
+
+        hits: List = []
+
+        def _rel(key: str) -> str:
+            return str(Path(key).relative_to(self.staging_dir))
+
+        if progress:
+            progress.stage(
+                f'LLM sample audit round 1 '
+                f'({len(samples)} samples, {llm.model})')
+        round1, errors1 = detect_entities_batch(
+            llm, {str(p): texts_all[str(p)] for p in samples})
+        for key, err in errors1.items():
+            hits.append(LeakageHit(
+                file_path=_rel(key), entity_type='unverifiable',
+                original=f'LLM sample scan failed: {err}'))
+
+        # Every round-1 value is identifying text that SURVIVED cleaning:
+        # register it (idempotent for known entities) so the re-clean
+        # replaces it everywhere, not just in the sampled file.
+        leak_values: List[str] = []
+        for key, entities in round1.items():
+            for entity_type, value in entities:
+                self.mapper.get_or_create(
+                    entity_type, value,
+                    source=f'llm_sample_audit:{Path(key).name}')
+                leak_values.append(value)
+
+        recleaned: List[Path] = []
+        if leak_values:
+            _logger.info(
+                "Sample audit round 1: %d leak value(s) across %d sample(s)",
+                len(leak_values), len(samples))
+            router = FileCleanerRouter(self.mapper)
+            needles = {v.lower() for v in leak_values}
+            if progress:
+                progress.stage(
+                    f're-cleaning files containing {len(needles)} '
+                    f'audited value(s)')
+            for f in all_files:
+                text_lower = texts_all.get(str(f), '').lower()
+                if not any(needle in text_lower for needle in needles):
+                    continue
+                ok = router.clean_file(
+                    input_path=f, output_path=f, entity_spans=None)
+                if ok:
+                    self._normalize_mtime(f)
+                    recleaned.append(f)
+                else:
+                    _logger.warning(
+                        "Sample-audit re-clean failed for %s; "
+                        "quarantining", f.name)
+                    self._quarantine_file(
+                        f, f.relative_to(self.staging_dir))
+
+            # Round 2: re-check samples + everything re-cleaned.
+            targets = [p for p in dict.fromkeys(samples + recleaned)
+                       if p.exists()]
+            if progress:
+                progress.stage(
+                    f'LLM sample audit round 2 ({len(targets)} files)')
+            round2, errors2 = detect_entities_batch(llm, _texts(targets))
+            for key, err in errors2.items():
+                hits.append(LeakageHit(
+                    file_path=_rel(key), entity_type='unverifiable',
+                    original=f'LLM sample re-scan failed: {err}'))
+            for key, entities in round2.items():
+                for entity_type, value in entities:
+                    hits.append(LeakageHit(
+                        file_path=_rel(key),
+                        entity_type=f'llm_{entity_type}',
+                        original=value,
+                        context='Still identifiable after sample-audit '
+                                're-clean'))
+
+        self._sample_audit_result = VerificationResult(
+            check_name="LLM Sample Audit",
+            passed=len(hits) == 0,
+            details=(f"Sampled {len(samples)} file(s) (one per type) via "
+                     f"{llm.model}; round 1 registered {len(leak_values)} "
+                     f"leak value(s); re-cleaned {len(recleaned)} file(s)"),
+            hits=hits,
+        )
 
     def _inplace_reclean(self) -> int:
         """Re-clean every file currently in staging, in place.

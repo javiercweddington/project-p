@@ -52,15 +52,22 @@ DEFAULT_API_KEY = os.environ.get('PROJECT_P_LLM_API_KEY', 'not-needed')
 
 
 def llm_verify_mode() -> str:
-    """Current LLM verification mode: off | auto | required | judge.
+    """Current LLM verification mode: off | auto | required | judge | sample.
 
     judge = LLM is used ONLY for the final cleanliness check (no
     discovery): deterministic + CV detection carry cleaning, and the
     model audits the finished output once. Unreachable endpoint fails
     the check (you asked for an audit; a skipped audit is not a pass).
+
+    sample = LLM audits ONE cleaned file per extension, its findings are
+    registered and the affected files re-cleaned, then the samples (and
+    re-cleaned files) are audited again. Two bounded LLM rounds over a
+    small subset instead of judging every file — O(types), not O(files).
+    Residual round-2 findings FAIL the run.
     """
     mode = os.environ.get('PROJECT_P_LLM_VERIFY', 'auto').strip().lower()
-    return mode if mode in ('off', 'auto', 'required', 'judge') else 'auto'
+    return mode if mode in ('off', 'auto', 'required', 'judge',
+                            'sample') else 'auto'
 
 
 # Entity types the LLM may register, mapped to mapper types.
@@ -266,42 +273,62 @@ _GUIDED_SCHEMA = {
         'required': ['type', 'value'],
     },
 }
-_guided_unsupported = False
+
+# Structured-output negotiation. Different vLLM generations want different
+# request fields ('guided_json' historically, 'response_format' with
+# json_schema on newer builds) and some servers silently IGNORE unknown
+# fields (measured: guided_json accepted with HTTP 200 but the model still
+# emitted a CoT preamble). So the mode self-adapts: advance to the next
+# mode on HTTP 4xx OR when a "constrained" reply doesn't start with '['.
+_STRUCTURED_MODES = ('guided_json', 'response_format', 'off')
+_structured_idx = 0
 
 
-def _guided_extra() -> Optional[Dict]:
+def _structured_extra() -> Optional[Dict]:
     if os.environ.get('PROJECT_P_LLM_GUIDED', '1') == '0':
         return None
-    if _guided_unsupported:
-        return None
-    return {'guided_json': _GUIDED_SCHEMA}
+    mode = _STRUCTURED_MODES[min(_structured_idx, len(_STRUCTURED_MODES) - 1)]
+    if mode == 'guided_json':
+        return {'guided_json': _GUIDED_SCHEMA}
+    if mode == 'response_format':
+        return {'response_format': {
+            'type': 'json_schema',
+            'json_schema': {'name': 'entity_list',
+                            'schema': _GUIDED_SCHEMA}}}
+    return None
+
+
+def _advance_structured_mode(reason: str) -> None:
+    global _structured_idx
+    if _structured_idx < len(_STRUCTURED_MODES) - 1:
+        _structured_idx += 1
+        _logger.warning(
+            "Structured output mode %r failed (%s); switching to %r.",
+            _STRUCTURED_MODES[_structured_idx - 1], reason,
+            _STRUCTURED_MODES[_structured_idx])
 
 
 def _detect_chunk(llm: LocalLLM, chunk: str) -> List[Dict[str, str]]:
     """One chunk -> parsed entity dicts. Raises on any failure
     (fail-closed: an unparseable/failed reply is NOT 'no entities')."""
-    global _guided_unsupported
-    extra = _guided_extra()
-    try:
+    while True:
+        extra = _structured_extra()
         try:
             reply = llm.chat(_detect_system_prompt(), chunk,
                              max_tokens=_llm_max_tokens(), extra=extra)
         except urllib.error.HTTPError as e:
             if extra is not None and 400 <= e.code < 500:
-                # Server rejected guided decoding — remember and retry
-                # plain (older vLLM / non-vLLM endpoints).
-                if not _guided_unsupported:
-                    _logger.warning(
-                        "Endpoint rejected guided_json (HTTP %d); "
-                        "falling back to unguided replies.", e.code)
-                _guided_unsupported = True
-                reply = llm.chat(_detect_system_prompt(), chunk,
-                                 max_tokens=_llm_max_tokens())
-            else:
-                raise
-    except Exception as e:
-        _logger.warning("LLM detection call failed: %s", e)
-        raise
+                _advance_structured_mode(f'rejected with HTTP {e.code}')
+                continue
+            _logger.warning("LLM detection call failed: %s", e)
+            raise
+        except Exception as e:
+            _logger.warning("LLM detection call failed: %s", e)
+            raise
+        break
+    if extra is not None and not reply.lstrip().startswith('['):
+        # Server accepted the field but ignored the constraint.
+        _advance_structured_mode('constraint ignored — reply began with prose')
     parsed = _parse_entity_json(reply)
     if parsed is None:
         raise ValueError(
@@ -590,6 +617,13 @@ class LLMCleanlinessJudge:
                 check_name="LLM Cleanliness Check",
                 passed=True,
                 details="Disabled (PROJECT_P_LLM_VERIFY=off)",
+            )
+        if mode == 'sample':
+            return VerificationResult(
+                check_name="LLM Cleanliness Check",
+                passed=True,
+                details="Delegated to the LLM Sample Audit check "
+                        "(PROJECT_P_LLM_VERIFY=sample)",
             )
 
         if not self.llm.available():

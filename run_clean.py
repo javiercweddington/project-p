@@ -65,13 +65,17 @@ def main() -> int:
                              'once, verify once — no retroactive re-cleans. '
                              'iterative: legacy loop (re-clean until the '
                              'mapper stops growing).')
-    parser.add_argument('--llm', choices=['off', 'auto', 'required', 'judge'],
+    parser.add_argument('--llm',
+                        choices=['off', 'auto', 'required', 'judge',
+                                 'sample'],
                         default='off',
                         help='LLM mode (default: off — deterministic + CV + '
-                             'human review carry detection). judge: LLM '
-                             'audits the FINISHED output once (no LLM '
-                             'discovery); auto/required: LLM also joins '
-                             'up-front discovery.')
+                             'human review carry detection). sample: LLM '
+                             'audits ONE cleaned file per type, fixes its '
+                             'findings everywhere, re-checks (O(types) LLM '
+                             'cost); judge: LLM audits EVERY finished file '
+                             'once; auto/required: LLM also joins up-front '
+                             'discovery.')
     parser.add_argument('--llm-base', default=None,
                         help='OpenAI-compatible base URL '
                              '(default http://localhost:8000/v1)')
@@ -116,7 +120,7 @@ def main() -> int:
     print(f'LLM endpoint: {llm.base_url} (model {llm.model}) — '
           f'{"reachable" if llm.available() else "NOT reachable"} '
           f'[mode={args.llm}]')
-    if args.llm in ('required', 'judge') and not llm.available():
+    if args.llm in ('required', 'judge', 'sample') and not llm.available():
         print(f'ERROR: --llm {args.llm} but the endpoint is unreachable. '
               f'Start the Qwen server or pass --llm auto/off.',
               file=sys.stderr)

@@ -108,7 +108,7 @@ def install_probes():
 
     # --- Pipeline stages (roughly additive; top-level view) ---
     for name in ('_copy_to_staging', '_upfront_discovery',
-                 '_clean_all_files',
+                 '_clean_all_files', '_llm_sample_audit',
                  '_llm_discovery_loop', '_inplace_reclean',
                  '_anonymize_paths', '_normalize_all_mtimes',
                  '_save_mapper'):
@@ -267,12 +267,14 @@ def main():
         description='One-file-per-type pipeline run with timing profile.')
     parser.add_argument('--source', default=str(SOURCE_BASE),
                         help='Project directory to sample from')
-    parser.add_argument('--llm', choices=['off', 'auto', 'required', 'judge'],
+    parser.add_argument('--llm',
+                        choices=['off', 'auto', 'required', 'judge',
+                                 'sample'],
                         default='off',
                         help='LLM mode (default off, matching run_clean.py). '
-                             'judge: LLM audits the finished output once — '
-                             'no LLM discovery; required: LLM also joins '
-                             'discovery.')
+                             'sample: LLM audits one file per type, fixes, '
+                             're-checks; judge: LLM audits every finished '
+                             'file; required: LLM also joins discovery.')
     parser.add_argument('--mode', choices=['onepass', 'iterative'],
                         default='onepass',
                         help='Pipeline mode (default onepass, matching '
@@ -310,7 +312,7 @@ def main():
     print(f'LLM endpoint: {llm.base_url} (model {llm.model}) — '
           f'{"reachable" if llm.available() else "NOT reachable"} '
           f'[mode={args.llm}]')
-    if args.llm in ('required', 'judge') and not llm.available():
+    if args.llm in ('required', 'judge', 'sample') and not llm.available():
         print(f'ERROR: --llm {args.llm} but the endpoint is unreachable. '
               f'Start the Qwen server or pass --llm auto/off.',
               file=sys.stderr)
