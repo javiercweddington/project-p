@@ -101,6 +101,36 @@ def anonymize_path_component(mapper: 'EntityMapper', name: str,
     return replaced + ext
 
 
+_NAME_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z'\-]+$")
+
+
+def _person_name_variants(name: str) -> List[str]:
+    """Derived writings of a two-part Latin personal name.
+
+    'Ward, Bryan' also appears as 'Bryan Ward', 'B. Ward' and 'B.WARD'
+    in drawing title blocks (all four seen live; only the registered
+    form was caught). Matching is case-insensitive downstream, so one
+    dotted variant covers the caps form. Only clean two-token names
+    qualify — usernames, digits, initials, CJK and glued XML runs
+    derive nothing.
+    """
+    name = name.strip()
+    if ',' in name:
+        parts = [p.strip() for p in name.split(',')]
+        if len(parts) != 2 or not all(parts):
+            return []
+        last, first = parts
+    else:
+        parts = name.split()
+        if len(parts) != 2:
+            return []
+        first, last = parts
+    if not (_NAME_TOKEN_RE.match(first) and _NAME_TOKEN_RE.match(last)):
+        return []
+    return [f'{first} {last}', f'{last}, {first}',
+            f'{first[0]}. {last}', f'{first[0]}.{last}']
+
+
 @dataclass
 class EntityMapping:
     """A single mapping from original entity text to a placeholder."""
@@ -277,13 +307,18 @@ class EntityMapper:
         return re.compile(pattern_str, re.IGNORECASE)
 
     def get_or_create(self, entity_type: str, value: str,
-                      source: Optional[str] = None) -> str:
+                      source: Optional[str] = None,
+                      derive_variants: bool = True) -> str:
         """Get existing placeholder or create a new one.
 
         Args:
             entity_type: Type of entity (person, company, etc.)
             value: Original entity text
             source: Source file/path for attribution
+            derive_variants: person entities also register their other
+                common writings ('Ward, Bryan' -> 'Bryan Ward',
+                'B. Ward', 'B.Ward') so title-block initials are caught.
+                Internal recursion guard — leave True.
 
         Returns:
             The placeholder string (e.g., "[PERSON_001]")
@@ -329,6 +364,14 @@ class EntityMapper:
         # registration is not a substitution. Firing it on registration
         # produced phantom "entities replaced" counts for mere seeding.
         # replace_in_text / replace_spans fire it per actual replacement.
+
+        if entity_type == 'person' and derive_variants:
+            for variant in _person_name_variants(value):
+                if variant.strip().lower() != key:
+                    self.get_or_create(
+                        'person', variant,
+                        source=f'name_variant:{value.strip()}',
+                        derive_variants=False)
 
         return placeholder
 

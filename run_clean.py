@@ -82,6 +82,13 @@ def main() -> int:
                              'cost); judge: LLM audits EVERY finished file '
                              'once; auto/required: LLM also joins up-front '
                              'discovery.')
+    parser.add_argument('--layout', choices=['flat', 'tree'], default='flat',
+                        help='flat (default): all cleaned files land '
+                             'directly in the staging root — no DIR_nnn '
+                             'subfolders (original relative paths go to '
+                             'path_manifest.json in the audit dir for the '
+                             'later H5 packaging). tree: keep the '
+                             'anonymized directory hierarchy.')
     parser.add_argument('--comb', choices=['on', 'off'], default='on',
                         help='Comb & destroy (default on): pre-verify the '
                              'deterministic checks, repair every reported '
@@ -112,6 +119,8 @@ def main() -> int:
     os.environ['PROJECT_P_LLM_VERIFY'] = args.llm
     os.environ['PROJECT_P_OPAQUE_BINARY'] = args.opaque_binary
     os.environ['PROJECT_P_COMB'] = '1' if args.comb == 'on' else '0'
+    os.environ['PROJECT_P_FLAT_OUTPUT'] = (
+        '1' if args.layout == 'flat' else '0')
     if args.llm_base:
         os.environ['PROJECT_P_LLM_BASE'] = args.llm_base
     if args.llm_model:
@@ -188,8 +197,9 @@ def main() -> int:
         staging_dir=staging,
         mapper=mapper,
         one_pass=(args.mode == 'onepass'),
+        flat_output=(args.layout == 'flat'),
     )
-    print(f'Mode: {args.mode}')
+    print(f'Mode: {args.mode} (layout: {args.layout})')
     result = pipeline.run()
 
     print()
@@ -216,7 +226,7 @@ def main() -> int:
                 'type': m.entity_type,
                 'value': m.original,
                 'placeholder': m.placeholder,
-                'source': getattr(m, 'source', ''),
+                'source': ', '.join(getattr(m, 'sources', []) or []),
             }
             for m in mapper.mappings
         ],

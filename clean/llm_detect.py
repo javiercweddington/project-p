@@ -109,7 +109,52 @@ _VALUE_STOPLIST = {
     'microsoft office', 'microsoft', 'excel', 'word', 'powerpoint',
     'openpyxl', 'libreoffice', 'openoffice', 'wps office', 'wps',
     'adobe', 'acrobat', 'adobe acrobat', 'pdf', 'windows',
+    # Generic system account names (registered as 'person' live)
+    'user', 'admin', 'administrator', 'guest', 'owner',
+    # Generic hardware/packaging vocabulary: cannot identify a client,
+    # and registering them blacks out every engineering drawing table
+    # ('HOLE SAW PULL-OFF TEST' died to a 'HOLE SAW' product entry).
+    'hole saw', 'hole saw arbor', 'hole saw kit', 'pilot bit',
+    'ball bearing', 'bearing ball', 'arbor', 'arbor shank', 'collar',
+    'shank', 'forged shank', 'color bands', 'shrink film',
+    # Generic web/software strings seen auto-registered as companies
+    'www.google.com', 'google', 'sap',
 }
+
+# Value SHAPES that are extraction junk, not entities. These all showed
+# up registered live (jacky run): spreadsheet cell refs tagged as
+# phone/address by GLiNER, formula fragments as doc refs, XML runs
+# concatenated with ISO timestamps as person names, and dimension
+# triples as products.
+_CELL_REF_RE = re.compile(r'^[A-Za-z]{1,3}\d{1,4}$')
+_CELL_REF_CHAIN_RE = re.compile(
+    r'^[A-Za-z]{1,3}\d{1,4}([-:][A-Za-z]{1,3}\d{1,4})+$')
+_FORMULA_TOKEN_RE = re.compile(
+    r'(?i)(IFERROR|VLOOKUP|HLOOKUP|SUMIFS?|COUNTIFS?|CONCATENATE'
+    r'|ISBLANK|INDIRECT|falsefalse|truetrue)')
+_TIMESTAMP_GLUE_RE = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}')
+_NUMERIC_ONLY_RE = re.compile(r'^[\d.,\s-]+$')
+
+
+def _junk_shaped(value: str, entity_type: Optional[str] = None) -> bool:
+    """True when a candidate value is extraction junk by SHAPE.
+
+    Applied at every registration choke point (GLiNER discovery, LLM
+    detection, deterministic identifier scan). Deliberately narrow:
+    cell refs cap at 4 digits so real doc ids (MM00032628) still
+    register.
+    """
+    v = value.strip()
+    if _CELL_REF_RE.match(v) or _CELL_REF_CHAIN_RE.match(v):
+        return True
+    if _FORMULA_TOKEN_RE.search(v):
+        return True
+    if _TIMESTAMP_GLUE_RE.search(v):
+        return True
+    if entity_type in ('product', 'company', 'person') \
+            and _NUMERIC_ONLY_RE.match(v):
+        return True
+    return False
 
 _VERSION_SUFFIX_RE = re.compile(r'^[\sv.\d()+-]+$')
 
@@ -423,7 +468,7 @@ def _filter_parsed(parsed_lists) -> List[Tuple[str, str]]:
             has_cjk = re.search(r'[぀-ヿ㐀-䶿一-鿿가-힯]', value)
             if len(value) < (2 if has_cjk else 3) or len(value) > 120:
                 continue
-            if _stoplisted(value):
+            if _stoplisted(value) or _junk_shaped(value, mapper_type):
                 continue
             if _PLACEHOLDER_RE.fullmatch(value):
                 continue

@@ -152,7 +152,8 @@ class CleanPipeline:
                  source_dir: Path,
                  staging_dir: Optional[Path] = None,
                  mapper: Optional[EntityMapper] = None,
-                 one_pass: Optional[bool] = None):
+                 one_pass: Optional[bool] = None,
+                 flat_output: Optional[bool] = None):
         """Initialize the cleaning pipeline.
 
         Args:
@@ -166,10 +167,19 @@ class CleanPipeline:
                 instead of triggering re-cleans). None = read
                 PROJECT_P_ONE_PASS env (default off, preserving the
                 iterative behavior for library callers).
+            flat_output: True (default) = every cleaned file lands
+                DIRECTLY in the staging root (no DIR_nnn hierarchy);
+                the original relative paths go to path_manifest.json in
+                the audit dir for later H5 packaging. False = preserve
+                the anonymized directory tree. None = read
+                PROJECT_P_FLAT_OUTPUT env (default on).
         """
         if one_pass is None:
             one_pass = os.environ.get('PROJECT_P_ONE_PASS', '0') == '1'
         self.one_pass = one_pass
+        if flat_output is None:
+            flat_output = os.environ.get('PROJECT_P_FLAT_OUTPUT', '1') == '1'
+        self.flat_output = flat_output
         self.project_name = project_name
         self.source_dir = Path(source_dir)
         self.staging_dir = Path(staging_dir) if staging_dir else (
@@ -627,7 +637,18 @@ class CleanPipeline:
         app names like "WeChat", unmapped CJK text) is replaced wholesale
         with FILE_nnn/DIR_nnn pseudonyms. The original names are preserved
         in the audit mapper for traceability.
+
+        flat_output (default): the directory hierarchy is dropped
+        entirely — every file moves to the staging ROOT under its
+        anonymized name and the empty DIR skeleton is removed. The
+        original relative path of each final file is written to
+        path_manifest.json in the audit dir (KEEP PRIVATE) so the later
+        H5 packaging step can reconstruct provenance.
         """
+        if self.flat_output:
+            self._flatten_paths()
+            return
+
         # Collect all directories and files
         dirs_to_rename: List[Path] = []
         files_to_rename: List[Path] = []
@@ -664,16 +685,70 @@ class CleanPipeline:
                 new_path = dir_path.parent / anonymized_name
                 self._safe_rename(dir_path, new_path, "directory")
 
-    def _safe_rename(self, old_path: Path, new_path: Path, item_type: str) -> None:
+    def _flatten_paths(self) -> None:
+        """Move every cleaned file to the staging ROOT (anonymized name,
+        collision-suffixed) and drop the directory skeleton. Writes
+        path_manifest.json {final name -> original relative path} to the
+        audit dir — that file contains original names, keep it private.
+        """
+        files: List[Path] = []
+        for dirpath, _dirnames, filenames in os.walk(self.staging_dir):
+            current_dir = Path(dirpath)
+            for filename in filenames:
+                if filename.startswith('.'):
+                    continue
+                files.append(current_dir / filename)
+        files.sort()
+
+        manifest: Dict[str, str] = {}
+        for file_path in files:
+            if not file_path.exists():
+                continue
+            rel = file_path.relative_to(self.staging_dir)
+            anonymized_name = self._anonymize_name(file_path.name, 'filename')
+            final = self._safe_rename(
+                file_path, self.staging_dir / anonymized_name, "file")
+            manifest[(final or file_path).name] = str(rel)
+
+        # Remove the now-empty directory skeleton (bottom-up). A dir that
+        # still has content (failed move) is kept — fail-safe, and the
+        # downstream steps walk recursively either way.
+        for dirpath, _dirnames, _filenames in os.walk(
+                self.staging_dir, topdown=False):
+            dir_path = Path(dirpath)
+            if dir_path == self.staging_dir:
+                continue
+            try:
+                dir_path.rmdir()
+            except OSError:
+                _logger.warning("Flatten: directory kept (not empty): %s",
+                                dir_path)
+
+        audit_dir = self._audit_root() / self.project_name
+        try:
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            with open(audit_dir / 'path_manifest.json', 'w') as f:
+                json.dump(manifest, f, indent=2, ensure_ascii=False)
+            _logger.info("Flatten: %d file(s) in staging root; manifest at "
+                         "%s", len(manifest),
+                         audit_dir / 'path_manifest.json')
+        except OSError as e:
+            _logger.warning("Flatten: could not write path manifest: %s", e)
+
+    def _safe_rename(self, old_path: Path, new_path: Path,
+                     item_type: str) -> Optional[Path]:
         """Safely rename a file or directory, handling conflicts.
 
         Args:
             old_path: Current path
             new_path: Desired new path
             item_type: "file" or "directory" for logging
+
+        Returns the final path on success, None when the rename failed
+        (the file stays at old_path).
         """
         if old_path == new_path:
-            return
+            return new_path
 
         # Handle name conflicts by adding a suffix
         if new_path.exists():
@@ -690,11 +765,13 @@ class CleanPipeline:
                 "Anonymized %s: %s -> %s",
                 item_type, old_path.name, new_path.name,
             )
+            return new_path
         except OSError as e:
             _logger.warning(
                 "Failed to rename %s %s: %s",
                 item_type, old_path.name, e,
             )
+            return None
 
     def _check_size_delta(self, rel_path: Path, orig_size: int, clean_size: int) -> None:
         """Check size delta between original and cleaned file.
@@ -957,7 +1034,7 @@ class CleanPipeline:
             return
 
         from .anonymizer import PLACEHOLDER_VALUE_RE
-        from .llm_detect import _stoplisted
+        from .llm_detect import _stoplisted, _junk_shaped
         try:
             auto_threshold = float(
                 os.environ.get('GLINER_AUTO_THRESHOLD', '0.80'))
@@ -982,7 +1059,7 @@ class CleanPipeline:
                 has_cjk = re.search(r'[぀-ヿ㐀-䶿一-鿿가-힯]', value)
                 if len(value) < (2 if has_cjk else 3) or len(value) > 120:
                     continue
-                if _stoplisted(value):
+                if _stoplisted(value) or _junk_shaped(value, hit.entity_type):
                     continue
                 if PLACEHOLDER_VALUE_RE.fullmatch(value):
                     continue

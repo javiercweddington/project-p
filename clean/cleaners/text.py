@@ -189,12 +189,19 @@ class TextCleaner:
         - Project/invoice codes like JCW20200615A embed personal initials
           plus dates and are registered as document references.
         """
+        from ..llm_detect import _junk_shaped, _stoplisted
+
         for match in _EMAIL_RE.finditer(text):
             self.mapper.get_or_create(
                 'email', match.group(0),
                 source=source or 'auto_email_detection',
             )
         for match in _DOC_CODE_RE.finditer(text):
+            # Raw spreadsheet XML concatenates cell refs and formula
+            # fragments into doc-code-shaped runs ('AE3300000IFERROR')
+            # — shape-check before registering.
+            if _junk_shaped(match.group(0), 'sensitive_doc'):
+                continue
             self.mapper.get_or_create(
                 'sensitive_doc', match.group(0),
                 source=source or 'auto_doc_code_detection',
@@ -225,6 +232,9 @@ class TextCleaner:
                     # ("100 200 300" is exactly 9 — require 10 to be safe)
                     if len(re.sub(r'\D', '', match.group(0))) < 10:
                         continue
+                if _stoplisted(match.group(0)) or _junk_shaped(
+                        match.group(0), etype):
+                    continue
                 self.mapper.get_or_create(
                     etype, match.group(0),
                     source=source or 'auto_identifier_detection',

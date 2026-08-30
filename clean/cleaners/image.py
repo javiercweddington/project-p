@@ -61,6 +61,15 @@ except ImportError:
 
 _logger = logging.getLogger(__name__)
 
+# Above this fraction of all-caps alphabetic tokens, a page is treated
+# as caps-styled (engineering drawing) and the ALL-CAPS shape rules are
+# disabled — see redact_pil.
+try:
+    _CAPS_STYLE_MAX_RATIO = float(
+        os.environ.get('PROJECT_P_CAPS_RULE_MAX_RATIO', '0.5'))
+except ValueError:
+    _CAPS_STYLE_MAX_RATIO = 0.5
+
 # Try optional dependencies
 try:
     from PIL import Image, ImageOps
@@ -408,6 +417,28 @@ class ImageCleaner:
             had_redactions = False
             patterns = list(_entity_patterns())
 
+            # Caps-styled pages (engineering drawings, CAD title blocks)
+            # set virtually ALL text in capitals by drafting convention —
+            # there "ALL-CAPS" stops meaning "name-shaped" and the caps
+            # rules would black out entire spec tables (seen live:
+            # 'JAM TEST (CYCLES)', 'SEE SHEET 1 FOR REVISIONS'). When
+            # most alphabetic tokens are all-caps, redaction relies on
+            # mapper patterns + GLiNER + the identifier rule instead.
+            alpha_tokens = [
+                word
+                for words in lines.values()
+                for word, _x, _y, _w, _h in words
+                if len(re.sub(r'[^A-Za-z]', '', word)) >= 3]
+            caps_ratio = (
+                sum(1 for t in alpha_tokens if t == t.upper())
+                / len(alpha_tokens)) if alpha_tokens else 0.0
+            caps_rules_on = caps_ratio <= _CAPS_STYLE_MAX_RATIO
+            if not caps_rules_on:
+                _logger.info(
+                    "Caps-styled page (%d%% all-caps tokens): ALL-CAPS "
+                    "shape rules off for %s",
+                    round(caps_ratio * 100), source_name)
+
             def _redact_box(x, y, w, h):
                 nonlocal had_redactions
                 pad = max(2, h // 8)
@@ -424,10 +455,11 @@ class ImageCleaner:
                 for word, x, y, w, h in words:
                     if _is_identifier_token(word):
                         _redact_box(x, y, w, h)
-                    if (_is_caps_word(word)
+                    if (caps_rules_on and _is_caps_word(word)
                             and len(re.sub(r'[^A-Za-z]', '', word)) >= 6):
                         _redact_box(x, y, w, h)
-                    if _is_caps_word(word) and not money_re.match(word):
+                    if (caps_rules_on and _is_caps_word(word)
+                            and not money_re.match(word)):
                         caps_run.append((word, x, y, w, h))
                     else:
                         if sum(1 for t in caps_run if len(t[0]) >= 3) >= 2:
