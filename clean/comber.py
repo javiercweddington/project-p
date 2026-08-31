@@ -36,6 +36,22 @@ _OFFICE_ZIP_EXTS = {'.docx', '.xlsx', '.pptx', '.xlsm', '.docm', '.pptm',
 _OLE_EXTS = {'.doc', '.xls', '.ppt', '.sldprt', '.sldasm'}
 _MEDIA_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp',
                '.emf', '.wmf')
+# Formats PIL cannot decode (HD Photo, video, audio): a flagged member
+# in one of these gets a placeholder, never a copy-through.
+_OPAQUE_MEDIA_EXTS = ('.wdp', '.jxr', '.mov', '.mp4', '.avi', '.wmv',
+                      '.m4v', '.mp3', '.wav', '.bin')
+
+
+def _placeholder_member_bytes() -> bytes:
+    """A tiny neutral PNG used to overwrite undecodable media members."""
+    import io
+    try:
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new('RGB', (2, 2), (229, 229, 229)).save(buf, 'PNG')
+        return buf.getvalue()
+    except ImportError:
+        return b''
 
 
 def _parse_hit_location(file_path: str) -> Tuple[str, Optional[str]]:
@@ -104,14 +120,23 @@ def _comb_office_zip(path: Path, mapper, members: List[str]) -> bool:
             ok = False
             continue
         lower = member.lower()
-        if lower.endswith(_MEDIA_EXTS):
+        if lower.endswith(_MEDIA_EXTS + _OPAQUE_MEDIA_EXTS):
             new = _reencode_image_bytes(data)
             if new is None:
-                ok = False
-                continue
+                # Undecodable media (.wdp/.emf/.MOV — PIL can't rebuild
+                # from pixels): REPLACE with a neutral placeholder
+                # instead of quarantining the whole deck. The member's
+                # content (and whatever it leaked) is destroyed by
+                # construction; the slide shows a grey box.
+                new = _placeholder_member_bytes()
+                _logger.info(
+                    "Comb: media member %s::%s not re-encodable — "
+                    "replaced with placeholder (content destroyed)",
+                    path.name, member)
+            else:
+                _logger.info("Comb: re-encoded media member %s::%s "
+                             "(metadata destroyed)", path.name, member)
             blobs[member] = new
-            _logger.info("Comb: re-encoded media member %s::%s "
-                         "(metadata destroyed)", path.name, member)
         else:
             try:
                 text = data.decode('utf-8')

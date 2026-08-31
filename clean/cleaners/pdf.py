@@ -168,12 +168,26 @@ class PDFCleaner:
                     and self._raster_available()):
                 if self._clean_raster(input_path, output_path):
                     return True
-                if self._pdf_mode == 'raster':
-                    return False  # explicit raster mode: no silent fallback
+                # NO fallback when raster fails: raster failure means the
+                # page could not be verifiably redacted, and the text
+                # strategies below are a NO-OP on vector/scanned PDFs with
+                # no text layer — falling back shipped a Milwaukee drawing
+                # completely raw (FILE_040 live). Fail closed; the
+                # pipeline quarantines.
                 _logger.warning(
-                    "Raster PDF cleaning failed for %s; falling back to "
-                    "text-redaction strategy.", input_path.name,
-                )
+                    "Raster PDF cleaning failed for %s — fail-closed "
+                    "(no text-strategy fallback).", input_path.name)
+                return False
+            # Text strategies only act on the TEXT LAYER. A vector/scanned
+            # PDF with no extractable text would pass through content-
+            # untouched (metadata scrub only) and "succeed" — the second
+            # flavor of the FILE_040 fail-open. Refuse it.
+            if not self._has_text_layer(input_path):
+                _logger.warning(
+                    "%s has no extractable text layer and raster mode is "
+                    "unavailable — text strategies cannot clean page "
+                    "content; fail-closed.", input_path.name)
+                return False
             if self._strategy == 'pymupdf':
                 return self._clean_with_pymupdf(input_path, output_path)
             elif self._strategy == 'pdfminer_reportlab':
@@ -185,6 +199,27 @@ class PDFCleaner:
         except Exception as e:
             _logger.error("Error cleaning PDF %s: %s", input_path, e)
             return self._copy_as_is(input_path, output_path)
+
+    def _has_text_layer(self, input_path: Path) -> bool:
+        """True when any page yields extractable text (first 10 pages).
+
+        Errors count as False: if we cannot READ the text layer we
+        cannot claim to have cleaned it.
+        """
+        try:
+            if HAS_PYMUPDF:
+                import fitz
+                with fitz.open(input_path) as doc:
+                    return any(page.get_text().strip()
+                               for page in doc.pages(0, min(len(doc), 10)))
+            from pypdf import PdfReader
+            reader = PdfReader(str(input_path))
+            return any((page.extract_text() or '').strip()
+                       for page in reader.pages[:10])
+        except Exception as e:
+            _logger.warning("Text-layer probe failed for %s: %s",
+                            input_path.name, e)
+            return False
 
     # ---- incremental update detection ----
 

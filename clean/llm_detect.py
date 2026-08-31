@@ -119,6 +119,12 @@ _VALUE_STOPLIST = {
     'shank', 'forged shank', 'color bands', 'shrink film',
     # Generic web/software strings seen auto-registered as companies
     'www.google.com', 'google', 'sap',
+    # SharePoint/Office internals reported as products live
+    'documentlibraryform', 'document id generator',
+    # Generic mechanical components (reported as llm_product live —
+    # 'WASHER', 'COMPRESSION SPRING' identify nothing)
+    'washer', 'spring', 'compression spring', 'shaft', 'bearing',
+    'screw', 'nut', 'bolt', 'gasket', 'o-ring',
 }
 
 # Value SHAPES that are extraction junk, not entities. These all showed
@@ -146,6 +152,10 @@ def _junk_shaped(value: str, entity_type: Optional[str] = None) -> bool:
     """
     v = value.strip()
     if _CELL_REF_RE.match(v) or _CELL_REF_CHAIN_RE.match(v):
+        return True
+    # Dotted code namespaces ('Microsoft.Office.DocumentManagement'):
+    # software fingerprints, not client entities.
+    if re.match(r'(?i)^(microsoft|com|org|net|system|office)\.\w', v):
         return True
     if _FORMULA_TOKEN_RE.search(v):
         return True
@@ -345,6 +355,23 @@ def _parse_entity_json(raw: str) -> Optional[List[Dict[str, str]]]:
                     if isinstance(e, dict) and 'type' in e and 'value' in e]
     except json.JSONDecodeError:
         pass
+
+    # Truncation salvage: max_tokens cuts dense replies mid-array
+    # ('{"entities": [{"type": ...' then silence — seen live on
+    # product-heavy xlsx). Every COMPLETE {"type","value"} object is
+    # still recoverable; only the object the cut landed in is lost.
+    # Salvage keeps the audit useful instead of failing the whole file.
+    if re.match(r'\s*[\[{]', raw):
+        objs = re.findall(
+            r'\{\s*"type"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*'
+            r'"value"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}', raw)
+        if objs:
+            _logger.warning(
+                "LLM reply truncated mid-JSON; salvaged %d complete "
+                "entities (raise PROJECT_P_LLM_MAX_TOKENS to avoid).",
+                len(objs))
+            return [{'type': json.loads(f'"{t}"'),
+                     'value': json.loads(f'"{v}"')} for t, v in objs]
     return None
 
 
@@ -471,6 +498,12 @@ def _filter_parsed(parsed_lists) -> List[Tuple[str, str]]:
             if _stoplisted(value) or _junk_shaped(value, mapper_type):
                 continue
             if _PLACEHOLDER_RE.fullmatch(value):
+                continue
+            # Placeholder combos ('[ENTITY_002]™ [COMPANY_025]'): already
+            # pseudonymized text the judge echoes back — registering it
+            # would mint placeholder-of-placeholder entries.
+            if not re.search(r'[A-Za-z0-9]',
+                             re.sub(r'\[[A-Z]+_\d{3}\]', '', value)):
                 continue
             key = (mapper_type, value.lower())
             if key in seen:

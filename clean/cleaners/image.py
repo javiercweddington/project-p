@@ -339,7 +339,7 @@ class ImageCleaner:
                     pattern = self.mapper._build_pattern_cached(
                         mapping.original, mapping.entity_type)
                     if pattern is not None:
-                        yield pattern
+                        yield mapping.original, pattern
 
             lines = _ocr_lines(work)
 
@@ -482,7 +482,7 @@ class ImageCleaner:
                     line_text += word
                 # Cover mapped-entity matches AND GLiNER-detected spans
                 spans = [(m.start(), m.end())
-                         for pattern in patterns
+                         for _orig, pattern in patterns
                          for m in pattern.finditer(line_text)]
                 spans.extend(gliner_spans.get(key, []))
                 for start, end in spans:
@@ -494,14 +494,40 @@ class ImageCleaner:
 
             if had_redactions:
                 # Verify: re-OCR the redacted image; every entity pattern
-                # must now be unreadable.
-                verify_lines = _ocr_lines(work)
-                verify_text = '\n'.join(
-                    ' '.join(w[0] for w in words)
-                    for words in verify_lines.values())
-                for pattern in patterns:
-                    if pattern.search(verify_text):
+                # must now be unreadable. A residual match is COVERED at
+                # its re-OCR position and verified again (OCR segments
+                # shift once boxes land, so one pass routinely leaves a
+                # stray readable fragment — giving up on the first one
+                # quarantined whole files that one more box would fix).
+                for attempt in range(3):
+                    verify_lines = _ocr_lines(work)
+                    residual = []
+                    for key, words in verify_lines.items():
+                        line_text = ''
+                        offsets = []
+                        for word, x, y, w, h in words:
+                            if line_text:
+                                line_text += ' '
+                            offsets.append(
+                                (len(line_text),
+                                 len(line_text) + len(word), x, y, w, h))
+                            line_text += word
+                        for orig, pattern in patterns:
+                            for m2 in pattern.finditer(line_text):
+                                residual.append(
+                                    (orig, m2.start(), m2.end(), offsets))
+                    if not residual:
+                        break
+                    if attempt == 2:
+                        _logger.warning(
+                            "Pixel redaction verify: %r still readable "
+                            "after %d cover passes in %s — fail-closed.",
+                            residual[0][0], attempt + 1, source_name)
                         return None
+                    for _orig, start, end, offsets in residual:
+                        for (ws, we, x, y, w, h) in offsets:
+                            if ws < end and we > start:
+                                _redact_box(x, y, w, h)
 
             return work, had_redactions, total_words
 

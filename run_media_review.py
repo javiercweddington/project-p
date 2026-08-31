@@ -45,6 +45,51 @@ CONTACT_CELL = 150
 CONTACT_PER_SHEET = 36
 
 
+def _decode_preview(blob: bytes):
+    """Decode image bytes to a PIL image, trying hard.
+
+    PIL first; then ImageMagick, then ffmpeg (first frame — covers
+    .wdp/JPEG-XR, EMF/WMF metafiles, and video members like .MOV).
+    A reviewer who cannot SEE a picture cannot veto a logo — live, the
+    undecodable clusters were exactly where marks slipped review.
+    Returns None only when every decoder fails.
+    """
+    import io
+    import shutil as _sh
+    import subprocess
+    import tempfile
+    from PIL import Image
+    try:
+        img = Image.open(io.BytesIO(blob))
+        img.load()
+        return img
+    except Exception:
+        pass
+    with tempfile.NamedTemporaryFile(suffix='.bin', delete=False) as tf:
+        tf.write(blob)
+        src = tf.name
+    try:
+        for tool, cmd in (
+                ('magick', ['magick', src, 'png:-']),
+                ('convert', ['convert', src, 'png:-']),
+                ('ffmpeg', ['ffmpeg', '-v', 'error', '-i', src,
+                            '-frames:v', '1', '-f', 'image2pipe',
+                            '-vcodec', 'png', 'pipe:1'])):
+            if not _sh.which(tool):
+                continue
+            try:
+                out = subprocess.run(cmd, capture_output=True, timeout=30)
+                if out.returncode == 0 and out.stdout:
+                    img = Image.open(io.BytesIO(out.stdout))
+                    img.load()
+                    return img
+            except Exception:
+                continue
+    finally:
+        Path(src).unlink(missing_ok=True)
+    return None
+
+
 def write_contact_sheets(clusters, out_dir: Path) -> list:
     """Render numbered thumbnail grids of every distinct picture.
 
@@ -69,16 +114,18 @@ def write_contact_sheets(clusters, out_dir: Path) -> list:
             x, y = col * CONTACT_CELL, row * (CONTACT_CELL + 22)
             box = (x + 4, y + 4, x + CONTACT_CELL - 4, y + CONTACT_CELL - 4)
             draw.rectangle(box, outline=(200, 200, 200))
-            try:
-                import io
-                with Image.open(io.BytesIO(cluster.sample_bytes)) as img:
+            img = _decode_preview(cluster.sample_bytes)
+            if img is not None:
+                try:
                     thumb = img.convert('RGB')
                     thumb.thumbnail((CONTACT_CELL - 16, CONTACT_CELL - 16))
                     sheet.paste(
                         thumb,
                         (x + (CONTACT_CELL - thumb.width) // 2,
                          y + (CONTACT_CELL - thumb.height) // 2))
-            except Exception:
+                except Exception:
+                    img = None
+            if img is None:
                 draw.text((x + 12, y + CONTACT_CELL // 2),
                           'undecodable', fill=(180, 0, 0))
             label = (f'{cluster.cluster_id.replace("media_", "#")}  '
@@ -108,11 +155,13 @@ def write_thumbnails(clusters, out_dir: Path) -> dict:
         if not cluster.sample_bytes:
             continue
         target = thumbs / f'{cluster.cluster_id}.png'
+        img = _decode_preview(cluster.sample_bytes)
+        if img is None:
+            continue
         try:
-            with Image.open(io.BytesIO(cluster.sample_bytes)) as img:
-                thumb = img.convert('RGBA')
-                thumb.thumbnail((320, 320))
-                thumb.save(target)
+            thumb = img.convert('RGBA')
+            thumb.thumbnail((320, 320))
+            thumb.save(target)
         except Exception:
             continue
         out[cluster.cluster_id] = f'thumbs/{target.name}'

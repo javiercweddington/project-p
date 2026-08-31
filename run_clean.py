@@ -97,13 +97,14 @@ def main() -> int:
                              'what cannot be repaired.')
     parser.add_argument('--opaque-binary',
                         choices=['quarantine', 'ship-scanned'],
-                        default='quarantine',
+                        default='ship-scanned',
                         help='Non-OLE binary CAD (e.g. newer SolidWorks): '
-                             'quarantine (default, fail-closed) or '
-                             'ship-scanned (same-length entity surgery + '
-                             'raw-byte verify + embedded-image OCR gate; '
-                             'compressed streams are NOT scannable — '
-                             'accepts that residual risk).')
+                             'ship-scanned (default: same-length entity '
+                             'surgery + raw-byte verify + embedded-image '
+                             'OCR gate; compressed streams are NOT '
+                             'scannable — accepted residual risk, live '
+                             'this class was 29%% of a real corpus) or '
+                             'quarantine (strict fail-closed).')
     parser.add_argument('--llm-base', default=None,
                         help='OpenAI-compatible base URL '
                              '(default http://localhost:8000/v1)')

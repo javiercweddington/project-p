@@ -57,6 +57,10 @@ padding:13px;display:flex;flex-direction:column;gap:9px}
 background:repeating-conic-gradient(#eee 0 25%,#fff 0 50%) 0 0/16px 16px;
 border-radius:7px;overflow:hidden}
 .thumb img{max-width:100%;max-height:150px;object-fit:contain}
+.thumb.blind{background:#fbeaea;border:2px dashed var(--redact);
+flex-direction:column;gap:4px;text-align:center;padding:8px}
+.thumb.blind b{color:var(--redact);font-size:13px}
+.thumb.blind span{font-size:11px;color:#7a2222}
 .id{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--mute)}
 .meta{font-size:13px;color:var(--mute)}
 .chips{display:flex;flex-wrap:wrap;gap:5px}
@@ -97,9 +101,12 @@ function card(c, i) {
   const sig = Object.entries(c.signals || {}).filter(([, v]) => v);
   const hot = new Set(['in_template_chrome', 'spread_across_corpus']);
   return `<div class="card" id="c${i}" data-a="${c.action}">
-    <div class="thumb">${c.thumb
+    <div class="thumb${c.thumb ? '' : ' blind'}">${c.thumb
       ? `<img src="${c.thumb}" alt="${c.id}">`
-      : '<span class="meta">no preview</span>'}</div>
+      : `<b>&#9888; CANNOT RENDER (${c.format || 'unknown format'})</b>
+         <span>You are deciding blind — open a source document from
+         &ldquo;where it appears&rdquo; below before choosing Keep.</span>`
+      }</div>
     <div class="id">${c.id} &middot; score ${c.score}</div>
     <div class="meta">${c.width}&times;${c.height} ${c.format || ''} &middot;
       ${c.occurrences} uses in ${c.documents} docs${

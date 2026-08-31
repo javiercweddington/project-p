@@ -374,7 +374,8 @@ class CleanPipeline:
                 _logger.warning("LLM cleanliness check errored: %s", e)
 
             if getattr(self, '_sample_audit_result', None) is not None:
-                leakage_report.add_result(self._sample_audit_result)
+                leakage_report.add_result(
+                    self._filter_shipped_hits(self._sample_audit_result))
 
             result.leakage_report = leakage_report
 
@@ -1095,6 +1096,41 @@ class CleanPipeline:
             "GLiNER discovery: %d value(s) auto-registered (>=%.2f), "
             "%d suggestion(s) for review",
             registered, auto_threshold, len(self.suggested_entities))
+
+    def _filter_shipped_hits(self, check: 'VerificationResult'
+                             ) -> 'VerificationResult':
+        """Drop hits on files that are NO LONGER in the deliverable.
+
+        The sample audit (Step 2e) runs before the comber (Step 2f); a
+        file the comber later quarantined can still carry audit hits.
+        Failing the run over content that never shipped is noise — live
+        it buried the real signal under 180+ hits from two quarantined
+        pptx decks. Hits on files still in staging keep their teeth.
+        """
+        from .verifier import VerificationResult
+        if check.passed or not check.hits:
+            return check
+        kept, dropped = [], 0
+        for hit in check.hits:
+            rel = hit.file_path.split('::')[0]
+            if rel.endswith(']') and '[' in rel:
+                rel = rel[:rel.rindex('[')]
+            if (self.staging_dir / rel).exists():
+                kept.append(hit)
+            else:
+                dropped += 1
+        if dropped == 0:
+            return check
+        details = check.details
+        if dropped:
+            details += (f' | {dropped} hit(s) on quarantined files '
+                        f'dropped (never shipped)')
+        return VerificationResult(
+            check_name=check.check_name,
+            passed=not kept,
+            details=details,
+            hits=kept,
+        )
 
     def _llm_sample_audit(self, result: 'CleanResult') -> None:
         """PROJECT_P_LLM_VERIFY=sample: audit ONE cleaned file per
