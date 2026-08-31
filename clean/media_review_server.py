@@ -326,7 +326,20 @@ def serve(review_path: Path, audit_dir: Path, port: int = 8000,
                          result['changed'], result['undecided'])
             self._send(200, json.dumps(result).encode())
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = None
+    for candidate in range(port, port + 20):
+        try:
+            server = ThreadingHTTPServer((host, candidate), Handler)
+            break
+        except OSError as exc:
+            if getattr(exc, 'errno', None) not in (48, 98):  # EADDRINUSE
+                raise
+            _logger.info('Port %d busy, trying %d', candidate,
+                         candidate + 1)
+    if server is None:
+        raise OSError(
+            f'No free port in {port}-{port + 19}; pass --port')
+    port = server.server_address[1]
     print(f'Review server on http://{host}:{port}/')
     print(f'  sheet:  {review_path}')
     print('  forward this port (VS Code PORTS panel, or '

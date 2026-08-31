@@ -363,7 +363,11 @@ def main() -> int:
     parser.add_argument('--serve', action='store_true',
                         help='Open the review sheet in a local server '
                              'that writes decisions straight back')
-    parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--port', type=int, default=8765,
+                        help='Review server port (default 8765 — NOT '
+                             '8000, which the vLLM endpoint owns; if '
+                             'busy, the server bumps to the next free '
+                             'port)')
     parser.add_argument('--host', default='127.0.0.1',
                         help='Bind address (default loopback only -- '
                              'forward the port instead of widening this)')
