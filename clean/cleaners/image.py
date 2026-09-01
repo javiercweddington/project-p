@@ -417,6 +417,27 @@ class ImageCleaner:
             had_redactions = False
             patterns = list(_entity_patterns())
 
+            # Belt 0: logo template matching — the leak class OCR can
+            # never see (vector logo art has no text and no embedded
+            # image part). Templates come from the media review's
+            # 'redact' decisions plus any crops dropped into
+            # PROJECT_P_LOGO_TEMPLATES.
+            try:
+                from ..logo_match import env_templates, find_logo_boxes
+                logo_templates = env_templates()
+                if logo_templates:
+                    for (lx, ly, lw, lh) in find_logo_boxes(
+                            work, logo_templates):
+                        draw.rectangle([lx, ly, lx + lw, ly + lh],
+                                       fill=(0, 0, 0))
+                        had_redactions = True
+                        _logger.info(
+                            "Logo template match covered %dx%d region "
+                            "in %s", lw, lh, source_name)
+            except Exception as e:
+                _logger.warning("Logo template matching failed for %s: "
+                                "%s", source_name, e)
+
             # Caps-styled pages (engineering drawings, CAD title blocks)
             # set virtually ALL text in capitals by drafting convention —
             # there "ALL-CAPS" stops meaning "name-shaped" and the caps

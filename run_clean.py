@@ -82,6 +82,14 @@ def main() -> int:
                              'cost); judge: LLM audits EVERY finished file '
                              'once; auto/required: LLM also joins up-front '
                              'discovery.')
+    parser.add_argument('--logo-templates', default=None, metavar='DIR',
+                        help='Directory of logo image crops to '
+                             'template-match and black out on every '
+                             'rasterized page/image (run_media_review '
+                             '--apply exports redact decisions to '
+                             '<audit>/logo_templates). Catches VECTOR '
+                             'logo art that OCR and media stripping '
+                             'cannot see.')
     parser.add_argument('--layout', choices=['flat', 'tree'], default='flat',
                         help='flat (default): all cleaned files land '
                              'directly in the staging root — no DIR_nnn '
@@ -122,6 +130,8 @@ def main() -> int:
     os.environ['PROJECT_P_COMB'] = '1' if args.comb == 'on' else '0'
     os.environ['PROJECT_P_FLAT_OUTPUT'] = (
         '1' if args.layout == 'flat' else '0')
+    if args.logo_templates:
+        os.environ['PROJECT_P_LOGO_TEMPLATES'] = args.logo_templates
     if args.llm_base:
         os.environ['PROJECT_P_LLM_BASE'] = args.llm_base
     if args.llm_model:
@@ -181,16 +191,25 @@ def main() -> int:
             payload = json.load(f)
         entries = payload.get('entities', payload) if isinstance(
             payload, dict) else payload
-        seeded = 0
+        from clean.llm_detect import _junk_shaped, _stoplisted
+        seeded = skipped = 0
         for entry in entries:
             entity_type = str(entry.get('type', '')).strip()
             value = str(entry.get('value', '')).strip()
             if not entity_type or not value:
                 continue
+            # Bulk replays carry yesterday's junk ('User' re-imported
+            # this way quarantined 15 SolidWorks files). A deliberate
+            # exception goes through --seed TYPE=VALUE instead.
+            if _stoplisted(value) or _junk_shaped(value, entity_type):
+                skipped += 1
+                continue
             mapper.get_or_create(entity_type, value,
                                  source=f'seed_file:{seed_path.name}')
             seeded += 1
-        print(f'Seeded {seeded} entities from {seed_path}')
+        print(f'Seeded {seeded} entities from {seed_path}'
+              + (f' ({skipped} junk/stoplisted entries skipped)'
+                 if skipped else ''))
 
     pipeline = CleanPipeline(
         project_name=project,

@@ -141,22 +141,46 @@ def overwrite_entities_in_binary(mapper, data: bytes):
                 ba[pos + 1] = 0x00
         return True
 
-    build = getattr(mapper, '_build_pattern_cached', None)
-    for text, width, base, enc in views:
-        # Fast pass: literal + collapsed spellings
-        for mapping, forms in targets:
-            for form in forms:
-                search_from = 0
-                while True:
-                    idx = text.find(form, search_from)
-                    if idx < 0:
-                        break
-                    search_from = idx + len(form)
-                    if _overwrite(base + idx * width,
-                                  base + (idx + len(form)) * width,
-                                  form, width, enc):
+    # BYTE-EXACT pass: encode each form per encoding and regex the raw
+    # buffer. The decoded-view approach below suffers index DRIFT — one
+    # astral surrogate early in a 3MB binary shifts every later char
+    # index, self-validation refuses the shifted offsets, and the
+    # occurrences silently survive (live: 10 of 12 UTF-16 'ImpactHoleSaw'
+    # path strings kept their bytes). Byte offsets cannot drift.
+    for mapping, forms in targets:
+        for form in forms:
+            for enc, width in (('latin-1', 1), ('utf-16-le', 2)):
+                try:
+                    needle = form.encode(enc)
+                except UnicodeEncodeError:
+                    continue
+                pattern = _re.compile(_re.escape(needle), _re.IGNORECASE)
+                for m in pattern.finditer(bytes(ba)):
+                    if _overwrite(m.start(), m.end(), form, width, enc):
                         total += 1
                         mapping.occurrence_count += 1
+
+    # Windows-username pass, UNCONDITIONAL: absolute paths like
+    # C:\Users\bward\Desktop\... embed the author's OS account in
+    # feature trees and saved-path records. The username is rarely a
+    # mapped entity (nobody registers 'bward'), so the mapped-entity
+    # gates pass while the identity ships. Overwrite the path segment
+    # after Users\ regardless of the mapper.
+    for pat, width in (
+            (_re.compile(rb'(?i)users[\\/]([^\\/\x00:*?"<>|]{2,64})'
+                         rb'[\\/]'), 1),
+            (_re.compile(rb'(?i)u\x00s\x00e\x00r\x00s\x00[\\/]\x00'
+                         rb'((?:[^\x00][\x00]){2,64}?)[\\/]\x00'), 2)):
+        for m in pat.finditer(bytes(ba)):
+            b0, b1 = m.span(1)
+            for k in range(b0, b1, width):
+                ba[k] = 0x58
+                if width == 2 and k + 1 < b1:
+                    ba[k + 1] = 0x00
+            total += 1
+
+    build = getattr(mapper, '_build_pattern_cached', None)
+    for text, width, base, enc in views:
         # Gate-alignment pass: the verify gate matches VARIANT spellings
         # (hyphen/underscore/flexible whitespace) via the mapper's
         # boundary patterns — surgery must remove the SAME matches or a

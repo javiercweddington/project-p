@@ -168,6 +168,8 @@ def iter_source_files(source: Path) -> Iterator[Path]:
     """Every file under ``source`` that could carry an embedded image."""
     interesting = (OOXML_SUFFIXES | STANDALONE_IMAGE_SUFFIXES | {'.pdf'})
     for path in sorted(source.rglob('*')):
+        if path.name.startswith('.'):
+            continue  # dotfiles/AppleDouble ._ sidecars: never shipped
         if path.is_file() and path.suffix.lower() in interesting:
             yield path
 

@@ -70,8 +70,14 @@ CAD_ASCII_TEXT = {
 
 CAD_BINARY_COPY = {
     '.sldprt', '.sldasm', '.prt', '.asm',
+    '.slddrw',             # SolidWorks drawings — same container family;
+                           # unrouted they hit the router's unknown-type
+                           # fail-closed (18 quarantines on a live corpus)
     '.x_t', '.x_b', '.ipt', '.iam',
     '.dwg', '.fbx', '.blend',
+    '.mpp',                # MS Project: OLE compound file; not CAD, but
+                           # the OLE property scrub + binary surgery +
+                           # scan gates are exactly the right treatment
 }
 
 CAD_ZIP_BASED = {'.3mf'}
@@ -373,7 +379,11 @@ class CADCleaner:
         OLE SummaryInformation streams using olefile/pyole2.
         Falls back to fail-closed removal for other binary formats.
         """
-        if ext in ('.sldprt', '.sldasm'):
+        if ext in ('.sldprt', '.sldasm', '.slddrw', '.mpp'):
+            # SolidWorks parts/assemblies/drawings and MS Project: OLE
+            # compound (or newer opaque container) — property scrub +
+            # binary surgery + scan gates, honoring
+            # PROJECT_P_OPAQUE_BINARY for the non-OLE variants.
             return self._strip_ole_summary(input_path, output_path, ext)
 
         # Other binary CAD: fail-closed

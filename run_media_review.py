@@ -456,6 +456,24 @@ def main() -> int:
             return 2
         with open(path) as handle:
             review = json.load(handle)
+        # Every redact decision doubles as a LOGO TEMPLATE: export the
+        # cluster thumbnails so run_clean's pixel belt can template-match
+        # the same marks where they appear as VECTOR art (CAD title
+        # blocks) that media removal can't reach. Point run_clean at it
+        # with --logo-templates.
+        tdir = path.parent / 'logo_templates'
+        exported = 0
+        for entry in review.get('clusters', []):
+            thumb = entry.get('thumbnail')
+            if entry.get('action') == 'redact' and thumb:
+                src_thumb = path.parent / thumb
+                if src_thumb.is_file():
+                    tdir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_thumb, tdir / src_thumb.name)
+                    exported += 1
+        if exported:
+            print(f'Exported {exported} redact decision(s) as logo '
+                  f'templates: {tdir}')
         out_dir = Path(args.output) if args.output else Path(
             str(source) + '_media_clean')
         stats = apply_decisions(source, review, out_dir)

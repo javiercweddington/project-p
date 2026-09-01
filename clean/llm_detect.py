@@ -201,9 +201,9 @@ Find every piece of IDENTIFYING information that remains. Look for (in ANY langu
 - email: email addresses
 - phone: phone/fax/mobile numbers (电话/手机)
 - address: street or building addresses (地址), AND standalone city/town/country names (城市/国家) AND postal/zip codes — report each as type "address"
-- product: specific named products or part designations tied to a client project
+- product: BRANDED or model-designated products ONLY — trademark names, product-line names, SKU/model codes tied to a client project
 
-Do NOT report: generic role words (customer, supplier, CEO), software/application names (Microsoft Excel, Adobe), currencies, quantities, dates alone, material names (PC, MAKROLON is a material brand — DO report material brand names as product), or anything already in [XXX_nnn] placeholder form.
+Do NOT report: generic role words (customer, supplier, CEO), software/application names (Microsoft Excel, Adobe), currencies, quantities, dates alone, or anything already in [XXX_nnn] placeholder form. NEVER report generic component/engineering vocabulary as product: part descriptions (washer, compression spring, arbor, shank, collar, bearing, end cap), colors ("Red Plastic"), materials or material+part combos ("6150 Shank", "Plastic (PC) Insert Molded Steel"), or design-option labels ("COLLAR OPTION 1", "Arbor (Bearing Design)") — these identify nothing. Material BRAND names (MAKROLON) are the exception: DO report those as product.
 
 Answer with ONLY a JSON array, no prose:
 [{"type":"person","value":"EXACT text as it appears"}, ...]

@@ -335,6 +335,21 @@ class EntityMapper:
         if PLACEHOLDER_VALUE_RE.match(value.strip()):
             return value.strip()
 
+        # CENTRAL stoplist gate. Registration paths that bypassed the
+        # per-detector filters (metadata author fields, --seed-file
+        # replays of old review files) minted entities like 'User' —
+        # which then MATCHED INSIDE every SolidWorks binary's structure
+        # names and quarantined 15 files over one junk word. Explicit
+        # human seeds keep the last word.
+        if key not in self._mappings and not (
+                source or '').startswith('seed'):
+            try:
+                from .llm_detect import _stoplisted
+                if _stoplisted(value):
+                    return value.strip()
+            except ImportError:
+                pass
+
         if key in self._mappings:
             mapping = self._mappings[key]
             mapping.occurrence_count += 1
