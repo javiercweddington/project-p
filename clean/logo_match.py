@@ -129,12 +129,15 @@ def _max_hits_per_template() -> int:
 
 
 def env_templates():
-    """Templates from PROJECT_P_LOGO_TEMPLATES, cached by (dir, mtime)."""
+    """Templates from PROJECT_P_LOGO_TEMPLATES, cached by directory
+    listing (name+mtime per entry — a max-mtime key survived DELETING a
+    template, so a removed template kept matching)."""
     directory = templates_dir()
     if directory is None:
         return []
-    key = (str(directory), max((p.stat().st_mtime
-                                for p in directory.iterdir()), default=0))
+    key = (str(directory),
+           tuple(sorted((p.name, p.stat().st_mtime)
+                        for p in directory.iterdir() if p.is_file())))
     if key not in _TEMPLATE_CACHE:
         _TEMPLATE_CACHE.clear()
         _TEMPLATE_CACHE[key] = load_templates(directory)
@@ -241,16 +244,19 @@ def _template_variants(tmpl):
         yield squeezed, _COARSE_SCALES
 
 
-def _iou_clash(box, kept, thresh=0.3) -> bool:
+def _iou_clash(box, kept, thresh=0.3) -> int:
+    """Index of the first box in `kept` overlapping `box` (IoU >
+    thresh), or -1 when none does. Compare with >= 0 — index 0 is a
+    valid clash."""
     x, y, w, h = box
-    for kx, ky, kw, kh in kept:
+    for i, (kx, ky, kw, kh) in enumerate(kept):
         ix = max(0, min(x + w, kx + kw) - max(x, kx))
         iy = max(0, min(y + h, ky + kh) - max(y, ky))
         inter = ix * iy
         union = w * h + kw * kh - inter
         if union > 0 and inter / union > thresh:
-            return True
-    return False
+            return i
+    return -1
 
 
 def find_logo_boxes(pil_image, templates,
@@ -335,39 +341,61 @@ def find_logo_boxes(pil_image, templates,
     by_template: dict = {}
     for box in boxes:
         by_template.setdefault(box[5], []).append(box)
-    survivors: List[Tuple[int, int, int, int, float, str]] = []
+    # Each cluster: winner box + a few distinct-extent lower-scored
+    # alternates of the SAME region. Alternates matter because the
+    # reject callback runs in stage 2: a winner whose slightly larger
+    # extent drifts onto adjacent text gets rejected — without
+    # alternates a single-template region would then be lost entirely
+    # (live: the sole deduped winner rejected -> logo shipped).
+    survivors: List[dict] = []
     for name, tboxes in by_template.items():
         tboxes.sort(key=lambda b: -b[4])
-        deduped: List[Tuple[int, int, int, int]] = []
-        scored = []
+        clusters: List[dict] = []
         for x, y, w, h, score, _n in tboxes:
-            if not _iou_clash((x, y, w, h), deduped):
-                deduped.append((x, y, w, h))
-                scored.append((x, y, w, h, score, name))
-        area = sum(b[2] * b[3] for b in deduped) / page_area
-        if len(deduped) > max_hits or area > 0.08:
+            idx = _iou_clash((x, y, w, h),
+                             [c['box'] for c in clusters])
+            if idx < 0:
+                clusters.append({'box': (x, y, w, h), 'score': score,
+                                 'name': name, 'alts': []})
+            elif len(clusters[idx]['alts']) < 4:
+                alt = (x, y, w, h)
+                if alt != clusters[idx]['box'] \
+                        and alt not in clusters[idx]['alts']:
+                    clusters[idx]['alts'].append(alt)
+        area = sum(c['box'][2] * c['box'][3]
+                   for c in clusters) / page_area
+        if len(clusters) > max_hits or area > 0.08:
             _logger.warning(
                 "Logo template %s looks pathological on this page "
                 "(%d boxes, %.1f%% of page) — matches DROPPED. Curate "
                 "the template set: only actual marks belong in %s.",
-                name, len(deduped), area * 100,
+                name, len(clusters), area * 100,
                 os.environ.get('PROJECT_P_LOGO_TEMPLATES', ''))
             continue
-        survivors.extend(scored)
+        survivors.extend(clusters)
 
-    # Stage 2: cross-template merge in score order. Rejected candidates
-    # are skipped WITHOUT entering `kept`, so they cannot suppress a
-    # genuine lower-scored catch of the same region.
-    survivors.sort(key=lambda b: -b[4])
+    # Stage 2: cross-template merge in score order. A rejected
+    # candidate is skipped WITHOUT entering `kept` (it cannot suppress
+    # a genuine lower-scored catch), and its own cluster's alternates
+    # are tried in order before the region is given up.
+    survivors.sort(key=lambda c: -c['score'])
     kept: List[Tuple[int, int, int, int]] = []
-    for x, y, w, h, score, name in survivors:
-        if _iou_clash((x, y, w, h), kept):
+    for cluster in survivors:
+        if _iou_clash(cluster['box'], kept) >= 0:
             continue
-        if reject is not None and reject(x, y, w, h):
-            _logger.debug("logo candidate %s score=%.3f box=(%d,%d,%d,%d)"
-                          " rejected by caller", name, score, x, y, w, h)
-            continue
-        _logger.debug("logo candidate %s score=%.3f box=(%d,%d,%d,%d)",
-                      name, score, x, y, w, h)
-        kept.append((x, y, w, h))
+        for cand in [cluster['box']] + cluster['alts']:
+            if _iou_clash(cand, kept) >= 0:
+                break  # region already covered by a kept box
+            x, y, w, h = cand
+            if reject is not None and reject(x, y, w, h):
+                _logger.debug(
+                    "logo candidate %s score=%.3f box=(%d,%d,%d,%d) "
+                    "rejected by caller — trying alternates",
+                    cluster['name'], cluster['score'], x, y, w, h)
+                continue
+            _logger.debug("logo candidate %s score=%.3f "
+                          "box=(%d,%d,%d,%d)", cluster['name'],
+                          cluster['score'], x, y, w, h)
+            kept.append(cand)
+            break
     return kept

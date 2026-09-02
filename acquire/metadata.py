@@ -288,9 +288,14 @@ class ImageOCR:
                             scores.append(float(det[2]) * 100.0)
                         elif len(det) >= 2:
                             words.append(str(det[1]))
-                    text = ' '.join(words)
-                    conf = (sum(scores) / len(scores)) if scores else None
-                    return text, conf
+                    if words:
+                        text = ' '.join(words)
+                        conf = (sum(scores) / len(scores)) if scores \
+                            else None
+                        return text, conf
+                    # RapidOCR read NOTHING — fall through to tesseract
+                    # rather than reporting 'unreadable' from one
+                    # backend's blind spot.
                 except Exception as e:
                     _logger.debug("RapidOCR confidence read failed: %s", e)
         if HAS_TESSERACT:
@@ -343,6 +348,8 @@ class ImageOCR:
             # as sparse text; words whose center no existing box covers
             # are merged in under synthetic line keys.
             try:
+                if _os.environ.get('PROJECT_P_OCR_SPARSE', '1') != '1':
+                    return lines
                 sparse = self._tess_data(image, config='--psm 11')
                 for i, word in enumerate(sparse['text']):
                     if not word.strip():

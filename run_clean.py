@@ -46,6 +46,42 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Entity types the pipeline knows. Defined here (not imported from
+# clean.anonymizer) because --targets must be validated BEFORE the env
+# wiring that the clean package reads at import/instantiation time.
+KNOWN_ENTITY_TYPES = frozenset({
+    'person', 'company', 'location', 'email', 'phone', 'address',
+    'sensitive_doc', 'account', 'product', 'filename', 'directory',
+})
+
+
+def parse_targets(raw: str) -> str:
+    """Expand and validate a --targets value.
+
+    'names' expands per-TOKEN to person,company,email (whole-string-only
+    expansion silently turned '--targets names,phone' into the literal
+    type 'names' — dropping every person/company/email from the policy).
+    Unknown tokens raise ValueError instead of silently never
+    registering ('--targets compnay' must fail fast, not ship originals
+    across a whole drive sweep).
+    """
+    tokens = [t.strip().lower() for t in raw.split(',') if t.strip()]
+    if not tokens:
+        raise ValueError('empty --targets')
+    out = []
+    for token in tokens:
+        if token in ('all', '*'):
+            return 'all'
+        if token == 'names':
+            out.extend(('person', 'company', 'email'))
+        elif token in KNOWN_ENTITY_TYPES:
+            out.append(token)
+        else:
+            raise ValueError(
+                f'unknown entity type {token!r} in --targets; valid: '
+                f"names, all, {', '.join(sorted(KNOWN_ENTITY_TYPES))}")
+    return ','.join(dict.fromkeys(out))
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -130,14 +166,22 @@ def main() -> int:
                         help='Served model name (default qwen27b)')
     parser.add_argument('--llm-key', default=None,
                         help='API key for the endpoint (default not-needed)')
+    parser.add_argument('--clobber', action='store_true',
+                        help='Delete an existing non-empty staging dir '
+                             'before cleaning. Without it, a non-empty '
+                             'staging is refused: mixing runs left '
+                             'stale FILE_nnn outputs (absent from '
+                             'path_manifest.json) in a live deliverable.')
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
     # Environment wiring BEFORE importing the pipeline (modules read these
     # at import/instantiation time)
-    targets = args.targets.strip().lower()
-    if targets == 'names':
-        targets = 'person,company,email'
+    try:
+        targets = parse_targets(args.targets)
+    except ValueError as e:
+        print(f'ERROR: {e}', file=sys.stderr)
+        return 2
     os.environ['PROJECT_P_ENTITY_TYPES'] = targets
     os.environ['PROJECT_P_LLM_VERIFY'] = args.llm
     os.environ['PROJECT_P_OPAQUE_BINARY'] = args.opaque_binary
@@ -172,6 +216,19 @@ def main() -> int:
     project = args.project or source.name
     staging = Path(args.staging) if args.staging else (
         Path('/tmp/clean') / project)
+    if staging.is_dir() and any(staging.iterdir()):
+        if args.clobber:
+            import shutil
+            shutil.rmtree(staging)
+            print(f'Cleared existing staging: {staging}')
+        else:
+            print(f'ERROR: staging dir is not empty: {staging}\n'
+                  f'A second run into a live deliverable mixes stale '
+                  f'FILE_nnn outputs into it (seen live: duplicates '
+                  f'absent from path_manifest.json). Re-run with '
+                  f'--clobber to replace it, or pick a fresh --staging.',
+                  file=sys.stderr)
+            return 2
 
     # A leftover staging tree mixes runs: the HoleSaw corpus shipped
     # stale FILE_nnn outputs from an earlier run under SHIFTED numbers

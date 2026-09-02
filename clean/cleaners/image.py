@@ -143,16 +143,42 @@ def _erase_mark_preserving_lines(work, draw, box) -> None:
             ink = ~ink
         inku = ink.astype(np.uint8)
 
-        klen_h = max(15, int(bw_ * 0.85))
-        klen_v = max(15, int(bh_ * 0.85))
-        klen_d = max(15, int(min(bw_, bh_) * 0.85))
+        # Preservation floor of 60px: in a tight logo box the mark's OWN
+        # strokes approach the box span (an 'M' stem in a 45px-tall
+        # crop), and "preserving" those would leak the mark. A severed
+        # line shorter than ~60px is visually negligible anyway.
+        klen_h = max(60, int(bw_ * 0.85))
+        klen_v = max(60, int(bh_ * 0.85))
+        klen_d = max(60, int(min(bw_, bh_) * 0.85))
         preserve = np.zeros_like(inku)
         kern_h = np.ones((1, klen_h), np.uint8)
         kern_v = np.ones((klen_v, 1), np.uint8)
         kern_d1 = np.eye(klen_d, dtype=np.uint8)
         kern_d2 = np.flipud(kern_d1)
         for kern in (kern_h, kern_v, kern_d1, kern_d2):
-            preserve |= cv2.morphologyEx(inku, cv2.MORPH_OPEN, kern)
+            if max(kern.shape) <= max(inku.shape):
+                preserve |= cv2.morphologyEx(inku, cv2.MORPH_OPEN, kern)
+        # The openings only see 0/45/90/135-degree lines; a SKEWED
+        # scan's contour (matched at ±5 degrees for exactly this
+        # reason) crosses at other angles and would be severed.
+        # HoughLinesP is angle-agnostic: preserve any straight segment
+        # spanning ~the box in its dominant axis. Logo strokes,
+        # including the bolt zigzag, never fit one straight segment
+        # that long.
+        lines = cv2.HoughLinesP(
+            inku * 255, 1, np.pi / 360.0, threshold=40,
+            minLineLength=int(max(50, 0.8 * min(bw_, bh_))),
+            maxLineGap=6)
+        if lines is not None:
+            line_mask = np.zeros_like(inku)
+            # OpenCV returns (N,1,4) or (N,4) depending on version.
+            for (lx1, ly1, lx2, ly2) in np.asarray(lines).reshape(-1, 4):
+                if (abs(int(lx2) - int(lx1)) >= max(60, 0.85 * bw_)
+                        or abs(int(ly2) - int(ly1))
+                        >= max(60, 0.85 * bh_)):
+                    cv2.line(line_mask, (int(lx1), int(ly1)),
+                             (int(lx2), int(ly2)), 1, 5)
+            preserve |= line_mask
         # A hair of slack so anti-aliased line edges stay with the line.
         preserve = cv2.dilate(preserve, np.ones((3, 3), np.uint8))
 

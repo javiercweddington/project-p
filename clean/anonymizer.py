@@ -151,9 +151,43 @@ def _person_name_variants(name: str) -> List[str]:
         first, last = parts
     if not (_NAME_TOKEN_RE.match(first) and _NAME_TOKEN_RE.match(last)):
         return []
-    return [f'{first} {last}', f'{last}, {first}',
-            f'{first[0]}. {last}', f'{first[0]}.{last}',
-            f'{first[0]}{last}']
+    variants = [f'{first} {last}', f'{last}, {first}',
+                f'{first[0]}. {last}', f'{first[0]}.{last}']
+    # Glued initial+surname ('BWard') covers OCR dot-drops ('B.WARD'
+    # reads as 'BWARD') and username shapes — but initial+surname is
+    # often an ordinary WORD ('Carol Ash' -> 'cash', 'Brian Rand' ->
+    # 'brand'), and a word-variant would replace that word everywhere
+    # in prose (live-reproduced in review). Register the glued form
+    # only when it is not in the system dictionary; with no dictionary
+    # available, skip it — content corruption outranks the residual.
+    glued = f'{first[0]}{last}'
+    if not _is_dictionary_word(glued):
+        variants.append(glued)
+    return variants
+
+
+_DICT_WORDS: Optional[frozenset] = None
+
+
+def _is_dictionary_word(token: str) -> bool:
+    """True when token is an ordinary English word (or no dict exists —
+    fail toward NOT minting risky variants)."""
+    global _DICT_WORDS
+    if _DICT_WORDS is None:
+        words: Set[str] = set()
+        for path in ('/usr/share/dict/words',
+                     '/usr/share/dict/american-english'):
+            try:
+                with open(path, encoding='utf-8', errors='ignore') as fh:
+                    words = {w.strip().lower() for w in fh
+                             if 2 < len(w.strip()) <= 12}
+                break
+            except OSError:
+                continue
+        _DICT_WORDS = frozenset(words)
+    if not _DICT_WORDS:
+        return True
+    return token.lower() in _DICT_WORDS
 
 
 @dataclass
@@ -444,11 +478,17 @@ class EntityMapper:
         # replace_in_text / replace_spans fire it per actual replacement.
 
         if entity_type == 'person' and derive_variants:
+            # Variants inherit the parent's seed-ness: under a custom
+            # --targets that excludes 'person', a SEEDED person's
+            # variants must not be demoted by the targeting gate
+            # ('seed_variant' passes the startswith('seed') predicate).
+            variant_src = ('seed_variant' if (source or '').startswith(
+                'seed') else 'name_variant')
             for variant in _person_name_variants(value):
                 if variant.strip().lower() != key:
                     self.get_or_create(
                         'person', variant,
-                        source=f'name_variant:{value.strip()}',
+                        source=f'{variant_src}:{value.strip()}',
                         derive_variants=False)
 
         return placeholder

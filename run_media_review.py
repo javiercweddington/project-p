@@ -398,6 +398,43 @@ def apply_decisions(source: Path, review: dict, out_dir: Path) -> dict:
     return stats
 
 
+def export_logo_templates(review: dict, audit_dir: Path):
+    """Export 'logo'-decision cluster thumbnails as matcher templates.
+
+    ONLY explicit 'logo' decisions become templates. The old behavior
+    (every redact thumbnail auto-exported) enrolled product photos and
+    whole drawing sheets: matching went ~40x slower and false boxes
+    covered 16% of a live drawing page. Thumbnails are flattened onto
+    WHITE — cv2 loads grayscale without alpha, so a transparent crop
+    would otherwise be matched on art the reviewer never saw.
+
+    Returns (count_exported, templates_dir).
+    """
+    tdir = audit_dir / 'logo_templates'
+    exported = 0
+    for entry in review.get('clusters', []):
+        thumb = entry.get('thumbnail')
+        if entry.get('action') == 'logo' and thumb:
+            src_thumb = audit_dir / thumb
+            if src_thumb.is_file():
+                tdir.mkdir(parents=True, exist_ok=True)
+                dest = (tdir / src_thumb.name).with_suffix('.png')
+                try:
+                    from PIL import Image as _Image
+                    with _Image.open(src_thumb) as img:
+                        if 'A' in img.getbands():
+                            base = _Image.new('RGBA', img.size,
+                                              (255, 255, 255, 255))
+                            base.alpha_composite(img.convert('RGBA'))
+                            base.convert('RGB').save(dest)
+                        else:
+                            img.convert('RGB').save(dest)
+                except Exception:
+                    shutil.copy2(src_thumb, tdir / src_thumb.name)
+                exported += 1
+    return exported, tdir
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description='Inventory and triage embedded media before cleaning.')
@@ -408,6 +445,11 @@ def main() -> int:
                              '(default /tmp/clean_audit/<project>)')
     parser.add_argument('--apply', action='store_true',
                         help='Rewrite containers using --review-file')
+    parser.add_argument('--export-templates', action='store_true',
+                        help="Export 'logo' decisions as template crops "
+                             'WITHOUT rewriting the corpus — enrollment '
+                             'for drive-scale runs where run_batch.py '
+                             'applies the media decisions per project.')
     parser.add_argument('--review-file', default=None)
     parser.add_argument('--output', default=None,
                         help='Rewritten corpus (default <source>_media_clean)')
@@ -451,44 +493,14 @@ def main() -> int:
         serve(path, path.parent, port=args.port, host=args.host)
         return 0
 
-    if args.apply:
+    if args.apply or args.export_templates:
         path = Path(args.review_file) if args.review_file else review_path
         if not path.is_file():
             print(f'ERROR: review file not found: {path}', file=sys.stderr)
             return 2
         with open(path) as handle:
             review = json.load(handle)
-        # ONLY explicit 'logo' decisions become templates. The old
-        # behavior (every redact thumbnail auto-exported) enrolled
-        # product photos and whole drawing sheets: matching went ~40x
-        # slower and false boxes covered 16% of a live drawing page.
-        # Thumbnails are flattened onto WHITE at export — cv2 loads
-        # grayscale without alpha, so a transparent-background crop
-        # would otherwise be matched on art the reviewer never saw.
-        tdir = path.parent / 'logo_templates'
-        exported = 0
-        for entry in review.get('clusters', []):
-            thumb = entry.get('thumbnail')
-            if entry.get('action') == 'logo' and thumb:
-                src_thumb = path.parent / thumb
-                if src_thumb.is_file():
-                    tdir.mkdir(parents=True, exist_ok=True)
-                    dest = (tdir / src_thumb.name).with_suffix('.png')
-                    try:
-                        from PIL import Image as _Image
-                        with _Image.open(src_thumb) as img:
-                            if 'A' in img.getbands():
-                                base = _Image.new(
-                                    'RGBA', img.size,
-                                    (255, 255, 255, 255))
-                                base.alpha_composite(
-                                    img.convert('RGBA'))
-                                base.convert('RGB').save(dest)
-                            else:
-                                img.convert('RGB').save(dest)
-                    except Exception:
-                        shutil.copy2(src_thumb, tdir / src_thumb.name)
-                    exported += 1
+        exported, tdir = export_logo_templates(review, path.parent)
         if exported:
             print(f'Exported {exported} logo enrollment(s) as '
                   f'templates: {tdir}\n'
@@ -496,6 +508,12 @@ def main() -> int:
                   f'the pixel belt hunts each mark corpus-wide (any '
                   f'color/scale, mild warp/skew) and blanks it to the '
                   f'local background.')
+        if args.export_templates and not args.apply:
+            if not exported:
+                print("No 'logo' decisions in the review file — nothing "
+                      'to export. Mark logo clusters with the l key in '
+                      '--serve first.')
+            return 0
         out_dir = Path(args.output) if args.output else Path(
             str(source) + '_media_clean')
         stats = apply_decisions(source, review, out_dir)

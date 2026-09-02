@@ -670,7 +670,13 @@ class ReScanner:
 
         hits = []
         for entity in entities:
-            if self.mapper.has_entity(entity.value):
+            mapping = self.mapper.get_mapping(entity.value)
+            # filename/directory mappings are audit-only pseudonyms —
+            # their originals ('Arbor', 'Collar') legitimately remain in
+            # cleaned CONTENT (LeakageChecker/replace_in_text skip them
+            # for the same reason); only text-replaced types may fail.
+            if (mapping is not None
+                    and mapping.entity_type not in NON_TEXT_ENTITY_TYPES):
                 # Known entity that survived - leakage (FAILS the run)
                 hits.append(LeakageHit(
                     file_path=source,
@@ -703,7 +709,11 @@ class ReScanner:
 
         hits = []
         for entity in entities:
-            if self.mapper.has_entity(entity.value):
+            mapping = self.mapper.get_mapping(entity.value)
+            # See _rescan_with_gliner: filename/directory pseudonym
+            # sources legitimately remain in cleaned content.
+            if (mapping is not None
+                    and mapping.entity_type not in NON_TEXT_ENTITY_TYPES):
                 hits.append(LeakageHit(
                     file_path=source,
                     entity_type=entity.entity_type,
