@@ -65,6 +65,16 @@ def main() -> int:
                              'review_candidates.json a previous run wrote, '
                              'after human editing, or any JSON with an '
                              '"entities" list of {"type","value"} objects)')
+    parser.add_argument('--targets', default='names', metavar='TYPES',
+                        help="What detectors may auto-register (default: "
+                             "'names' = person,company,email). Pass a "
+                             "comma list of entity types, or 'all' for "
+                             "legacy behavior. Everything OUTSIDE the "
+                             "policy ships untouched and lands in "
+                             "review_candidates.json as a demoted "
+                             "suggestion; human seeds (--seed/--seed-file) "
+                             "are always honored at any type. Logos are "
+                             "handled separately by --logo-templates.")
     parser.add_argument('--mode', choices=['onepass', 'iterative'],
                         default='onepass',
                         help='onepass (default): discover up front, clean '
@@ -125,6 +135,10 @@ def main() -> int:
 
     # Environment wiring BEFORE importing the pipeline (modules read these
     # at import/instantiation time)
+    targets = args.targets.strip().lower()
+    if targets == 'names':
+        targets = 'person,company,email'
+    os.environ['PROJECT_P_ENTITY_TYPES'] = targets
     os.environ['PROJECT_P_LLM_VERIFY'] = args.llm
     os.environ['PROJECT_P_OPAQUE_BINARY'] = args.opaque_binary
     os.environ['PROJECT_P_COMB'] = '1' if args.comb == 'on' else '0'
@@ -159,6 +173,18 @@ def main() -> int:
     staging = Path(args.staging) if args.staging else (
         Path('/tmp/clean') / project)
 
+    # A leftover staging tree mixes runs: the HoleSaw corpus shipped
+    # stale FILE_nnn outputs from an earlier run under SHIFTED numbers
+    # absent from path_manifest.json (two pseudonyms for one original
+    # breaks unlinkability). Refuse rather than merge.
+    if staging.is_dir() and any(staging.iterdir()):
+        print(f'ERROR: staging directory is not empty: {staging}\n'
+              f'  Outputs from a previous run would mix with this one '
+              f'(stale FILE_nnn pseudonyms, incomplete manifest). '
+              f'Delete it or pass a fresh --staging path.',
+              file=sys.stderr)
+        return 2
+
     llm = LocalLLM()
     print(f'LLM endpoint: {llm.base_url} (model {llm.model}) — '
           f'{"reachable" if llm.available() else "NOT reachable"} '
@@ -192,7 +218,9 @@ def main() -> int:
         entries = payload.get('entities', payload) if isinstance(
             payload, dict) else payload
         from clean.llm_detect import _junk_shaped, _stoplisted
-        seeded = skipped = 0
+        from clean.anonymizer import targeted_types
+        allowed_types = targeted_types()
+        seeded = skipped = skipped_policy = 0
         for entry in entries:
             entity_type = str(entry.get('type', '')).strip()
             value = str(entry.get('value', '')).strip()
@@ -204,12 +232,24 @@ def main() -> int:
             if _stoplisted(value) or _junk_shaped(value, entity_type):
                 skipped += 1
                 continue
+            # Same trap, policy edition: an old review file re-imports
+            # 74 doc-ref codes as "human seeds" and the targeting gate
+            # can't touch them (seeds win by design). Out-of-policy
+            # types need the explicit spellings: --seed TYPE=VALUE, or
+            # --targets to widen the policy.
+            if (allowed_types is not None
+                    and entity_type not in allowed_types):
+                skipped_policy += 1
+                continue
             mapper.get_or_create(entity_type, value,
                                  source=f'seed_file:{seed_path.name}')
             seeded += 1
         print(f'Seeded {seeded} entities from {seed_path}'
               + (f' ({skipped} junk/stoplisted entries skipped)'
-                 if skipped else ''))
+                 if skipped else '')
+              + (f' ({skipped_policy} out-of-policy entries skipped — '
+                 f'use --seed TYPE=VALUE or --targets to force)'
+                 if skipped_policy else ''))
 
     pipeline = CleanPipeline(
         project_name=project,
@@ -220,6 +260,11 @@ def main() -> int:
         flat_output=(args.layout == 'flat'),
     )
     print(f'Mode: {args.mode} (layout: {args.layout})')
+    print(f'Targets: {targets} — detectors auto-register ONLY these '
+          f'types; all else ships untouched (demoted to review file). '
+          f'Human seeds exempt.'
+          if targets not in ('all', '*') else
+          'Targets: all (legacy — every detector class auto-registers)')
     result = pipeline.run()
 
     print()
@@ -241,6 +286,10 @@ def main() -> int:
         # GLiNER hits below the auto-register threshold: human triage —
         # move real ones into 'entities' and re-run with --seed-file.
         'suggested_entities': getattr(pipeline, 'suggested_entities', []),
+        # Detector findings the targeting policy refused (doc codes,
+        # phones, addresses, products under names-only): they SHIPPED
+        # UNTOUCHED. Promote real targets to seeds and re-run.
+        'demoted_entities': mapper.demoted_suggestions,
         'entities': [
             {
                 'type': m.entity_type,

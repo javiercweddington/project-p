@@ -481,6 +481,8 @@ def _detect_chunk(llm: LocalLLM, chunk: str) -> List[Dict[str, str]]:
 
 def _filter_parsed(parsed_lists) -> List[Tuple[str, str]]:
     """Merge parsed chunk replies into deduped (mapper_type, value) pairs."""
+    from .anonymizer import targeted_types
+    allowed = targeted_types()
     found: List[Tuple[str, str]] = []
     seen = set()
     for parsed in parsed_lists:
@@ -489,6 +491,12 @@ def _filter_parsed(parsed_lists) -> List[Tuple[str, str]]:
             value = str(entity.get('value', '')).strip()
             mapper_type = _LLM_TYPE_MAP.get(raw_type)
             if mapper_type is None:
+                continue
+            # Targeting policy: this single gate covers the LLM detector,
+            # the sample audit AND the cleanliness judge — a names-only
+            # run must neither register nor FAIL over llm_address /
+            # llm_product / llm_phone content that ships by design.
+            if allowed is not None and mapper_type not in allowed:
                 continue
             # CJK names are routinely 2 characters (朱生); Latin values
             # shorter than 3 are too ambiguous to register.

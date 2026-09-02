@@ -78,6 +78,137 @@ except ImportError:
     HAS_PIL = False
 
 
+def _shape_rules_enabled() -> bool:
+    """Mapper-independent pixel shape rules (identifier-shaped tokens,
+    ALL-CAPS runs). DEFAULT OFF: on engineering drawings the identifier
+    rule blacked out dimension callouts, tolerance tables, dates, doc
+    refs and hardness specs wholesale (every TwistRelease sheet in the
+    HoleSaw audit). Under the names-only targeting policy, pixels are
+    redacted from mapper needles + NER + logo templates; enable the
+    shape net explicitly for finance-style corpora where digit-heavy
+    tokens really are account/transaction identifiers."""
+    return os.environ.get('PROJECT_P_PIXEL_SHAPE_RULES', '0') == '1'
+
+
+def _logo_pad_fraction() -> float:
+    """Padding around a matched logo box, as a fraction of its size.
+
+    Small on purpose: the template box already covers the artwork
+    extent, and a generous pad wipes neighboring part-contour lines —
+    on a live collar view the fill severed the drawn silhouette so one
+    part read as two objects."""
+    try:
+        return float(os.environ.get('PROJECT_P_LOGO_PAD', '0.05'))
+    except ValueError:
+        return 0.05
+
+
+def _erase_mark_preserving_lines(work, draw, box) -> None:
+    """Erase the MARK inside `box` while preserving geometry that
+    passes through it.
+
+    A flat rectangle fill severs part-contour lines crossing the
+    matched region — live: the fill across a collar view made one drawn
+    part read as two objects. Instead: binarize the box and erase every
+    ink pixel EXCEPT near-full-crossing straight lines (morphological
+    opening in 4 orientations with kernels ~85% of the box span).
+    Part contours cross the whole box and survive; logo strokes —
+    including the bolt's zigzag segments, and even strokes CONNECTED to
+    contour lines (engraved marks touch the silhouette; component
+    logic cannot separate them) — never span the box and are erased.
+    Erased pixels take the local paper color. Any failure falls back to
+    the flat background-fill rectangle; PROJECT_P_LOGO_FILL=box forces
+    the flat fill, =black the legacy censor bar.
+    """
+    if os.environ.get('PROJECT_P_LOGO_FILL', 'background') != 'background':
+        _fill_box_background(work, draw, box)
+        return
+    x0, y0, x1, y1 = (int(v) for v in box)
+    w, h = work.size
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    bw_, bh_ = x1 - x0, y1 - y0
+    if bw_ < 8 or bh_ < 8:
+        return
+    try:
+        import cv2
+        import numpy as np
+        arr = np.asarray(work).copy()
+        crop = arr[y0:y1, x0:x1]
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        _, bwm = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        ink = bwm < 128
+        if ink.mean() > 0.5:
+            ink = ~ink
+        inku = ink.astype(np.uint8)
+
+        klen_h = max(15, int(bw_ * 0.85))
+        klen_v = max(15, int(bh_ * 0.85))
+        klen_d = max(15, int(min(bw_, bh_) * 0.85))
+        preserve = np.zeros_like(inku)
+        kern_h = np.ones((1, klen_h), np.uint8)
+        kern_v = np.ones((klen_v, 1), np.uint8)
+        kern_d1 = np.eye(klen_d, dtype=np.uint8)
+        kern_d2 = np.flipud(kern_d1)
+        for kern in (kern_h, kern_v, kern_d1, kern_d2):
+            preserve |= cv2.morphologyEx(inku, cv2.MORPH_OPEN, kern)
+        # A hair of slack so anti-aliased line edges stay with the line.
+        preserve = cv2.dilate(preserve, np.ones((3, 3), np.uint8))
+
+        erase = ink & (preserve == 0)
+        if not erase.any():
+            return
+        paper = crop[~ink]
+        fill = (np.median(paper, axis=0).astype(np.uint8)
+                if paper.size else np.array([255, 255, 255], np.uint8))
+        # Take anti-aliased stroke fringes with the strokes.
+        erase = cv2.dilate(erase.astype(np.uint8),
+                           np.ones((3, 3), np.uint8), iterations=2) > 0
+        erase &= (preserve == 0)
+        crop[erase] = fill
+        from PIL import Image as _Image
+        work.paste(_Image.fromarray(crop), (x0, y0))
+    except Exception as e:
+        _logger.debug("Line-preserving logo erase failed (%s); flat "
+                      "background fill instead.", e)
+        _fill_box_background(work, draw, box)
+
+
+def _fill_box_background(work, draw, box) -> None:
+    """Paint `box` with the LOCAL background color (median of a border
+    ring sampled around it), so the blank reads as empty paper rather
+    than a censor bar. Falls back to black when sampling fails
+    (numpy missing, degenerate box) and to plain black fill when
+    PROJECT_P_LOGO_FILL=black.
+
+    box: (x0, y0, x1, y1), may exceed image bounds (clamped here).
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    w, h = work.size
+    x0c, y0c = max(0, x0), max(0, y0)
+    x1c, y1c = min(w, x1), min(h, y1)
+    if x1c <= x0c or y1c <= y0c:
+        return
+    fill = (0, 0, 0)
+    if os.environ.get('PROJECT_P_LOGO_FILL', 'background') != 'black':
+        try:
+            import numpy as np
+            arr = np.asarray(work)
+            ring = max(4, (x1c - x0c) // 10, (y1c - y0c) // 10)
+            rx0, ry0 = max(0, x0c - ring), max(0, y0c - ring)
+            rx1, ry1 = min(w, x1c + ring), min(h, y1c + ring)
+            outer = arr[ry0:ry1, rx0:rx1].astype('float32')
+            mask = np.ones(outer.shape[:2], dtype=bool)
+            mask[(y0c - ry0):(y1c - ry0), (x0c - rx0):(x1c - rx0)] = False
+            samples = outer[mask]
+            if samples.size:
+                fill = tuple(int(v) for v in np.median(samples, axis=0))
+        except Exception:
+            fill = (0, 0, 0)
+    draw.rectangle([x0c, y0c, x1c - 1, y1c - 1], fill=fill)
+
+
 class ImageCleaner:
     """Clean image files by removing EXIF and other metadata.
 
@@ -309,6 +440,86 @@ class ImageCleaner:
             return None
         return self.redact_pil(work, source_name=str(input_path))
 
+    def _logo_box_reject_reason(self, work, x: int, y: int,
+                                w: int, h: int):
+        """Adjudicate one template-match box; None means paint it.
+
+        Template correlation cannot separate true marks from two FP
+        classes by score alone (live bands overlap: warped/etched marks
+        0.66-0.70 vs 'NUMBER' labels 0.66-0.70 and shaded spheres
+        0.71-0.74). Two discriminators do, both calibrated on the
+        HoleSaw corpus:
+
+        1. COMPACT BLOB: largest binarized component's circularity
+           (4*pi*A/P^2). Stroke art maxes at 0.28; spheres/solid shapes
+           start at 0.52. Cutoff 0.40.
+        2. MACHINE-READABLE TEXT: a logo is art OCR cannot read (every
+           true mark read <=3 chars; 'NUMBER' reads perfectly). Text
+           regions are belt 2's jurisdiction — EXCEPT when the text is
+           itself a mapper needle (a legible 'Milwaukee' script must
+           keep the LOGO box so the whole artwork incl. the bolt
+           underline is filled, not just the word box).
+        """
+        left, top = max(0, int(x)), max(0, int(y))
+        right = min(work.size[0], int(x + w))
+        bottom = min(work.size[1], int(y + h))
+        if right - left < 8 or bottom - top < 8:
+            return 'degenerate box'
+        crop = work.crop((left, top, right, bottom))
+
+        try:
+            import cv2
+            import numpy as np
+            gray = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+            _, bw = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            ink = bw < 128
+            if ink.mean() > 0.5:
+                ink = ~ink
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(
+                ink.astype(np.uint8), 8)
+            if n > 1:
+                areas = stats[1:, cv2.CC_STAT_AREA]
+                big = 1 + int(np.argmax(areas))
+                mask = (labels == big).astype(np.uint8)
+                cnts, _ = cv2.findContours(
+                    mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+                if cnts:
+                    a = cv2.contourArea(cnts[0])
+                    p = cv2.arcLength(cnts[0], True)
+                    if p > 0 and (4 * 3.14159 * a / (p * p)) > 0.40:
+                        return 'compact blob, not stroke art'
+        except Exception:
+            pass
+
+        try:
+            if self.image_ocr and self.image_ocr.available:
+                probe = crop
+                if min(probe.size) < 60:
+                    probe = probe.resize((probe.width * 2,
+                                          probe.height * 2))
+                text, conf = self.image_ocr.ocr_text_confidence(probe)
+                alnum = sum(ch.isalnum() for ch in text)
+                # Reject only CONFIDENT text: printed labels read at
+                # 38-96 conf, stylized script half-reads at 0-33
+                # ('Milas'/'ites'/'Miwon' on live Milwaukee marks).
+                # Unknown confidence -> paint (historical behavior;
+                # a shipped logo outranks a painted label).
+                if alnum >= 5 and conf is not None and conf >= 35:
+                    lowered = text.lower()
+                    from ..anonymizer import NON_TEXT_ENTITY_TYPES
+                    for mapping in self.mapper.mappings:
+                        if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
+                            continue
+                        needle = mapping.original.strip().lower()
+                        if len(needle) >= 3 and needle in lowered:
+                            return None  # legible name -> still a logo
+                    return (f'machine-readable text {text[:40]!r} '
+                            f'(conf {conf:.0f})')
+        except Exception:
+            pass
+        return None
+
     def redact_pil(self, work, source_name: str = '<image>'):
         """OCR a PIL RGB image, black out entity text at word level, verify.
 
@@ -401,10 +612,20 @@ class ImageCleaner:
                                   for _key, words in line_items]
                     per_line = _extract_entities_with_gliner_batch(
                         line_texts, source_name)
+                    from ..anonymizer import targeted_types
+                    _allowed_types = targeted_types()
                     for (key, _words), line_text, ents in zip(
                             line_items, line_texts, per_line):
                         spans = []
                         for ent in ents:
+                            # Targeting policy: pixel spans have no
+                            # mapper stopover, so gate them here — the
+                            # untyped loop was blacking address/date/
+                            # money spans on names-only runs.
+                            if (_allowed_types is not None
+                                    and ent.entity_type
+                                    not in _allowed_types):
+                                continue
                             for m2 in re.finditer(
                                     re.escape(ent.value), line_text, re.I):
                                 spans.append((m2.start(), m2.end()))
@@ -419,17 +640,34 @@ class ImageCleaner:
 
             # Belt 0: logo template matching — the leak class OCR can
             # never see (vector logo art has no text and no embedded
-            # image part). Templates come from the media review's
-            # 'redact' decisions plus any crops dropped into
-            # PROJECT_P_LOGO_TEMPLATES.
+            # image part). Templates come from the media review's LOGO
+            # enrollments plus any crops dropped into
+            # PROJECT_P_LOGO_TEMPLATES. Boxes are padded (matches sit
+            # slightly inside the artwork: red bolt tails survived
+            # unpadded boxes on 8 of 9 HoleSaw sheets) and filled with
+            # the LOCAL BACKGROUND color, not black — the blank should
+            # read as empty paper, not as a censor bar.
             try:
                 from ..logo_match import env_templates, find_logo_boxes
                 logo_templates = env_templates()
                 if logo_templates:
+                    def _reject_box(rx, ry, rw, rh):
+                        reason = self._logo_box_reject_reason(
+                            work, rx, ry, rw, rh)
+                        if reason:
+                            _logger.info(
+                                "Logo box (%d,%d,%dx%d) in %s rejected:"
+                                " %s", rx, ry, rw, rh, source_name,
+                                reason)
+                        return reason is not None
+
                     for (lx, ly, lw, lh) in find_logo_boxes(
-                            work, logo_templates):
-                        draw.rectangle([lx, ly, lx + lw, ly + lh],
-                                       fill=(0, 0, 0))
+                            work, logo_templates, reject=_reject_box):
+                        px = max(2, int(lw * _logo_pad_fraction()))
+                        py = max(2, int(lh * _logo_pad_fraction()))
+                        _erase_mark_preserving_lines(
+                            work, draw,
+                            (lx - px, ly - py, lx + lw + px, ly + lh + py))
                         had_redactions = True
                         _logger.info(
                             "Logo template match covered %dx%d region "
@@ -453,8 +691,10 @@ class ImageCleaner:
             caps_ratio = (
                 sum(1 for t in alpha_tokens if t == t.upper())
                 / len(alpha_tokens)) if alpha_tokens else 0.0
-            caps_rules_on = caps_ratio <= _CAPS_STYLE_MAX_RATIO
-            if not caps_rules_on:
+            shape_rules = _shape_rules_enabled()
+            caps_rules_on = (shape_rules
+                             and caps_ratio <= _CAPS_STYLE_MAX_RATIO)
+            if shape_rules and not caps_rules_on:
                 _logger.info(
                     "Caps-styled page (%d%% all-caps tokens): ALL-CAPS "
                     "shape rules off for %s",
@@ -474,7 +714,7 @@ class ImageCleaner:
             for words in lines.values():
                 caps_run = []
                 for word, x, y, w, h in words:
-                    if _is_identifier_token(word):
+                    if shape_rules and _is_identifier_token(word):
                         _redact_box(x, y, w, h)
                     if (caps_rules_on and _is_caps_word(word)
                             and len(re.sub(r'[^A-Za-z]', '', word)) >= 6):

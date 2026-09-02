@@ -271,7 +271,9 @@ def apply_decisions(source: Path, review: dict, out_dir: Path) -> dict:
     unresolved = []
     for entry in review.get('clusters', []):
         action = entry.get('action', 'review')
-        if action == 'redact':
+        # 'logo' = redact here AND enroll as a template (see the export
+        # block in main) so the pixel belt hunts the mark corpus-wide.
+        if action in ('redact', 'logo'):
             for digest in entry.get('sha256', []):
                 flagged[digest] = entry
         elif action != 'keep':
@@ -456,24 +458,44 @@ def main() -> int:
             return 2
         with open(path) as handle:
             review = json.load(handle)
-        # Every redact decision doubles as a LOGO TEMPLATE: export the
-        # cluster thumbnails so run_clean's pixel belt can template-match
-        # the same marks where they appear as VECTOR art (CAD title
-        # blocks) that media removal can't reach. Point run_clean at it
-        # with --logo-templates.
+        # ONLY explicit 'logo' decisions become templates. The old
+        # behavior (every redact thumbnail auto-exported) enrolled
+        # product photos and whole drawing sheets: matching went ~40x
+        # slower and false boxes covered 16% of a live drawing page.
+        # Thumbnails are flattened onto WHITE at export — cv2 loads
+        # grayscale without alpha, so a transparent-background crop
+        # would otherwise be matched on art the reviewer never saw.
         tdir = path.parent / 'logo_templates'
         exported = 0
         for entry in review.get('clusters', []):
             thumb = entry.get('thumbnail')
-            if entry.get('action') == 'redact' and thumb:
+            if entry.get('action') == 'logo' and thumb:
                 src_thumb = path.parent / thumb
                 if src_thumb.is_file():
                     tdir.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_thumb, tdir / src_thumb.name)
+                    dest = (tdir / src_thumb.name).with_suffix('.png')
+                    try:
+                        from PIL import Image as _Image
+                        with _Image.open(src_thumb) as img:
+                            if 'A' in img.getbands():
+                                base = _Image.new(
+                                    'RGBA', img.size,
+                                    (255, 255, 255, 255))
+                                base.alpha_composite(
+                                    img.convert('RGBA'))
+                                base.convert('RGB').save(dest)
+                            else:
+                                img.convert('RGB').save(dest)
+                    except Exception:
+                        shutil.copy2(src_thumb, tdir / src_thumb.name)
                     exported += 1
         if exported:
-            print(f'Exported {exported} redact decision(s) as logo '
-                  f'templates: {tdir}')
+            print(f'Exported {exported} logo enrollment(s) as '
+                  f'templates: {tdir}\n'
+                  f'  Pass --logo-templates {tdir} to run_clean.py — '
+                  f'the pixel belt hunts each mark corpus-wide (any '
+                  f'color/scale, mild warp/skew) and blanks it to the '
+                  f'local background.')
         out_dir = Path(args.output) if args.output else Path(
             str(source) + '_media_clean')
         stats = apply_decisions(source, review, out_dir)

@@ -1034,13 +1034,14 @@ class CleanPipeline:
         if model is None:
             return
 
-        from .anonymizer import PLACEHOLDER_VALUE_RE
+        from .anonymizer import PLACEHOLDER_VALUE_RE, targeted_types
         from .llm_detect import _stoplisted, _junk_shaped
         try:
             auto_threshold = float(
                 os.environ.get('GLINER_AUTO_THRESHOLD', '0.80'))
         except ValueError:
             auto_threshold = 0.80
+        allowed_types = targeted_types()
 
         if progress:
             progress.stage(
@@ -1064,7 +1065,13 @@ class CleanPipeline:
                     continue
                 if PLACEHOLDER_VALUE_RE.fullmatch(value):
                     continue
-                if hit.confidence >= auto_threshold:
+                # Targeting policy: out-of-policy types (phone/address
+                # under names-only) never auto-register — they go to the
+                # review file WITH their confidence so promotion is an
+                # informed human call.
+                if hit.confidence >= auto_threshold and (
+                        allowed_types is None
+                        or hit.entity_type in allowed_types):
                     self.mapper.get_or_create(
                         hit.entity_type, value,
                         source=f'gliner_discovery:{file_path.name}')

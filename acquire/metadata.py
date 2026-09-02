@@ -265,25 +265,99 @@ class ImageOCR:
             _logger.debug("RapidOCR line extraction failed: %s", e)
             return None
 
+    def ocr_text_confidence(self, image):
+        """OCR a small crop into (text, mean_confidence 0-100).
+
+        Used to adjudicate logo-template matches: printed labels read
+        at high confidence ('NUMBER' = 96) while stylized script marks
+        half-read at low confidence ('Milas' = 0, 'ites' = 33 on live
+        Milwaukee marks). Returns ('', None) when no backend can read
+        the crop (None = confidence unknown, not zero).
+        """
+        if self.backend == 'rapidocr':
+            engine = _get_rapidocr()
+            if engine is not None:
+                try:
+                    import numpy as np
+                    result = engine(np.array(image.convert('RGB')))
+                    dets = result[0] if isinstance(result, tuple) else result
+                    words, scores = [], []
+                    for det in dets or []:
+                        if len(det) >= 3:
+                            words.append(str(det[1]))
+                            scores.append(float(det[2]) * 100.0)
+                        elif len(det) >= 2:
+                            words.append(str(det[1]))
+                    text = ' '.join(words)
+                    conf = (sum(scores) / len(scores)) if scores else None
+                    return text, conf
+                except Exception as e:
+                    _logger.debug("RapidOCR confidence read failed: %s", e)
+        if HAS_TESSERACT:
+            try:
+                data = self._tess_data(image, config='--psm 7')
+                words, confs = [], []
+                for t, cf in zip(data['text'], data['conf']):
+                    if not t.strip():
+                        continue
+                    words.append(t)
+                    if (float(cf) >= 0
+                            and sum(ch.isalnum() for ch in t) >= 2):
+                        confs.append(float(cf))
+                conf = (sum(confs) / len(confs)) if confs else None
+                return ' '.join(words), conf
+            except Exception as e:
+                _logger.debug("Tesseract confidence read failed: %s", e)
+        return '', None
+
+    def _tess_data(self, image, config: str = ''):
+        try:
+            return pytesseract.image_to_data(
+                image, lang='eng+chi_sim', config=config,
+                output_type=pytesseract.Output.DICT)
+        except pytesseract.TesseractError:
+            return pytesseract.image_to_data(
+                image, lang='eng', config=config,
+                output_type=pytesseract.Output.DICT)
+
     def _tesseract_lines(self, image) -> Optional[dict]:
         try:
-            try:
-                data = pytesseract.image_to_data(
-                    image, lang='eng+chi_sim',
-                    output_type=pytesseract.Output.DICT)
-            except pytesseract.TesseractError:
-                data = pytesseract.image_to_data(
-                    image, lang='eng',
-                    output_type=pytesseract.Output.DICT)
+            data = self._tess_data(image)
             lines = {}
+            covered = []
             for i, word in enumerate(data['text']):
                 if not word.strip():
                     continue
                 key = (data['block_num'][i], data['par_num'][i],
                        data['line_num'][i])
-                lines.setdefault(key, []).append(
-                    (word, data['left'][i], data['top'][i],
-                     data['width'][i], data['height'][i]))
+                box = (data['left'][i], data['top'][i],
+                       data['width'][i], data['height'][i])
+                lines.setdefault(key, []).append((word,) + box)
+                covered.append(box)
+
+            # Sparse second pass. Full-auto segmentation routinely skips
+            # isolated title-block cells on busy drawing sheets (live:
+            # 'B.WARD' read at conf 91 from a crop of the DWN BY cell
+            # but absent from the page-level pass — the drafter name
+            # then SHIPPED on 2 of 19 sheets). --psm 11 treats the page
+            # as sparse text; words whose center no existing box covers
+            # are merged in under synthetic line keys.
+            try:
+                sparse = self._tess_data(image, config='--psm 11')
+                for i, word in enumerate(sparse['text']):
+                    if not word.strip():
+                        continue
+                    x, y = sparse['left'][i], sparse['top'][i]
+                    w, h = sparse['width'][i], sparse['height'][i]
+                    cx, cy = x + w / 2.0, y + h / 2.0
+                    if any(bx <= cx <= bx + bw and by <= cy <= by + bh
+                           for bx, by, bw, bh in covered):
+                        continue
+                    lines.setdefault((99, 99, i), []).append(
+                        (word, x, y, w, h))
+            except Exception as e:
+                _logger.debug("Sparse OCR pass failed: %s", e)
+
             return lines
         except Exception as e:
             _logger.debug("Tesseract line extraction failed: %s", e)

@@ -30,7 +30,7 @@ PAGE = """<!doctype html>
 <title>Media review &mdash; __PROJECT__</title>
 <style>
 :root{--bg:#faf9f7;--card:#fff;--ink:#1b1b19;--mute:#6b6a66;--line:#dfddd6;
---keep:#1d7a55;--redact:#a32d2d;--warn:#8a5a0b}
+--keep:#1d7a55;--redact:#a32d2d;--logo:#8a5a0b;--warn:#8a5a0b}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);
 font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -53,6 +53,7 @@ padding:13px;display:flex;flex-direction:column;gap:9px}
 .card.sel{border-color:var(--ink);box-shadow:0 0 0 2px rgba(27,27,25,.12)}
 .card.done-keep{border-left:4px solid var(--keep)}
 .card.done-redact{border-left:4px solid var(--redact)}
+.card.done-logo{border-left:4px solid var(--logo)}
 .thumb{height:150px;display:flex;align-items:center;justify-content:center;
 background:repeating-conic-gradient(#eee 0 25%,#fff 0 50%) 0 0/16px 16px;
 border-radius:7px;overflow:hidden}
@@ -73,6 +74,8 @@ background:#f0eee7;color:#55544f}
 color:#fff;border-color:var(--keep)}
 .acts button[aria-pressed=true][data-a=redact]{background:var(--redact);
 color:#fff;border-color:var(--redact)}
+.acts button[aria-pressed=true][data-a=logo]{background:var(--logo);
+color:#fff;border-color:var(--logo)}
 details{font-size:12px;color:var(--mute)}
 details pre{white-space:pre-wrap;word-break:break-all;margin:6px 0 0;
 font:11px ui-monospace,Menlo,monospace}
@@ -122,6 +125,9 @@ function card(c, i) {
         onclick="mark(${i},'keep')">Keep</button>
       <button data-a="redact" aria-pressed="${c.action === 'redact'}"
         onclick="mark(${i},'redact')">Redact</button>
+      <button data-a="logo" aria-pressed="${c.action === 'logo'}"
+        title="Redact AND enroll as a logo template: the pipeline will hunt this mark corpus-wide (any color, scale, mild warp) and blank it to the background"
+        onclick="mark(${i},'logo')">Logo</button>
     </div></div>`;
 }
 
@@ -137,6 +143,7 @@ function paint(i) {
   el.className = 'card' + (i === sel ? ' sel' : '')
     + (c.action === 'keep' ? ' done-keep' : '')
     + (c.action === 'redact' ? ' done-redact' : '')
+    + (c.action === 'logo' ? ' done-logo' : '')
     + (mode === 'review' && c.action !== 'review' ? ' hide' : '');
   el.querySelectorAll('.acts button').forEach(b =>
     b.setAttribute('aria-pressed', b.dataset.a === c.action));
@@ -163,9 +170,10 @@ let dirty = false;
 function status() {
   const left = DATA.clusters.filter(c => c.action === 'review').length;
   const red = DATA.clusters.filter(c => c.action === 'redact').length;
+  const lgo = DATA.clusters.filter(c => c.action === 'logo').length;
   document.getElementById('status').textContent =
-    left ? `${left} undecided \\u00b7 ${red} to redact`
-         : `all decided \\u00b7 ${red} to redact`;
+    left ? `${left} undecided \\u00b7 ${red} to redact \\u00b7 ${lgo} logos`
+         : `all decided \\u00b7 ${red} to redact \\u00b7 ${lgo} logos`;
   document.getElementById('save').disabled = false;
 }
 
@@ -207,6 +215,7 @@ addEventListener('keydown', e => {
     document.getElementById('c' + sel)
       ?.scrollIntoView({block: 'nearest'});
   } else if (e.key === 'r') { mark(sel, 'redact'); }
+  else if (e.key === 'l') { mark(sel, 'logo'); }
   else if (e.key === 'a') { mark(sel, 'keep'); }
   else if (e.key === 's' && (e.metaKey || e.ctrlKey)) {
     e.preventDefault(); save();
@@ -263,7 +272,9 @@ def _write_back(review_path: Path, decisions: list) -> dict:
     with open(review_path) as handle:
         review = json.load(handle)
 
-    allowed = {'keep', 'redact', 'review'}
+    # 'logo' = redact AND enroll as a template the pixel belt hunts
+    # corpus-wide (color/scale/warp variants, blanked to background).
+    allowed = {'keep', 'redact', 'logo', 'review'}
     by_id = {str(d.get('id')): d.get('action') for d in decisions}
     changed = 0
     for entry in review.get('clusters', []):
@@ -352,7 +363,8 @@ def serve(review_path: Path, audit_dir: Path, port: int = 8000,
     print('  forward this port (VS Code PORTS panel, or '
           'ssh -L {p}:localhost:{p} user@host), then open it locally.'
           .format(p=port))
-    print('  keys:   j/k move, a keep, r redact, ctrl-s save. '
+    print('  keys:   j/k move, a keep, r redact, l logo(+enroll), '
+          'ctrl-s save. '
           'Ctrl-C to stop.')
     try:
         server.serve_forever()

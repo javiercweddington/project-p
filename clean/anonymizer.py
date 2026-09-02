@@ -11,6 +11,7 @@ Placeholder format:
 
 from __future__ import annotations
 
+import os
 import re
 import logging
 from typing import Dict, List, Optional, Set, Tuple
@@ -38,6 +39,26 @@ ENTITY_PREFIX_MAP = {
 # replacement. Filename stems can be short/generic ("in", "report"), so
 # letting them into replace_in_text would corrupt ordinary document text.
 NON_TEXT_ENTITY_TYPES = frozenset({'filename', 'directory'})
+
+# ---- Targeting policy -------------------------------------------------
+# PROJECT_P_ENTITY_TYPES limits which entity types DETECTORS may
+# auto-register. Human seeds (--seed / --seed-file) are exempt: whatever
+# a person deliberately enrolls is honored at any type. Everything a
+# detector finds outside the policy is DEMOTED to a review suggestion
+# instead of registered — it ships untouched, and the human can promote
+# it to a seed on the next run. Default is names-only: doc-ref codes,
+# phones, addresses, part numbers, dimensions and products are exactly
+# the blueprint content that must be left alone.
+_TARGETS_ENV = 'PROJECT_P_ENTITY_TYPES'
+_DEFAULT_TARGETS = 'person,company,email'
+
+
+def targeted_types() -> Optional[frozenset]:
+    """Entity types detectors may auto-register; None means all (legacy)."""
+    raw = os.environ.get(_TARGETS_ENV, _DEFAULT_TARGETS).strip().lower()
+    if raw in ('all', '*'):
+        return None
+    return frozenset(t.strip() for t in raw.split(',') if t.strip())
 
 # (original, is_person) -> substring needles for the replacement/verify
 # prefilter (see EntityMapper.prefilter_needles). Module-wide: originals
@@ -110,7 +131,10 @@ def _person_name_variants(name: str) -> List[str]:
     'Ward, Bryan' also appears as 'Bryan Ward', 'B. Ward' and 'B.WARD'
     in drawing title blocks (all four seen live; only the registered
     form was caught). Matching is case-insensitive downstream, so one
-    dotted variant covers the caps form. Only clean two-token names
+    dotted variant covers the caps form. The dotless glued 'BWard' is
+    also derived: OCR drops the dot ('B.WARD' read as 'BWARD' shipped
+    a drafter name on live sheets) and it is the standard Windows
+    username shape (C:\\Users\\bward). Only clean two-token names
     qualify — usernames, digits, initials, CJK and glued XML runs
     derive nothing.
     """
@@ -128,7 +152,8 @@ def _person_name_variants(name: str) -> List[str]:
     if not (_NAME_TOKEN_RE.match(first) and _NAME_TOKEN_RE.match(last)):
         return []
     return [f'{first} {last}', f'{last}, {first}',
-            f'{first[0]}. {last}', f'{first[0]}.{last}']
+            f'{first[0]}. {last}', f'{first[0]}.{last}',
+            f'{first[0]}{last}']
 
 
 @dataclass
@@ -163,11 +188,39 @@ class EntityMapper:
         self._reverse: Dict[str, str] = {}
         # Optional callback: (original, placeholder, source) -> None
         self._tracker_callback = tracker_callback
+        # Detector findings the targeting policy refused to register,
+        # deduped by (type, value): review-file suggestions the human can
+        # promote to seeds.
+        self._demoted: Dict[Tuple[str, str], Dict] = {}
 
     @property
     def mappings(self) -> List[EntityMapping]:
         """Return all entity mappings."""
         return list(self._mappings.values())
+
+    def _demote(self, entity_type: str, value: str,
+                source: Optional[str]) -> None:
+        """Record a detector finding the targeting policy refused."""
+        key = (entity_type, value.strip().lower())
+        entry = self._demoted.get(key)
+        if entry is None:
+            entry = {'type': entity_type, 'value': value.strip(),
+                     'count': 0, 'sources': []}
+            self._demoted[key] = entry
+        entry['count'] += 1
+        # Keep the detector family, drop the per-file suffix.
+        src = (source or '').split(':', 1)[0]
+        if src and src not in entry['sources']:
+            entry['sources'].append(src)
+
+    @property
+    def demoted_suggestions(self) -> List[Dict]:
+        """Findings blocked by the targeting policy, most frequent first.
+
+        Written to review_candidates.json so a human can promote real
+        targets to seeds (--seed / --seed-file) on the next run.
+        """
+        return sorted(self._demoted.values(), key=lambda e: -e['count'])
 
     @property
     def mapping_count(self) -> int:
@@ -335,20 +388,30 @@ class EntityMapper:
         if PLACEHOLDER_VALUE_RE.match(value.strip()):
             return value.strip()
 
-        # CENTRAL stoplist gate. Registration paths that bypassed the
-        # per-detector filters (metadata author fields, --seed-file
-        # replays of old review files) minted entities like 'User' —
-        # which then MATCHED INSIDE every SolidWorks binary's structure
-        # names and quarantined 15 files over one junk word. Explicit
-        # human seeds keep the last word.
-        if key not in self._mappings and not (
-                source or '').startswith('seed'):
+        # CENTRAL gates. Human seeds keep the last word (both bypasses
+        # use the same startswith('seed') predicate, covering --seed and
+        # --seed-file). Path pseudonyms (filename/directory) bypass BOTH
+        # gates: they are minted BY policy, not detected — the stoplist
+        # blocking 'Bearing'/'Collar' stems shipped six drawings under
+        # their ORIGINAL names in the HoleSaw run.
+        if (key not in self._mappings
+                and not (source or '').startswith('seed')
+                and entity_type not in NON_TEXT_ENTITY_TYPES):
+            # Stoplist gate: junk values ('User', 'Microsoft Excel')
+            # minted by paths that bypassed per-detector filters.
             try:
                 from .llm_detect import _stoplisted
                 if _stoplisted(value):
                     return value.strip()
             except ImportError:
                 pass
+            # TARGETING gate: detectors may only register policy types
+            # (default names-only). Everything else becomes a review
+            # suggestion and the content ships untouched.
+            allowed = targeted_types()
+            if allowed is not None and entity_type not in allowed:
+                self._demote(entity_type, value, source)
+                return value.strip()
 
         if key in self._mappings:
             mapping = self._mappings[key]
@@ -534,7 +597,10 @@ class EntityMapper:
         for start, end, entity_type in sorted_spans:
             entity_value = result[start:end]
             placeholder = self.get_or_create(entity_type, entity_value, source)
-            if self._tracker_callback is not None:
+            # Demoted/stoplisted values come back unchanged — no
+            # replacement happened, so no tracker record.
+            if (self._tracker_callback is not None
+                    and placeholder != entity_value):
                 self._tracker_callback(entity_value, placeholder, source)
             result = result[:start] + placeholder + result[end:]
 
@@ -640,7 +706,8 @@ class SpanBasedReplacer:
                 continue
 
             placeholder = self.mapper.get_or_create(entity_type, entity_value, source)
-            if self.mapper._tracker_callback is not None:
+            if (self.mapper._tracker_callback is not None
+                    and placeholder != entity_value):
                 self.mapper._tracker_callback(entity_value, placeholder, source)
             result = result[:start] + placeholder + result[end:]
 

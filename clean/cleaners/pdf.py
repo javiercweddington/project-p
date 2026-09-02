@@ -54,6 +54,26 @@ from .text import TextCleaner
 
 _logger = logging.getLogger(__name__)
 
+
+def _keep_embedded_images() -> bool:
+    """Whether embedded raster images survive cleaning.
+
+    Explicit PROJECT_P_PDF_KEEP_IMAGES (0/1) wins. Otherwise the
+    targeting policy decides: under names-only, images are KEPT —
+    unconditional deletion wiped entire scanned pages to blank white
+    (a scanned drawing IS one page-sized image; live: two DFM PDFs
+    shipped as 100% empty sheets that still passed verification).
+    Rendered image content still gets belt 0 (enrolled logo templates)
+    and belt 2 (OCR name redaction) on the raster; cursive signatures
+    remain the documented residual. Legacy all-types runs keep the old
+    remove-everything default.
+    """
+    raw = os.environ.get('PROJECT_P_PDF_KEEP_IMAGES')
+    if raw is not None:
+        return raw == '1'
+    from ..anonymizer import targeted_types
+    return targeted_types() is not None
+
 # Try optional dependencies (modern pypdf only; PyPDF2 is deprecated)
 try:
     from pypdf import PdfReader, PdfWriter
@@ -322,12 +342,10 @@ class PDFCleaner:
             entity_terms = self._get_entity_terms_to_redact()
 
             # Embedded raster images (logos, stamps, signatures, photos)
-            # carry identifying content that text redaction can never reach
-            # ("NOA LABS" logo). Default: remove them all. Set
-            # PROJECT_P_PDF_KEEP_IMAGES=1 to keep (e.g. pure technical
-            # drawings you have separately vetted).
-            keep_images = os.environ.get(
-                'PROJECT_P_PDF_KEEP_IMAGES', '0') == '1'
+            # carry identifying content that text redaction can never
+            # reach ("NOA LABS" logo). Policy-dependent — see
+            # _keep_embedded_images.
+            keep_images = _keep_embedded_images()
 
             for page_num in range(len(doc)):
                 page = doc[page_num]
@@ -544,12 +562,10 @@ class PDFCleaner:
             pages_out = []
 
             # Embedded raster images (signatures, stamps, logos, photos)
-            # would otherwise be RENDERED INTO the page pixels — a scanned
-            # signature is identifying and OCR cannot read cursive to
-            # redact it. Same policy as the redact strategy: remove them
-            # before rendering (PROJECT_P_PDF_KEEP_IMAGES=1 to keep).
-            keep_images = os.environ.get(
-                'PROJECT_P_PDF_KEEP_IMAGES', '0') == '1'
+            # get RENDERED INTO the page pixels. Whether they are removed
+            # first is policy-dependent — see _keep_embedded_images
+            # (names-only keeps them; deletion wiped whole scanned pages).
+            keep_images = _keep_embedded_images()
 
             for page_num in range(len(doc)):
                 page = doc[page_num]
