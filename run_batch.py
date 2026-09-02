@@ -117,9 +117,19 @@ def main() -> int:
     parser.add_argument('--logo-templates', default=None, metavar='DIR')
     parser.add_argument('--seed', action='append', default=[],
                         metavar='TYPE=VALUE',
-                        help='Passed to every unit (repeatable)')
+                        help='Passed to EVERY unit (repeatable). Use '
+                             'only for names that genuinely span the '
+                             'whole drive — a client name seeded '
+                             'globally replaces colliding tokens in '
+                             'unrelated dossiers (overcorrection).')
     parser.add_argument('--seed-file', default=None,
-                        help='Passed to every unit')
+                        help='Passed to every unit (same caveat as '
+                             '--seed)')
+    parser.add_argument('--seeds-dir', default=None, metavar='DIR',
+                        help='Per-unit seeds: DIR/<unit-dir-name>.txt '
+                             'with one TYPE=VALUE per line (# comments '
+                             'ok) applies ONLY to that unit — client '
+                             'names belong here, not in --seed.')
     parser.add_argument('--targets', default='names',
                         help="Passed through to run_clean (default "
                              "'names' = person,company,email)")
@@ -264,6 +274,25 @@ def main() -> int:
                    '--clobber']
             for seed in args.seed:
                 cmd += ['--seed', seed]
+            if args.seeds_dir:
+                seeds_path = (Path(args.seeds_dir).expanduser()
+                              / f'{unit.name}.txt')
+                if seeds_path.is_file():
+                    n_unit_seeds = 0
+                    with open(seeds_path) as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if not line or line.startswith('#'):
+                                continue
+                            if '=' not in line:
+                                _logger.warning(
+                                    '  bad seed line in %s: %r',
+                                    seeds_path.name, line)
+                                continue
+                            cmd += ['--seed', line]
+                            n_unit_seeds += 1
+                    _logger.info('  %d per-unit seed(s) from %s',
+                                 n_unit_seeds, seeds_path.name)
             if args.seed_file:
                 cmd += ['--seed-file', args.seed_file]
             if args.logo_templates:
