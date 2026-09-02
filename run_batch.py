@@ -47,8 +47,14 @@ _logger = logging.getLogger('run_batch')
 _SKIP_NAMES = {'$RECYCLE.BIN', 'System Volume Information', 'lost+found'}
 
 
-def _units(root: Path, depth: int):
-    """Yield unit directories; warn on loose files that get no unit."""
+def _units(root: Path, depth: int, split=()):
+    """Yield unit directories; warn on loose files that get no unit.
+
+    `split`: dossier names whose SUBDIRECTORIES become units instead of
+    the dossier itself — for mixed drives where most dossiers are one
+    engagement but some (live: jacky) hold several independent client
+    projects that must not share a mapper.
+    """
     def _children(d: Path):
         out = []
         for p in sorted(d.iterdir()):
@@ -59,27 +65,36 @@ def _units(root: Path, depth: int):
             out.append(p)
         return out
 
+    split = set(split)
     loose = []
-    if depth == 1:
-        for p in _children(root):
+
+    def _expand(child: Path):
+        for p in _children(child):
             if p.is_dir():
                 yield p
             else:
                 loose.append(p)
+
+    if depth == 1:
+        for p in _children(root):
+            if not p.is_dir():
+                loose.append(p)
+            elif p.name in split:
+                yield from _expand(p)
+            else:
+                yield p
     else:
         for child in _children(root):
             if not child.is_dir():
                 loose.append(child)
                 continue
-            for p in _children(child):
-                if p.is_dir():
-                    yield p
-                else:
-                    loose.append(p)
+            yield from _expand(child)
     if loose:
         _logger.warning(
             "%d loose file(s) at unit level get NO cleaning unit and "
-            "are NOT processed — move them into a directory first: %s",
+            "are NOT processed — move them into a directory first "
+            "(duplicate .zip siblings of project folders are fine to "
+            "leave skipped): %s",
             len(loose), ', '.join(str(p) for p in loose[:10]))
 
 
@@ -108,6 +123,13 @@ def main() -> int:
     parser.add_argument('--targets', default='names',
                         help="Passed through to run_clean (default "
                              "'names' = person,company,email)")
+    parser.add_argument('--split', action='append', default=[],
+                        metavar='NAME',
+                        help='Dossier(s) whose SUBDIRECTORIES become '
+                             'separate units (own mapper each) instead '
+                             'of the dossier itself — for folders that '
+                             'hold several independent client projects '
+                             '(repeatable)')
     parser.add_argument('--only', action='append', default=[],
                         metavar='NAME',
                         help='Process only units whose directory name '
@@ -161,7 +183,7 @@ def main() -> int:
                   + ', '.join(undecided[:8]), file=sys.stderr)
             return 2
 
-    units = [u for u in _units(root, args.depth)
+    units = [u for u in _units(root, args.depth, split=args.split)
              if not args.only or u.name in args.only]
     if not units:
         print('No units found.', file=sys.stderr)
