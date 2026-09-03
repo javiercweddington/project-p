@@ -37,6 +37,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -144,6 +145,21 @@ def main() -> int:
                         metavar='NAME',
                         help='Process only units whose directory name '
                              'matches (repeatable)')
+    parser.add_argument('--llm', default='off',
+                        choices=['off', 'auto', 'required', 'judge',
+                                 'sample'],
+                        help="Passed to run_clean for every unit "
+                             "(default off). 'sample' = LLM audits one "
+                             "cleaned file per type per unit, fixes its "
+                             "findings everywhere, re-checks — the "
+                             "recommended accuracy net; needs the vLLM "
+                             "endpoint up.")
+    parser.add_argument('--jobs', type=int, default=1, metavar='N',
+                        help='Units cleaned concurrently (default 1). '
+                             'Units are fully independent; 3-4 is safe '
+                             'on a many-core box. Logs interleave in '
+                             'the console but per-unit .log files stay '
+                             'separate.')
     parser.add_argument('--no-resume', action='store_true',
                         help='Redo units already recorded as finished')
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -212,8 +228,14 @@ def main() -> int:
             taken.add(p)
             manifest[key] = {'pseudonym': p, 'status': 'pending'}
 
-    worst = 0
-    for i, unit in enumerate(units, 1):
+    manifest_lock = threading.Lock()
+
+    def _flush_manifest():
+        with open(manifest_path, 'w') as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    def _process_unit(i, unit):
+        """Clean one unit; returns its exit-contract contribution."""
         entry = manifest[str(unit)]
         pseudonym = entry['pseudonym']
         staging = output / pseudonym
@@ -221,10 +243,11 @@ def main() -> int:
                 and staging.is_dir()):
             _logger.info('[%d/%d] %s -> %s already done — skipped',
                          i, len(units), unit.name, pseudonym)
-            continue
+            return 0
 
         _logger.info('[%d/%d] %s -> %s', i, len(units), unit.name,
                      pseudonym)
+        worst = 0
         source_for_clean = unit
         media_work = None
         media_quarantined = []
@@ -271,6 +294,7 @@ def main() -> int:
                    '--project', pseudonym,
                    '--staging', str(staging),
                    '--targets', args.targets,
+                   '--llm', args.llm,
                    '--clobber']
             for seed in args.seed:
                 cmd += ['--seed', seed]
@@ -327,12 +351,30 @@ def main() -> int:
             entry['status'] = 'error'
             entry['error'] = str(e)
             worst = max(worst, 2)
-            _logger.error('  FAILED to run: %s', e)
+            _logger.error('  [%s] FAILED to run: %s', pseudonym, e)
         finally:
             if media_work is not None and media_work.exists():
                 shutil.rmtree(media_work, ignore_errors=True)
-            with open(manifest_path, 'w') as f:
-                json.dump(manifest, f, indent=2, ensure_ascii=False)
+            with manifest_lock:
+                _flush_manifest()
+        return worst
+
+    worst = 0
+    if args.jobs <= 1:
+        for i, unit in enumerate(units, 1):
+            worst = max(worst, _process_unit(i, unit))
+    else:
+        # Units are independent (own mapper, staging, audit, work dir);
+        # the child run_clean processes do the heavy lifting, so a
+        # thread pool is enough. Each unit's GLiNER child picks the
+        # freest GPU on load; OCR and matching are CPU-bound and
+        # parallelize cleanly.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            for w in pool.map(
+                    lambda iu: _process_unit(*iu),
+                    list(enumerate(units, 1))):
+                worst = max(worst, w)
 
     print()
     print('=' * 64)
