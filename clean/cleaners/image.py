@@ -687,8 +687,37 @@ class ImageCleaner:
                                 reason)
                         return reason is not None
 
-                    for (lx, ly, lw, lh) in find_logo_boxes(
-                            work, logo_templates, reject=_reject_box):
+                    logo_boxes = find_logo_boxes(
+                        work, logo_templates, reject=_reject_box)
+                    # AGGREGATE page guard. The junk guard caps boxes
+                    # PER TEMPLATE, but a large enrolled set on a
+                    # text-dense page (live: a chip datasheet lit up
+                    # dozens of "covers" across templates — headings
+                    # and table rows, not marks) is a calibration
+                    # failure in aggregate: no real page carries that
+                    # many marks. Erasing them would shred the document
+                    # — skip logo redaction for the page LOUDLY instead
+                    # and tell the human to curate the template set.
+                    try:
+                        max_page = int(os.environ.get(
+                            'PROJECT_P_LOGO_MAX_PAGE_HITS', '12'))
+                    except ValueError:
+                        max_page = 12
+                    page_area = float(work.size[0] * work.size[1])
+                    frac = sum(bw * bh for _x, _y, bw, bh
+                               in logo_boxes) / page_area
+                    if len(logo_boxes) > max_page or frac > 0.10:
+                        _logger.warning(
+                            "Belt 0 aggregate pathological on %s: %d "
+                            "boxes, %.1f%% of page — logo redaction "
+                            "SKIPPED for this page. Curate %s to actual "
+                            "marks (PROJECT_P_LOGO_MAX_PAGE_HITS=%d).",
+                            source_name, len(logo_boxes), frac * 100,
+                            os.environ.get(
+                                'PROJECT_P_LOGO_TEMPLATES', ''),
+                            max_page)
+                        logo_boxes = []
+                    for (lx, ly, lw, lh) in logo_boxes:
                         px = max(2, int(lw * _logo_pad_fraction()))
                         py = max(2, int(lh * _logo_pad_fraction()))
                         _erase_mark_preserving_lines(
