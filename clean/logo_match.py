@@ -244,6 +244,115 @@ def _template_variants(tmpl):
         yield squeezed, _COARSE_SCALES
 
 
+class _TorchNCC:
+    """GPU normalized cross-correlation, numerically matching
+    cv2.matchTemplate(TM_CCOEFF_NORMED).
+
+    Template matching is the CPU bottleneck of the whole pipeline
+    (live: a drawing unit at 61 templates ran minutes per page on one
+    core while four 4090s idled). NCC is a convolution: with the
+    zero-mean template, numerator = correlation(P, T'); denominator =
+    sqrt(sum(T'^2) * window_variance(P)). The page spectrum and
+    integral images upload/compute once per page; each template/scale
+    is one FFT pass.
+
+    NOT torch conv2d: CPU conv materializes im2col, which for a page
+    x wordmark-sized kernel is a ~180 GB allocation (live: silent OOM
+    kill). FFT correlation + integral-image window stats are exact,
+    memory-flat, and fast on CPU and GPU alike. Circular FFT needs no
+    padding here: correlation lags up to H-th never wrap.
+    """
+
+    def __init__(self, page, device):
+        import torch
+        self.torch = torch
+        self.device = device
+        with torch.no_grad():
+            P = torch.from_numpy(page.astype('float32')).to(device)
+            self.H, self.W = P.shape
+            self.FP = torch.fft.rfft2(P)
+            # Integral images padded with a zero row/col so window
+            # sums are 4 lookups with no edge cases. ALWAYS CPU
+            # float64: cumsum of squared pixels over a full page
+            # cancels catastrophically in float32, and MPS has no
+            # float64 — the lookups are cheap, only the FFT needs the
+            # accelerator.
+            Pc = torch.from_numpy(page.astype('float64'))
+            def integral(a):
+                s = torch.cumsum(torch.cumsum(a, 0), 1)
+                out = torch.zeros(self.H + 1, self.W + 1,
+                                  dtype=torch.float64)
+                out[1:, 1:] = s
+                return out
+            self.SP = integral(Pc)
+            self.SP2 = integral(Pc * Pc)
+        self._eps = 1e-6
+
+    def _window_stats(self, th, tw):
+        """(win_sum, win_sum2) over all valid template placements."""
+        SP, SP2 = self.SP, self.SP2
+        oh, ow = self.H - th + 1, self.W - tw + 1
+        def win(S):
+            return (S[th:th + oh, tw:tw + ow] - S[:oh, tw:tw + ow]
+                    - S[th:th + oh, :ow] + S[:oh, :ow])
+        return win(SP), win(SP2)
+
+    def match(self, tmpl):
+        torch = self.torch
+        with torch.no_grad():
+            th, tw = tmpl.shape
+            T = torch.from_numpy(tmpl.astype('float32')).to(self.device)
+            T = T - T.mean()
+            t_energy = float((T * T).sum())
+            FT = torch.fft.rfft2(T, s=(self.H, self.W))
+            cc = torch.fft.irfft2(self.FP * FT.conj(),
+                                  s=(self.H, self.W))
+            num = cc[:self.H - th + 1,
+                     :self.W - tw + 1].cpu().double()
+            win_sum, win_sum2 = self._window_stats(th, tw)
+            n = float(th * tw)
+            win_var = (win_sum2 - win_sum * win_sum / n).clamp_min(0)
+            denom = (win_var * t_energy).sqrt().clamp_min(self._eps)
+            res = num / denom
+            # Flat windows (blank paper — MOST of a drawing) have
+            # exactly zero variance; the true numerator there is 0 but
+            # FFT roundoff isn't, and noise/eps scored ~everything
+            # above threshold on a real sheet. cv2 special-cases this;
+            # so do we. Integer-valued pixels in float64 make the
+            # zero-variance test exact.
+            res[win_var <= 0] = 0.0
+            return res.float().cpu().numpy()
+
+
+def _make_torch_ncc(page):
+    """Return a _TorchNCC for this page, or None to use cv2 on CPU.
+
+    PROJECT_P_LOGO_DEVICE: auto (default; CUDA when available, else
+    cv2), cuda, mps, torch-cpu (testing), cv2 (force the old path).
+    """
+    want = os.environ.get('PROJECT_P_LOGO_DEVICE', 'auto').strip().lower()
+    if want == 'cv2':
+        return None
+    try:
+        import torch
+        if want == 'auto':
+            device = 'cuda' if torch.cuda.is_available() else None
+        elif want == 'cuda':
+            device = 'cuda' if torch.cuda.is_available() else None
+        elif want == 'mps':
+            device = 'mps' if torch.backends.mps.is_available() else None
+        elif want == 'torch-cpu':
+            device = 'cpu'
+        else:
+            device = None
+        if device is None:
+            return None
+        return _TorchNCC(page, device)
+    except Exception as e:
+        _logger.debug("torch NCC unavailable (%s); cv2 path.", e)
+        return None
+
+
 def _iou_clash(box, kept, thresh=0.3) -> int:
     """Index of the first box in `kept` overlapping `box` (IoU >
     thresh), or -1 when none does. Compare with >= 0 — index 0 is a
@@ -300,6 +409,9 @@ def find_logo_boxes(pil_image, templates,
     # skew steps rely on.
     page = cv2.GaussianBlur(page, (3, 3), 0)
     threshold = _threshold()
+    ncc = _make_torch_ncc(page)
+    if ncc is not None:
+        _logger.debug("logo matching on %s", ncc.device)
 
     # (x, y, w, h, score, template_name)
     boxes: List[Tuple[int, int, int, int, float, str]] = []
@@ -318,9 +430,18 @@ def find_logo_boxes(pil_image, templates,
                                interpolation=cv2.INTER_AREA), (3, 3), 0)
                 if int(t_scaled.std()) == 0:
                     continue
-                for variant in _polarities(t_scaled):
-                    result = cv2.matchTemplate(page, variant,
+                if ncc is not None:
+                    result = ncc.match(t_scaled)
+                else:
+                    result = cv2.matchTemplate(page, t_scaled,
                                                cv2.TM_CCOEFF_NORMED)
+                # Inverted polarity for free: a zero-mean-inverted
+                # template's TM_CCOEFF_NORMED map is exactly the
+                # NEGATED map of the original ((255-T) - mean(255-T)
+                # == -(T - mean(T))), so both polarities come from one
+                # correlation. (The old loop matched twice for
+                # identical results at double the cost.)
+                for result in (result, -result):
                     ys, xs = np.where(result >= threshold)
                     if len(xs) > _MAX_RAW_PEAKS:
                         top = np.argsort(result[ys, xs])[-_MAX_RAW_PEAKS:]

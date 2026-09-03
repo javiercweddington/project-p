@@ -160,6 +160,11 @@ def main() -> int:
                              'on a many-core box. Logs interleave in '
                              'the console but per-unit .log files stay '
                              'separate.')
+    parser.add_argument('--retry-failed', action='store_true',
+                        help="Re-run units recorded 'done-with-failures'. "
+                             'By default relaunches skip them too — a '
+                             'restart for an unrelated reason must not '
+                             'redo hours of triage-pending units.')
     parser.add_argument('--no-resume', action='store_true',
                         help='Redo units already recorded as finished')
     parser.add_argument('-v', '--verbose', action='store_true')
@@ -239,10 +244,13 @@ def main() -> int:
         entry = manifest[str(unit)]
         pseudonym = entry['pseudonym']
         staging = output / pseudonym
-        if (not args.no_resume and entry.get('status') == 'done'
+        finished = (('done',) if args.retry_failed
+                    else ('done', 'done-with-failures'))
+        if (not args.no_resume and entry.get('status') in finished
                 and staging.is_dir()):
-            _logger.info('[%d/%d] %s -> %s already done — skipped',
-                         i, len(units), unit.name, pseudonym)
+            _logger.info('[%d/%d] %s -> %s already %s — skipped',
+                         i, len(units), unit.name, pseudonym,
+                         entry.get('status'))
             return 0
 
         _logger.info('[%d/%d] %s -> %s', i, len(units), unit.name,
