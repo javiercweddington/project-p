@@ -28,6 +28,11 @@ from .pptx import PPTXCleaner
 _logger = logging.getLogger(__name__)
 
 
+class _FileTimeBudgetExceeded(Exception):
+    """Raised by the SIGALRM handler when one file exceeds its
+    wall-clock budget (see FileCleanerRouter.clean_file)."""
+
+
 # File extension sets for routing
 TEXT_EXTS = {
     '.txt', '.csv', '.tsv', '.log', '.md', '.rst',
@@ -80,6 +85,14 @@ class FileCleanerRouter:
                    entity_spans: Optional[List[Tuple[int, int, str, str]]] = None) -> bool:
         """Clean a file using the appropriate cleaner for its type.
 
+        Enforces a per-file WALL-CLOCK budget (PROJECT_P_FILE_TIMEOUT
+        seconds, default 900, 0 = off): a file that exceeds it fails
+        CLOSED to quarantine and the run moves on. Live: one chip
+        datasheet ground the logo matcher for 16 hours — technically
+        alive, practically a hang; no single file may hold a corpus
+        hostage. Unix main-thread only (SIGALRM); elsewhere the budget
+        is skipped silently.
+
         Args:
             input_path: Source file path
             output_path: Destination file path
@@ -88,6 +101,64 @@ class FileCleanerRouter:
         Returns:
             True if cleaning was successful
         """
+        import signal
+        import threading
+
+        try:
+            base = int(os.environ.get('PROJECT_P_FILE_TIMEOUT', '900'))
+        except ValueError:
+            base = 900
+        timeout = base
+        if base > 0:
+            # Legitimate big files need proportionally more: scale by
+            # size, and for PDFs by page count (a 100-page deck at
+            # ~30s/page is honest work; a single-page file grinding
+            # past 15 minutes is not). Capped at 4 hours.
+            try:
+                timeout += int(60 * input_path.stat().st_size / 2**20)
+                if input_path.suffix.lower() == '.pdf':
+                    import fitz
+                    with fitz.open(input_path) as _doc:
+                        timeout += 45 * len(_doc)
+            except Exception:
+                pass
+            timeout = min(timeout, 14400)
+        use_alarm = (
+            timeout > 0
+            and hasattr(signal, 'SIGALRM')
+            and threading.current_thread() is threading.main_thread()
+            and not FileCleanerRouter._timeout_armed)
+        if not use_alarm:
+            return self._clean_file_routed(
+                input_path, output_path, entity_spans)
+
+        def _on_alarm(_signum, _frame):
+            raise _FileTimeBudgetExceeded()
+
+        old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+        FileCleanerRouter._timeout_armed = True
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            return self._clean_file_routed(
+                input_path, output_path, entity_spans)
+        except _FileTimeBudgetExceeded:
+            _logger.error(
+                "FILE TIME BUDGET EXCEEDED (%ds) cleaning %s — failing "
+                "closed to quarantine and moving on. Raise "
+                "PROJECT_P_FILE_TIMEOUT (0 disables) if this file class "
+                "legitimately needs longer.", timeout, input_path.name)
+            return False
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+            FileCleanerRouter._timeout_armed = False
+
+    # Nested router calls (zip members re-enter clean_file) must not
+    # re-arm and thereby CANCEL the outer file's budget.
+    _timeout_armed = False
+
+    def _clean_file_routed(self, input_path: Path, output_path: Path,
+                           entity_spans: Optional[List[Tuple[int, int, str, str]]] = None) -> bool:
         ext = input_path.suffix.lower()
 
         # OPC '_rels/.rels' files are dotfiles with an EMPTY suffix —

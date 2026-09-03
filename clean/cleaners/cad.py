@@ -379,11 +379,17 @@ class CADCleaner:
         OLE SummaryInformation streams using olefile/pyole2.
         Falls back to fail-closed removal for other binary formats.
         """
-        if ext in ('.sldprt', '.sldasm', '.slddrw', '.mpp'):
-            # SolidWorks parts/assemblies/drawings and MS Project: OLE
-            # compound (or newer opaque container) — property scrub +
-            # binary surgery + scan gates, honoring
-            # PROJECT_P_OPAQUE_BINARY for the non-OLE variants.
+        if ext in ('.sldprt', '.sldasm', '.slddrw', '.mpp',
+                   '.prt', '.asm'):
+            # SolidWorks parts/assemblies/drawings, MS Project, and
+            # NX/Creo parts/assemblies: OLE compound (or opaque binary
+            # container) — property scrub + binary surgery + scan
+            # gates, honoring PROJECT_P_OPAQUE_BINARY for the non-OLE
+            # variants. .prt/.asm previously fell to the unconditional
+            # fail-closed branch: a whole supplier dossier of NX parts
+            # bulk-quarantined in 12 seconds while the identical
+            # problem class (.sldprt, 29% of a live corpus) shipped
+            # scanned.
             return self._strip_ole_summary(input_path, output_path, ext)
 
         # Other binary CAD: fail-closed
