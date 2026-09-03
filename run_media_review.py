@@ -197,7 +197,12 @@ def build_review(clusters, corpus_size: int, source: Path,
                 'sha256': c.sha256,
                 'decode_error': c.decode_error,
                 'thumbnail': thumbs.get(c.cluster_id),
-                'examples': [o.as_dict(source) for o in c.occurrences[:5]],
+                # FULL occurrence list, not a preview: run_batch scopes
+                # logo templates to the units whose documents actually
+                # contain the mark — a truncated list under-scopes and
+                # the mark ships in the unlisted units. The UI shows
+                # them in a collapsed <details>, so length is free.
+                'examples': [o.as_dict(source) for o in c.occurrences],
             }
             for c in clusters
         ],

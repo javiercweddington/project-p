@@ -36,6 +36,7 @@ import json
 import logging
 import shutil
 import subprocess
+import os
 import sys
 import threading
 from datetime import datetime, timezone
@@ -97,6 +98,65 @@ def _units(root: Path, depth: int, split=()):
             "(duplicate .zip siblings of project folders are fine to "
             "leave skipped): %s",
             len(loose), ', '.join(str(p) for p in loose[:10]))
+
+
+_TEMPLATE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff')
+
+
+def _classify_templates(review, templates_dir: Path):
+    """Split template files into (scoped {file: [doc rel paths]}, global).
+
+    A mark lives in the files about ITS product — searching every
+    dossier for every dossier's marks is both the drive-sweep slowdown
+    and the cross-dossier false-match surface. Cluster-derived
+    templates (media_XXXX.*) scope to the documents their cluster
+    occurred in. Global: hand-dropped variant crops (no cluster) and
+    clusters whose occurrence list was truncated by an older review
+    file (documents > len(examples)) — under-scoping ships marks,
+    over-scoping only costs speed.
+    """
+    clusters = {}
+    for c in review.get('clusters', []):
+        if c.get('action') == 'logo' and c.get('thumbnail'):
+            clusters[Path(c['thumbnail']).stem] = c
+    scoped, global_files = {}, []
+    for p in sorted(templates_dir.iterdir()):
+        if p.suffix.lower() not in _TEMPLATE_EXTS:
+            continue
+        c = clusters.get(p.stem)
+        if c is None:
+            global_files.append(p)
+        elif c.get('documents', 0) > len(c.get('examples') or []):
+            _logger.info(
+                'template %s: occurrence list truncated (%d docs, %d '
+                'listed) — applied GLOBALLY (regenerate the review '
+                'sheet for exact scoping)', p.name, c.get('documents'),
+                len(c.get('examples') or []))
+            global_files.append(p)
+        else:
+            scoped[p] = [e['document'] for e in c['examples']]
+    return scoped, global_files
+
+
+def _unit_template_dir(unit: Path, root: Path, pseudonym: str,
+                       scoped, global_files, work_root: Path):
+    """Build this unit's template dir; None = no marks, skip belt 0."""
+    rel = str(unit.relative_to(root)).rstrip('/')
+    mine = [p for p, docs in scoped.items()
+            if any(d == rel or d.startswith(rel + '/') for d in docs)]
+    udir = work_root / f'{pseudonym}_templates'
+    if udir.exists():
+        shutil.rmtree(udir)
+    picked = mine + global_files
+    if not picked:
+        return None
+    udir.mkdir(parents=True, exist_ok=True)
+    for p in picked:
+        shutil.copy2(p, udir / p.name)
+    _logger.info('  %d/%d template(s) scoped to this unit (%d global)',
+                 len(picked), len(scoped) + len(global_files),
+                 len(global_files))
+    return udir
 
 
 def main() -> int:
@@ -216,6 +276,17 @@ def main() -> int:
 
     units = [u for u in _units(root, args.depth, split=args.split)
              if not args.only or u.name in args.only]
+
+    # Per-unit template scoping (PROJECT_P_TEMPLATES_SCOPE=global to
+    # disable): a mark belongs to its product's dossier, not the drive.
+    template_scope = None
+    if (review is not None and args.logo_templates
+            and os.environ.get('PROJECT_P_TEMPLATES_SCOPE',
+                               'unit') != 'global'):
+        template_scope = _classify_templates(
+            review, Path(args.logo_templates).expanduser())
+        _logger.info('template scoping: %d cluster-scoped, %d global',
+                     len(template_scope[0]), len(template_scope[1]))
     if not units:
         print('No units found.', file=sys.stderr)
         return 2
@@ -328,8 +399,16 @@ def main() -> int:
             if args.seed_file:
                 cmd += ['--seed-file', args.seed_file]
             if args.logo_templates:
-                cmd += ['--logo-templates',
-                        str(Path(args.logo_templates).expanduser())]
+                tdir = Path(args.logo_templates).expanduser()
+                if template_scope is not None:
+                    tdir = _unit_template_dir(
+                        unit, root, pseudonym, template_scope[0],
+                        template_scope[1], work_root)
+                if tdir is not None:
+                    cmd += ['--logo-templates', str(tdir)]
+                else:
+                    _logger.info('  no marks scoped to this unit — '
+                                 'logo matching skipped')
 
             log_path = audit_root / f'{pseudonym}.log'
             with open(log_path, 'w') as log:
