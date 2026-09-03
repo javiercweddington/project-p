@@ -322,7 +322,21 @@ def main() -> int:
           f'Human seeds exempt.'
           if targets not in ('all', '*') else
           'Targets: all (legacy — every detector class auto-registers)')
-    result = pipeline.run()
+    try:
+        result = pipeline.run()
+    except Exception:
+        # An uncaught crash used to exit 1 — INDISTINGUISHABLE from
+        # 'finished with some failed files', so half-processed staging
+        # (cleaned content, ORIGINAL un-anonymized paths) sat in the
+        # deliverable looking like a triage-pending unit. Crashes are
+        # rc=2: the batch labels them 'error' and nothing pretends the
+        # unit finished.
+        import traceback
+        traceback.print_exc()
+        print('FATAL: pipeline crashed — staging is INCOMPLETE (paths '
+              'not anonymized). Fix the cause and re-run this unit.',
+              file=sys.stderr)
+        return 2
 
     print()
     print('=' * 64)

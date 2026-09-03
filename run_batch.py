@@ -414,7 +414,14 @@ def main() -> int:
             with open(log_path, 'w') as log:
                 rc = subprocess.run(
                     cmd, stdout=log, stderr=subprocess.STDOUT).returncode
-            if rc >= 2:
+            if rc < 0:
+                # Killed by a signal (Ctrl-C, OOM-killer): the unit is
+                # INTERRUPTED, not finished — recording it as anything
+                # 'done'-shaped left half-staged output (cleaned content
+                # under ORIGINAL names) masquerading as a deliverable.
+                entry['status'] = 'interrupted'
+                worst = max(worst, 2)
+            elif rc >= 2:
                 # run_clean could not run at all (bad args, missing
                 # seed file, unreachable required LLM) — not a partial
                 # result, so it must not read as 'done-with-failures'.
