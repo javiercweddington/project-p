@@ -52,6 +52,11 @@ except ImportError:
 _logger = logging.getLogger(__name__)
 
 
+class _VerifyTimeBudgetExceeded(Exception):
+    """Raised by the SIGALRM handler when one file's leakage scan
+    exceeds its wall-clock budget (see LeakageChecker.run_check)."""
+
+
 @dataclass
 class LeakageHit:
     """A single leakage detection: original entity found in cleaned output."""
@@ -591,26 +596,71 @@ class LeakageChecker:
     # -- top-level runner ---------------------------------------------------
 
     def run_check(self, cleaned_dir: Path, original_dir: Path) -> VerificationResult:
-        """Run leakage check on all files in cleaned directory."""
+        """Run leakage check on all files in cleaned directory.
+
+        Each file gets a WALL-CLOCK budget (PROJECT_P_VERIFY_TIMEOUT
+        seconds, default 300 + 60s/MB, 0 = off) and the walk logs
+        progress — live, this scan sat 74+ minutes on one log line at
+        100%% CPU with no way to tell grinding from wedged. A file that
+        exceeds its budget is reported as a failing 'unverifiable' hit
+        (fail-closed: it shows up in the run summary by name) instead
+        of holding the whole unit hostage.
+        """
+        import signal
+        import threading
+
+        try:
+            base = int(os.environ.get('PROJECT_P_VERIFY_TIMEOUT', '300'))
+        except ValueError:
+            base = 300
+        can_alarm = (base > 0 and hasattr(signal, 'SIGALRM')
+                     and threading.current_thread()
+                     is threading.main_thread())
+
+        files = [p for p in sorted(cleaned_dir.rglob('*')) if p.is_file()]
         all_hits = []
-        file_count = 0
-
-        for cleaned_file in cleaned_dir.rglob('*'):
-            if not cleaned_file.is_file():
-                continue
-
+        for i, cleaned_file in enumerate(files, 1):
             rel_path = cleaned_file.relative_to(cleaned_dir)
             original_file = original_dir / rel_path
-            file_count += 1
+            if i % 25 == 0 or i == len(files):
+                _logger.info("Leakage scan: %d/%d (%s)", i, len(files),
+                             cleaned_file.name)
+            if not can_alarm:
+                all_hits.extend(self.check_file(
+                    cleaned_file, original_file, str(rel_path)))
+                continue
 
-            hits = self.check_file(cleaned_file, original_file, str(rel_path))
-            all_hits.extend(hits)
+            budget = base + int(
+                60 * cleaned_file.stat().st_size / 2**20)
+
+            def _on_alarm(_s, _f):
+                raise _VerifyTimeBudgetExceeded()
+
+            old = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, budget)
+            try:
+                all_hits.extend(self.check_file(
+                    cleaned_file, original_file, str(rel_path)))
+            except _VerifyTimeBudgetExceeded:
+                _logger.error(
+                    "VERIFY TIME BUDGET EXCEEDED (%ds) scanning %s — "
+                    "reported as failing 'unverifiable' hit. Raise "
+                    "PROJECT_P_VERIFY_TIMEOUT if this file class "
+                    "legitimately needs longer.", budget, rel_path)
+                all_hits.append(LeakageHit(
+                    file_path=str(rel_path),
+                    entity_type='unverifiable',
+                    original=f'scan exceeded {budget}s budget',
+                ))
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old)
 
         passed = len(all_hits) == 0
         return VerificationResult(
             check_name="Entity Leakage Check",
             passed=passed,
-            details=f"Checked {file_count} files",
+            details=f"Checked {len(files)} files",
             hits=all_hits,
         )
 
