@@ -16,11 +16,21 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re as _re
 import shutil
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
+
+# Clusters served to the browser per request. The page embeds only the
+# first page and background-fetches the rest while the human reviews —
+# a 39,754-cluster dossier inlined as one data-URI page was hundreds of
+# MB and unloadable over an SSH tunnel.
+PAGE_SIZE = 500
+
+_THUMB_NAME_RE = _re.compile(r'^[A-Za-z0-9._-]+$')
 
 _logger = logging.getLogger(__name__)
 
@@ -131,25 +141,45 @@ function card(c, i) {
     </div></div>`;
 }
 
+// Paginated sheet: the page embeds only the first DATA.page clusters;
+// loadRest() background-fetches the remainder while the human reviews
+// the (ranked-riskiest-first) head. A 39,754-cluster dossier inlined
+// as one page was hundreds of MB and never finished loading.
+let KEEP_REST = false;
+
+function appendCards(from) {
+  const buf = [];
+  for (let i = from; i < DATA.clusters.length; i++)
+    buf.push(card(DATA.clusters[i], i));
+  grid.insertAdjacentHTML('beforeend', buf.join(''));
+  for (let i = from; i < DATA.clusters.length; i++) paint(i);
+}
+
 function render() {
-  // Chunked render + lazy imgs: a 39,754-cluster sheet (10x dossier)
-  // froze the tab for minutes building 40k cards in one shot and
-  // queued 40k thumbnail fetches through the SSH tunnel. First
-  // screenful is interactive immediately; the rest streams in.
   grid.innerHTML = '';
-  const CHUNK = 400;
-  let next = 0;
-  function step() {
-    const stop = Math.min(next + CHUNK, DATA.clusters.length);
-    const buf = [];
-    for (let i = next; i < stop; i++) buf.push(card(DATA.clusters[i], i));
-    grid.insertAdjacentHTML('beforeend', buf.join(''));
-    for (let i = next; i < stop; i++) paint(i);
-    next = stop;
+  appendCards(0);
+  status();
+}
+
+async function loadRest() {
+  while (DATA.clusters.length < DATA.total) {
+    let out;
+    try {
+      const r = await fetch(
+        `/clusters?offset=${DATA.clusters.length}&limit=${DATA.page}`);
+      out = await r.json();
+      if (!r.ok) throw new Error(out.error || r.statusText);
+    } catch (e) {
+      document.getElementById('status').textContent =
+        `background load stalled at ${DATA.clusters.length}/${DATA.total}: ${e}`;
+      return;
+    }
+    if (!out.clusters || !out.clusters.length) break;
+    const from = DATA.clusters.length;
+    DATA.clusters.push(...out.clusters);
+    appendCards(from);
     status();
-    if (next < DATA.clusters.length) requestAnimationFrame(step);
   }
-  step();
 }
 
 function paint(i) {
@@ -174,6 +204,10 @@ function keepRest() {
   DATA.clusters.forEach((c, i) => {
     if (c.action === 'review') { c.action = 'keep'; paint(i); }
   });
+  // Also cover clusters not yet loaded by pagination: the server marks
+  // every remaining 'review' as 'keep' on the next save. Without this,
+  // --apply fail-closes on the unloaded tail of a big sheet.
+  KEEP_REST = true;
   dirty = true; status();
 }
 
@@ -186,9 +220,12 @@ function status() {
   const left = DATA.clusters.filter(c => c.action === 'review').length;
   const red = DATA.clusters.filter(c => c.action === 'redact').length;
   const lgo = DATA.clusters.filter(c => c.action === 'logo').length;
-  document.getElementById('status').textContent =
+  const loaded = DATA.clusters.length < DATA.total
+    ? `${DATA.clusters.length}/${DATA.total} loaded \\u00b7 ` : '';
+  const rest = KEEP_REST ? ' \\u00b7 rest\\u2192keep on save' : '';
+  document.getElementById('status').textContent = loaded + (
     left ? `${left} undecided \\u00b7 ${red} to redact \\u00b7 ${lgo} logos`
-         : `all decided \\u00b7 ${red} to redact \\u00b7 ${lgo} logos`;
+         : `all decided \\u00b7 ${red} to redact \\u00b7 ${lgo} logos`) + rest;
   document.getElementById('save').disabled = false;
 }
 
@@ -199,7 +236,7 @@ async function save() {
     const r = await fetch('/save', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({clusters: DATA.clusters.map(
-        c => ({id: c.id, action: c.action}))})
+        c => ({id: c.id, action: c.action})), keep_rest: KEEP_REST})
     });
     const out = await r.json();
     if (!r.ok) throw new Error(out.error || r.statusText);
@@ -242,6 +279,7 @@ addEventListener('beforeunload', e => {
 });
 
 render();
+loadRest();
 </script></body></html>
 """
 
@@ -256,33 +294,54 @@ def _thumb_data_uri(path: Optional[Path]) -> Optional[str]:
     return 'data:image/png;base64,' + base64.b64encode(blob).decode('ascii')
 
 
-def render_page(review: dict, audit_dir: Path) -> bytes:
-    """Build the review page with thumbnails inlined as data URIs."""
-    clusters = []
-    for entry in review.get('clusters', []):
+def _cluster_items(review: dict, offset: int, limit: int) -> list:
+    """One page of clusters with thumbnails as fetchable URLs.
+
+    Thumbnails used to be inlined as base64 data URIs — at 40k clusters
+    the single page was hundreds of MB. Now the browser fetches
+    /thumbs/<name> lazily as cards scroll into view.
+    """
+    out = []
+    for entry in review.get('clusters', [])[offset:offset + limit]:
         item = dict(entry)
         thumb = entry.get('thumbnail')
-        item['thumb'] = _thumb_data_uri(
-            audit_dir / thumb if thumb else None)
-        clusters.append(item)
+        item['thumb'] = ('/' + thumb.lstrip('/')) if thumb else None
+        out.append(item)
+    return out
 
-    payload = {'clusters': clusters}
+
+def render_page(review: dict, audit_dir: Path) -> bytes:
+    """Build the review page shell with only the FIRST cluster page
+    embedded; the client background-fetches the rest from /clusters."""
+    total = len(review.get('clusters', []))
+    payload = {
+        'clusters': _cluster_items(review, 0, PAGE_SIZE),
+        'total': total,
+        'page': PAGE_SIZE,
+    }
     html = (PAGE
             .replace('__PROJECT__', str(review.get('project', 'corpus')))
             .replace('__DOCS__', str(review.get('documents_scanned', '?')))
             .replace('__OCC__', str(review.get('total_occurrences', '?')))
-            .replace('__N__', str(len(clusters)))
+            .replace('__N__', str(total))
             .replace('__DATA__', json.dumps(payload)))
     return html.encode('utf-8')
 
 
-def _write_back(review_path: Path, decisions: list) -> dict:
+def _write_back(review_path: Path, decisions: list,
+                keep_rest: bool = False) -> dict:
     """Merge actions into the on-disk review sheet, keeping a backup.
 
     Only the ``action`` field is taken from the browser. Everything
     else -- hashes, occurrence lists, dimensions -- is whatever the
     scan wrote, so a stale or tampered page cannot change what a
     decision applies to.
+
+    keep_rest: after merging, mark every cluster still 'review' as
+    'keep' — INCLUDING clusters the paginated client never loaded.
+    Without this the 'Keep all undecided' button only covered loaded
+    cards, and --apply would fail-closed on a 40k sheet's unloaded
+    tail.
     """
     with open(review_path) as handle:
         review = json.load(handle)
@@ -297,6 +356,11 @@ def _write_back(review_path: Path, decisions: list) -> dict:
         if action in allowed and action != entry.get('action'):
             entry['action'] = action
             changed += 1
+    if keep_rest:
+        for entry in review.get('clusters', []):
+            if entry.get('action', 'review') == 'review':
+                entry['action'] = 'keep'
+                changed += 1
     review['reviewed'] = datetime.now(timezone.utc).isoformat(
         timespec='seconds')
 
@@ -327,19 +391,67 @@ def serve(review_path: Path, audit_dir: Path, port: int = 8000,
             self.end_headers()
             self.wfile.write(body)
 
+        def _load_review(self):
+            with open(review_path) as handle:
+                return json.load(handle)
+
         def do_GET(self):
-            if self.path not in ('/', '/index.html'):
-                self._send(404, b'{"error":"not found"}')
+            parsed = urlparse(self.path)
+
+            if parsed.path in ('/', '/index.html'):
+                try:
+                    review = self._load_review()
+                except (OSError, ValueError) as exc:
+                    self._send(500, json.dumps(
+                        {'error': str(exc)}).encode())
+                    return
+                self._send(200, render_page(review, audit_dir),
+                           'text/html; charset=utf-8')
                 return
-            try:
-                with open(review_path) as handle:
-                    review = json.load(handle)
-            except (OSError, ValueError) as exc:
-                self._send(500, json.dumps(
-                    {'error': str(exc)}).encode())
+
+            if parsed.path == '/clusters':
+                try:
+                    query = parse_qs(parsed.query)
+                    offset = max(0, int(query.get('offset', ['0'])[0]))
+                    limit = min(PAGE_SIZE, max(
+                        1, int(query.get('limit', [str(PAGE_SIZE)])[0])))
+                    review = self._load_review()
+                except (OSError, ValueError) as exc:
+                    self._send(400, json.dumps(
+                        {'error': str(exc)}).encode())
+                    return
+                body = json.dumps({'clusters': _cluster_items(
+                    review, offset, limit)}).encode()
+                self._send(200, body)
                 return
-            self._send(200, render_page(review, audit_dir),
-                       'text/html; charset=utf-8')
+
+            if parsed.path.startswith('/thumbs/'):
+                name = parsed.path[len('/thumbs/'):]
+                if not _THUMB_NAME_RE.match(name):
+                    self._send(404, b'{"error":"not found"}')
+                    return
+                thumb_path = (audit_dir / 'thumbs' / name).resolve()
+                if (audit_dir.resolve() not in thumb_path.parents
+                        or not thumb_path.is_file()):
+                    self._send(404, b'{"error":"not found"}')
+                    return
+                try:
+                    blob = thumb_path.read_bytes()
+                except OSError:
+                    self._send(404, b'{"error":"not found"}')
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/png')
+                self.send_header('Content-Length', str(len(blob)))
+                # Thumbnails are content-stable per sheet: let the
+                # browser cache them across reloads of a 40k review.
+                self.send_header('Cache-Control',
+                                 'private, max-age=86400')
+                self.end_headers()
+                self.wfile.write(blob)
+                return
+
+            self._send(404, b'{"error":"not found"}')
 
         def do_POST(self):
             if self.path != '/save':
@@ -350,8 +462,9 @@ def serve(review_path: Path, audit_dir: Path, port: int = 8000,
                 if length <= 0 or length > 8 * 1024 * 1024:
                     raise ValueError('bad content length')
                 payload = json.loads(self.rfile.read(length))
-                result = _write_back(review_path,
-                                     payload.get('clusters', []))
+                result = _write_back(
+                    review_path, payload.get('clusters', []),
+                    keep_rest=bool(payload.get('keep_rest', False)))
             except Exception as exc:
                 self._send(400, json.dumps({'error': str(exc)}).encode())
                 return
