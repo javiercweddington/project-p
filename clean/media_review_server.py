@@ -105,7 +105,7 @@ function card(c, i) {
   const hot = new Set(['in_template_chrome', 'spread_across_corpus']);
   return `<div class="card" id="c${i}" data-a="${c.action}">
     <div class="thumb${c.thumb ? '' : ' blind'}">${c.thumb
-      ? `<img src="${c.thumb}" alt="${c.id}">`
+      ? `<img src="${c.thumb}" alt="${c.id}" loading="lazy" decoding="async">`
       : `<b>&#9888; CANNOT RENDER (${c.format || 'unknown format'})</b>
          <span>You are deciding blind — open a source document from
          &ldquo;where it appears&rdquo; below before choosing Keep.</span>`
@@ -132,9 +132,24 @@ function card(c, i) {
 }
 
 function render() {
-  grid.innerHTML = DATA.clusters.map(card).join('');
-  DATA.clusters.forEach((c, i) => paint(i));
-  status();
+  // Chunked render + lazy imgs: a 39,754-cluster sheet (10x dossier)
+  // froze the tab for minutes building 40k cards in one shot and
+  // queued 40k thumbnail fetches through the SSH tunnel. First
+  // screenful is interactive immediately; the rest streams in.
+  grid.innerHTML = '';
+  const CHUNK = 400;
+  let next = 0;
+  function step() {
+    const stop = Math.min(next + CHUNK, DATA.clusters.length);
+    const buf = [];
+    for (let i = next; i < stop; i++) buf.push(card(DATA.clusters[i], i));
+    grid.insertAdjacentHTML('beforeend', buf.join(''));
+    for (let i = next; i < stop; i++) paint(i);
+    next = stop;
+    status();
+    if (next < DATA.clusters.length) requestAnimationFrame(step);
+  }
+  step();
 }
 
 function paint(i) {

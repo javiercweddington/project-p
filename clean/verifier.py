@@ -256,6 +256,45 @@ class LeakageChecker:
             return re.compile(r'(?!x)x')
         return re.compile(re.escape(original), re.IGNORECASE)
 
+    def _token_automaton(self):
+        """Aho-Corasick automaton over every mapping's prefilter tokens.
+
+        The per-mapping prefilter was O(entities x text bytes) PER FILE
+        — py-spy showed the `any(tok in text_lower ...)` genexpr
+        dominating a 100-minute scan on a 759-file unit with a large
+        GLiNER-discovered mapper, and the same cost repeats in final
+        verification and every stage-2 unit. One automaton pass over
+        the text replaces thousands of full-text substring scans.
+        Rebuilt lazily when the mapper grows; None when pyahocorasick
+        is unavailable (fallback dedupes token lookups per file, which
+        is the lesser but still real win).
+        """
+        key = self.mapper.mapping_count
+        cached = self._prefilter_cache.get('_automaton')
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            import ahocorasick
+        except ImportError:
+            if '_ac_warned' not in self._prefilter_cache:
+                self._prefilter_cache['_ac_warned'] = True
+                _logger.info(
+                    'pyahocorasick not installed — leakage prefilter '
+                    'runs per-token (pip install pyahocorasick for a '
+                    'large-mapper speedup).')
+            self._prefilter_cache['_automaton'] = (key, None)
+            return None
+        auto = ahocorasick.Automaton()
+        for mapping in self.mapper.mappings:
+            if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
+                continue
+            for tok in self._prefilter_tokens(mapping.original,
+                                              mapping.entity_type):
+                auto.add_word(tok, tok)
+        auto.make_automaton()
+        self._prefilter_cache['_automaton'] = (key, auto)
+        return auto
+
     def check_text(self, cleaned_text: str, file_path: str = "") -> List[LeakageHit]:
         """Check cleaned text for any surviving original entity strings."""
         hits = []
@@ -264,6 +303,21 @@ class LeakageChecker:
         # dominant verification cost on multi-MB files (CAD text, raw
         # binary scans); the prefilter skips patterns that cannot match.
         text_lower = cleaned_text.lower()
+
+        auto = self._token_automaton()
+        found_tokens = None
+        if auto is not None:
+            found_tokens = {tok for _end, tok in auto.iter(text_lower)}
+        token_present: Dict[str, bool] = {}
+
+        def _tok_in(tok: str) -> bool:
+            if found_tokens is not None:
+                return tok in found_tokens
+            v = token_present.get(tok)
+            if v is None:
+                v = tok in text_lower
+                token_present[tok] = v
+            return v
 
         for mapping in self.mapper.mappings:
             original = mapping.original
@@ -275,7 +329,7 @@ class LeakageChecker:
                 continue
 
             tokens = self._prefilter_tokens(original, mapping.entity_type)
-            if tokens and not any(tok in text_lower for tok in tokens):
+            if tokens and not any(_tok_in(tok) for tok in tokens):
                 continue
 
             pattern = self._entity_pattern(original, mapping.entity_type)
