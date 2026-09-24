@@ -622,8 +622,34 @@ class PDFCleaner:
                         )
                         return False
 
+                # Physically huge sheets (packaging dielines: metre-wide
+                # media boxes) rasterize to 40-50 MEGAPIXEL images at a
+                # fixed DPI, and every downstream stage — OCR, erase
+                # morphology, re-OCR verify, PNG encode — pays per
+                # pixel (live: 9 files/HOUR through a dieline folder, a
+                # 594KB PDF ballooning to 8.7MB). Cap the render's max
+                # dimension and let DPI float down for oversized pages;
+                # normal drawings are untouched.
+                try:
+                    max_dim = int(os.environ.get(
+                        'PROJECT_P_PDF_MAX_RENDER_DIM', '5000'))
+                except ValueError:
+                    max_dim = 5000
+                page_zoom = zoom
+                if max_dim > 0:
+                    rect = page.rect
+                    biggest = max(rect.width, rect.height) * zoom
+                    if biggest > max_dim:
+                        page_zoom = zoom * (max_dim / biggest)
+                        _logger.info(
+                            "Oversized page %d of %s (%.0fpx at %ddpi) "
+                            "— render capped to %dpx (effective "
+                            "%.0fdpi).", page_num + 1, input_path.name,
+                            biggest, dpi, max_dim,
+                            dpi * page_zoom / zoom)
                 pix = page.get_pixmap(
-                    matrix=fitz.Matrix(zoom, zoom), alpha=False)
+                    matrix=fitz.Matrix(page_zoom, page_zoom),
+                    alpha=False)
                 img = Image.frombytes(
                     'RGB', (pix.width, pix.height), pix.samples)
 
@@ -631,8 +657,8 @@ class PDFCleaner:
                     cover_draw = ImageDraw.Draw(img)
                     for rect in cover_rects:
                         cover_draw.rectangle(
-                            [rect.x0 * zoom, rect.y0 * zoom,
-                             rect.x1 * zoom, rect.y1 * zoom],
+                            [rect.x0 * page_zoom, rect.y0 * page_zoom,
+                             rect.x1 * page_zoom, rect.y1 * page_zoom],
                             fill=(0, 0, 0))
                     _logger.info(
                         "Covered %d undeletable image placement(s) on "
@@ -664,8 +690,10 @@ class PDFCleaner:
                             # Substring-only hit inside larger words
                             continue
                         draw.rectangle(
-                            [expanded.x0 * zoom - 2, expanded.y0 * zoom - 2,
-                             expanded.x1 * zoom + 2, expanded.y1 * zoom + 2],
+                            [expanded.x0 * page_zoom - 2,
+                             expanded.y0 * page_zoom - 2,
+                             expanded.x1 * page_zoom + 2,
+                             expanded.y1 * page_zoom + 2],
                             fill=(0, 0, 0))
 
                 # Belt 2: pixel-level redaction shared with image files

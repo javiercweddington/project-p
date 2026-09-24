@@ -226,6 +226,12 @@ class EntityMapper:
         # deduped by (type, value): review-file suggestions the human can
         # promote to seeds.
         self._demoted: Dict[Tuple[str, str], Dict] = {}
+        # Registration is read-modify-write (counter increment + dict
+        # insert): parallel per-file cleaning (--workers) would mint
+        # duplicate placeholders without it. RLock: variant derivation
+        # recurses into get_or_create.
+        import threading
+        self._lock = threading.RLock()
 
     @property
     def mappings(self) -> List[EntityMapping]:
@@ -396,6 +402,13 @@ class EntityMapper:
     def get_or_create(self, entity_type: str, value: str,
                       source: Optional[str] = None,
                       derive_variants: bool = True) -> str:
+        with self._lock:
+            return self._get_or_create_locked(
+                entity_type, value, source, derive_variants)
+
+    def _get_or_create_locked(self, entity_type: str, value: str,
+                              source: Optional[str] = None,
+                              derive_variants: bool = True) -> str:
         """Get existing placeholder or create a new one.
 
         Args:

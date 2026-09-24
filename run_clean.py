@@ -166,6 +166,12 @@ def main() -> int:
                         help='Served model name (default qwen27b)')
     parser.add_argument('--llm-key', default=None,
                         help='API key for the endpoint (default not-needed)')
+    parser.add_argument('--workers', type=int, default=1, metavar='N',
+                        help='Files cleaned concurrently within this '
+                             'run (default 1). The heavy stages release '
+                             'the GIL, so 3-4 scales well on a many-'
+                             'core box. Note: the per-file time budget '
+                             'only arms with 1 worker.')
     parser.add_argument('--clobber', action='store_true',
                         help='Delete an existing non-empty staging dir '
                              'before cleaning. Without it, a non-empty '
@@ -183,6 +189,7 @@ def main() -> int:
         print(f'ERROR: {e}', file=sys.stderr)
         return 2
     os.environ['PROJECT_P_ENTITY_TYPES'] = targets
+    os.environ['PROJECT_P_CLEAN_WORKERS'] = str(max(1, args.workers))
     os.environ['PROJECT_P_LLM_VERIFY'] = args.llm
     os.environ['PROJECT_P_OPAQUE_BINARY'] = args.opaque_binary
     os.environ['PROJECT_P_COMB'] = '1' if args.comb == 'on' else '0'

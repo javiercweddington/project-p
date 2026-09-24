@@ -476,30 +476,36 @@ class CleanPipeline:
         todo = [f for f in self.staging_dir.rglob('*')
                 if f.is_file() and not f.name.startswith('.')]
         progress = getattr(self, '_progress', None) or _Progress()
-        progress.stage(f'cleaning {len(todo)} files (pass 1)')
 
-        for file_index, staging_file in enumerate(todo, 1):
-            progress.step(file_index, len(todo), staging_file.name)
+        # Per-file parallelism (PROJECT_P_CLEAN_WORKERS / --workers).
+        # The heavy work — render, OCR, matching, morphology, encode —
+        # is C code that releases the GIL, so threads scale on a
+        # many-core box (live: a single-unit 14,404-file dossier at 9
+        # files/HOUR sequential). The mapper is lock-guarded; all
+        # bookkeeping (tracker, size-delta, mtime, quarantine) stays in
+        # this thread. Caveat: the per-file SIGALRM time budget only
+        # arms on the main thread, so workers>1 trades the hard
+        # per-file kill for throughput — progress logging still shows
+        # any grinder by name.
+        try:
+            n_workers = max(1, int(os.environ.get(
+                'PROJECT_P_CLEAN_WORKERS', '1')))
+        except ValueError:
+            n_workers = 1
+        progress.stage(
+            f'cleaning {len(todo)} files (pass 1'
+            + (f', {n_workers} workers)' if n_workers > 1 else ')'))
 
-            if staging_file.suffix.lower() in IMAGE_EXTS:
-                images_cleaned += 1
-
+        def _clean_one(staging_file: Path):
             rel_path = staging_file.relative_to(self.staging_dir)
             source_file = self.source_dir / rel_path
-
-            # Get entity spans for this file
             entity_spans = self._entity_spans.get(str(rel_path), None)
-
-            # Record original size before cleaning
             orig_size = source_file.stat().st_size
-
-            # Clean in-place (staging file is both input and output)
             success = router.clean_file(
                 input_path=source_file,
                 output_path=staging_file,
                 entity_spans=entity_spans,
             )
-
             if success and not staging_file.exists():
                 # Format-converting cleaners (legacy .ppt -> image-only
                 # .pdf) write a sibling with a new extension and remove
@@ -515,6 +521,31 @@ class CleanPipeline:
                         "Cleaner reported success for %s but no output "
                         "exists; treating as failure.", rel_path)
                     success = False
+            return success, staging_file, rel_path, source_file, orig_size
+
+        if n_workers > 1:
+            # Pre-warm lazily-initialized shared components (raster
+            # ImageCleaner, OCR engine) so worker threads don't race
+            # their construction.
+            try:
+                router.pdf_cleaner._get_image_cleaner()
+            except Exception:
+                pass
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor(max_workers=n_workers)
+            outcome_iter = executor.map(_clean_one, todo)
+        else:
+            executor = None
+            outcome_iter = map(_clean_one, todo)
+
+        file_index = 0
+        for outcome in outcome_iter:
+            file_index += 1
+            (success, staging_file, rel_path, source_file,
+             orig_size) = outcome
+            progress.step(file_index, len(todo), staging_file.name)
+            if staging_file.suffix.lower() in IMAGE_EXTS:
+                images_cleaned += 1
 
             if success:
                 # Record hashes and sizes
@@ -542,6 +573,9 @@ class CleanPipeline:
                 _logger.warning("Failed to clean %s", rel_path)
                 # Quarantine: move the original file outside the deliverable
                 self._quarantine_file(staging_file, rel_path)
+
+        if executor is not None:
+            executor.shutdown(wait=True)
 
         # RETROACTIVE PASSES: entities discovered mid-run (emails inside a
         # workbook, authors in document metadata) were unknown when earlier
