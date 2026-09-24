@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import struct
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -467,7 +468,7 @@ class ImageCleaner:
         return self.redact_pil(work, source_name=str(input_path))
 
     def _logo_box_reject_reason(self, work, x: int, y: int,
-                                w: int, h: int):
+                                w: int, h: int, page_lines=None):
         """Adjudicate one template-match box; None means paint it.
 
         Template correlation cannot separate true marks from two FP
@@ -519,6 +520,41 @@ class ImageCleaner:
             pass
 
         try:
+            # Prefer the ALREADY-COMPUTED full-page OCR: a fresh crop
+            # probe per candidate cost ~0.3s x dozens of boxes on
+            # text-dense packaging artwork. Words the main pass placed
+            # inside the box ARE confident recognitions; a fresh probe
+            # only runs when the page pass read nothing there.
+            if page_lines is not None:
+                words_in = [
+                    word for wordlist in page_lines.values()
+                    for word, wx, wy, ww, wh in wordlist
+                    if (x <= wx + ww / 2 <= x + w
+                        and y <= wy + wh / 2 <= y + h)]
+                text = ' '.join(words_in)
+                alnum = sum(ch.isalnum() for ch in text)
+                # Fast rejection ONLY for unambiguous printed labels:
+                # page-OCR words carry no confidence, and cursive marks
+                # garble into word-shaped junk ('(ities' from a live
+                # etched logo — 5 alnum chars). Real labels are
+                # DICTIONARY words ('NUMBER', 'DIMENSIONS'); anything
+                # else falls through to the confidence-gated crop
+                # probe, which is what keeps script marks.
+                if alnum >= 5:
+                    lowered = text.lower()
+                    from ..anonymizer import (NON_TEXT_ENTITY_TYPES,
+                                              _is_dictionary_word)
+                    for mapping in self.mapper.mappings:
+                        if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
+                            continue
+                        needle = mapping.original.strip().lower()
+                        if len(needle) >= 3 and needle in lowered:
+                            return None  # legible name -> still a logo
+                    tokens = [t for t in re.split(r'[^a-zA-Z]+', text)
+                              if len(t) >= 4]
+                    if any(_is_dictionary_word(t) for t in tokens):
+                        return (f'machine-readable text {text[:40]!r} '
+                                f'(page OCR)')
             if self.image_ocr and self.image_ocr.available:
                 probe = crop
                 if min(probe.size) < 60:
@@ -578,7 +614,11 @@ class ImageCleaner:
                     if pattern is not None:
                         yield mapping.original, pattern
 
+            _tm = ({'start': time.time()}
+                   if os.environ.get('PROJECT_P_TIMING') == '1' else None)
             lines = _ocr_lines(work)
+            if _tm is not None:
+                _tm['ocr'] = time.time() - _tm['start']
 
             # Register deterministic identifiers from the OCR text so
             # accounts/codes/emails seen only in pixels also become
@@ -662,6 +702,11 @@ class ImageCleaner:
 
             draw = ImageDraw.Draw(work)
             had_redactions = False
+            # Text redactions gate the re-OCR verify loop; logo fills
+            # alone must NOT (a page with only logo covers paid up to
+            # 3 full-page re-OCRs verifying text needles that were
+            # never present — dominant cost on packaging artwork).
+            had_text_redactions = False
             patterns = list(_entity_patterns())
 
             # Belt 0: logo template matching — the leak class OCR can
@@ -673,13 +718,15 @@ class ImageCleaner:
             # unpadded boxes on 8 of 9 HoleSaw sheets) and filled with
             # the LOCAL BACKGROUND color, not black — the blank should
             # read as empty paper, not as a censor bar.
+            if _tm is not None:
+                _tm['belt0_t0'] = time.time()
             try:
                 from ..logo_match import env_templates, find_logo_boxes
                 logo_templates = env_templates()
                 if logo_templates:
                     def _reject_box(rx, ry, rw, rh):
                         reason = self._logo_box_reject_reason(
-                            work, rx, ry, rw, rh)
+                            work, rx, ry, rw, rh, page_lines=lines)
                         if reason:
                             _logger.info(
                                 "Logo box (%d,%d,%dx%d) in %s rejected:"
@@ -730,6 +777,8 @@ class ImageCleaner:
             except Exception as e:
                 _logger.warning("Logo template matching failed for %s: "
                                 "%s", source_name, e)
+            if _tm is not None:
+                _tm['belt0'] = time.time() - _tm.pop('belt0_t0')
 
             # Caps-styled pages (engineering drawings, CAD title blocks)
             # set virtually ALL text in capitals by drafting convention —
@@ -756,12 +805,13 @@ class ImageCleaner:
                     round(caps_ratio * 100), source_name)
 
             def _redact_box(x, y, w, h):
-                nonlocal had_redactions
+                nonlocal had_redactions, had_text_redactions
                 pad = max(2, h // 8)
                 draw.rectangle(
                     [x - pad, y - pad, x + w + pad, y + h + pad],
                     fill=(0, 0, 0))
                 had_redactions = True
+                had_text_redactions = True
 
             # Rule pass: identifier tokens + all-caps runs. A lone ALL-CAPS
             # word of >=6 letters is also redacted — line wraps strand the
@@ -808,7 +858,9 @@ class ImageCleaner:
 
             total_words = sum(len(words) for words in lines.values())
 
-            if had_redactions:
+            if _tm is not None:
+                _tm['verify_t0'] = time.time()
+            if had_text_redactions:
                 # Verify: re-OCR the redacted image; every entity pattern
                 # must now be unreadable. A residual match is COVERED at
                 # its re-OCR position and verified again (OCR segments
@@ -845,6 +897,17 @@ class ImageCleaner:
                             if ws < end and we > start:
                                 _redact_box(x, y, w, h)
 
+            if _tm is not None:
+                now = time.time()
+                _logger.info(
+                    "timing %s: total=%.1fs ocr=%.1fs belt0=%.1fs "
+                    "verify=%.1fs other=%.1fs (text_redactions=%s)",
+                    source_name, now - _tm['start'],
+                    _tm.get('ocr', 0), _tm.get('belt0', 0),
+                    now - _tm['verify_t0'],
+                    (_tm['verify_t0'] - _tm['start'] - _tm.get('ocr', 0)
+                     - _tm.get('belt0', 0)),
+                    had_text_redactions)
             return work, had_redactions, total_words
 
         except Exception as e:
