@@ -600,7 +600,12 @@ class EntityMapper:
         if auto is not None:
             found = {tok for _end, tok in auto.iter(text_lower)}
         out = []
-        for m in self._mappings.values():
+        # SNAPSHOT the mappings: with --workers, another thread can
+        # register a discovered entity mid-iteration ('dictionary
+        # changed size during iteration' quarantined a live xlsx).
+        # list(dict.values()) is a single C-level op under the GIL —
+        # an atomic copy; iterating the live view is not.
+        for m in list(self._mappings.values()):
             if m.entity_type in NON_TEXT_ENTITY_TYPES:
                 continue
             needles = self.prefilter_needles(m.original, m.entity_type)
@@ -717,7 +722,7 @@ class EntityMapper:
 
         # Group by entity type
         by_type: Dict[str, List[EntityMapping]] = defaultdict(list)
-        for m in self._mappings.values():
+        for m in list(self._mappings.values()):
             by_type[m.entity_type].append(m)
 
         for etype in sorted(by_type.keys()):
@@ -734,7 +739,7 @@ class EntityMapper:
     def to_dict(self) -> Dict[str, Dict]:
         """Export mappings as a serializable dictionary."""
         result = {}
-        for m in self._mappings.values():
+        for m in list(self._mappings.values()):
             result[m.placeholder] = {
                 'original': m.original,
                 'entity_type': m.entity_type,
