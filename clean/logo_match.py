@@ -267,21 +267,25 @@ class _TorchNCC:
         import torch
         self.torch = torch
         self.device = device
+        # Device for the float64 window-stat + division + thresholding
+        # math. On CUDA that stays on the GPU (the whole point: the
+        # post-FFT work, not the FFT, was the CPU/GIL bottleneck that
+        # left the cards idle). float64 cumsum over a full page cancels
+        # catastrophically in float32, and MPS has no float64 — so on
+        # MPS the stats math falls back to CPU (correct, just not the
+        # speedup; MPS is a dev box, CUDA is production).
+        self.dev64 = device if device == 'cuda' else 'cpu'
         with torch.no_grad():
             P = torch.from_numpy(page.astype('float32')).to(device)
             self.H, self.W = P.shape
             self.FP = torch.fft.rfft2(P)
             # Integral images padded with a zero row/col so window
-            # sums are 4 lookups with no edge cases. ALWAYS CPU
-            # float64: cumsum of squared pixels over a full page
-            # cancels catastrophically in float32, and MPS has no
-            # float64 — the lookups are cheap, only the FFT needs the
-            # accelerator.
-            Pc = torch.from_numpy(page.astype('float64'))
+            # sums are 4 lookups with no edge cases.
+            Pc = torch.from_numpy(page.astype('float64')).to(self.dev64)
             def integral(a):
                 s = torch.cumsum(torch.cumsum(a, 0), 1)
                 out = torch.zeros(self.H + 1, self.W + 1,
-                                  dtype=torch.float64)
+                                  dtype=torch.float64, device=self.dev64)
                 out[1:, 1:] = s
                 return out
             self.SP = integral(Pc)
@@ -297,31 +301,65 @@ class _TorchNCC:
                     - S[th:th + oh, :ow] + S[:oh, :ow])
         return win(SP), win(SP2)
 
+    def _corr_map(self, tmpl):
+        """Full NCC map for one template, as a float64 tensor on
+        self.dev64. Everything after the page-FFT stays on that device
+        — on CUDA the window stats, division and flat-window zeroing
+        never touch the CPU (the old .cpu().double() per template was
+        the GIL-held bottleneck that left the GPUs idle)."""
+        torch = self.torch
+        th, tw = tmpl.shape
+        T = torch.from_numpy(tmpl.astype('float32')).to(self.device)
+        T = T - T.mean()
+        t_energy = float((T * T).sum())
+        FT = torch.fft.rfft2(T, s=(self.H, self.W))
+        cc = torch.fft.irfft2(self.FP * FT.conj(), s=(self.H, self.W))
+        num = cc[:self.H - th + 1, :self.W - tw + 1].to(
+            device=self.dev64, dtype=torch.float64)
+        win_sum, win_sum2 = self._window_stats(th, tw)
+        n = float(th * tw)
+        win_var = (win_sum2 - win_sum * win_sum / n).clamp_min(0)
+        denom = (win_var * t_energy).sqrt().clamp_min(self._eps)
+        res = num / denom
+        # Flat windows (blank paper — MOST of a drawing) have exactly
+        # zero variance; the true numerator there is 0 but FFT roundoff
+        # isn't, and noise/eps scored ~everything above threshold on a
+        # real sheet. cv2 special-cases this; so do we. Integer-valued
+        # pixels in float64 make the zero-variance test exact.
+        res[win_var <= 0] = 0.0
+        return res
+
     def match(self, tmpl):
+        with self.torch.no_grad():
+            return self._corr_map(tmpl).float().cpu().numpy()
+
+    def match_peaks(self, tmpl, threshold, max_peaks):
+        """Peaks of |NCC| >= threshold for BOTH polarities, computed and
+        thresholded ON DEVICE — only the (few) peak coords come back to
+        the CPU, not the whole correlation map. Returns a list of
+        (x, y, score) with score = |correlation| (the value the caller's
+        NMS ranks on), capped per-polarity at max_peaks by score, exactly
+        mirroring the old two-pass np.where(±result)+argsort-top-K."""
         torch = self.torch
         with torch.no_grad():
-            th, tw = tmpl.shape
-            T = torch.from_numpy(tmpl.astype('float32')).to(self.device)
-            T = T - T.mean()
-            t_energy = float((T * T).sum())
-            FT = torch.fft.rfft2(T, s=(self.H, self.W))
-            cc = torch.fft.irfft2(self.FP * FT.conj(),
-                                  s=(self.H, self.W))
-            num = cc[:self.H - th + 1,
-                     :self.W - tw + 1].cpu().double()
-            win_sum, win_sum2 = self._window_stats(th, tw)
-            n = float(th * tw)
-            win_var = (win_sum2 - win_sum * win_sum / n).clamp_min(0)
-            denom = (win_var * t_energy).sqrt().clamp_min(self._eps)
-            res = num / denom
-            # Flat windows (blank paper — MOST of a drawing) have
-            # exactly zero variance; the true numerator there is 0 but
-            # FFT roundoff isn't, and noise/eps scored ~everything
-            # above threshold on a real sheet. cv2 special-cases this;
-            # so do we. Integer-valued pixels in float64 make the
-            # zero-variance test exact.
-            res[win_var <= 0] = 0.0
-            return res.float().cpu().numpy()
+            res = self._corr_map(tmpl)
+            out = []
+            for sign in (1.0, -1.0):
+                mask = (res * sign) >= threshold
+                idx = torch.nonzero(mask, as_tuple=False)
+                if idx.numel() == 0:
+                    continue
+                ys = idx[:, 0]
+                xs = idx[:, 1]
+                scores = res[ys, xs] * sign  # >= threshold, positive
+                if scores.numel() > max_peaks:
+                    keep = torch.argsort(scores)[-max_peaks:]
+                    ys, xs, scores = ys[keep], xs[keep], scores[keep]
+                ys = ys.cpu().tolist()
+                xs = xs.cpu().tolist()
+                scores = scores.cpu().tolist()
+                out.extend(zip(xs, ys, scores))
+            return out
 
 
 def _make_torch_ncc(page):
@@ -430,26 +468,34 @@ def find_logo_boxes(pil_image, templates,
                                interpolation=cv2.INTER_AREA), (3, 3), 0)
                 if int(t_scaled.std()) == 0:
                     continue
+                # Inverted polarity comes for free either way: a
+                # zero-mean-inverted template's NCC map is exactly the
+                # NEGATED map of the original, so both polarities read
+                # off one correlation as |score|.
                 if ncc is not None:
-                    result = ncc.match(t_scaled)
+                    # On-device threshold+peak-pick: only the handful of
+                    # peaks return, not the full map (no per-template
+                    # CPU np.where — the GIL tail that idled the GPUs).
+                    peaks = ncc.match_peaks(
+                        t_scaled, threshold, _MAX_RAW_PEAKS)
+                    for x, y, score in peaks:
+                        boxes.append((int(x * ratio), int(y * ratio),
+                                      int(tw * ratio), int(th * ratio),
+                                      float(score), name))
                 else:
                     result = cv2.matchTemplate(page, t_scaled,
                                                cv2.TM_CCOEFF_NORMED)
-                # Inverted polarity for free: a zero-mean-inverted
-                # template's TM_CCOEFF_NORMED map is exactly the
-                # NEGATED map of the original ((255-T) - mean(255-T)
-                # == -(T - mean(T))), so both polarities come from one
-                # correlation. (The old loop matched twice for
-                # identical results at double the cost.)
-                for result in (result, -result):
-                    ys, xs = np.where(result >= threshold)
-                    if len(xs) > _MAX_RAW_PEAKS:
-                        top = np.argsort(result[ys, xs])[-_MAX_RAW_PEAKS:]
-                        ys, xs = ys[top], xs[top]
-                    for x, y in zip(xs, ys):
-                        boxes.append((int(x * ratio), int(y * ratio),
-                                      int(tw * ratio), int(th * ratio),
-                                      float(result[y, x]), name))
+                    for result in (result, -result):
+                        ys, xs = np.where(result >= threshold)
+                        if len(xs) > _MAX_RAW_PEAKS:
+                            top = np.argsort(
+                                result[ys, xs])[-_MAX_RAW_PEAKS:]
+                            ys, xs = ys[top], xs[top]
+                        for x, y in zip(xs, ys):
+                            boxes.append(
+                                (int(x * ratio), int(y * ratio),
+                                 int(tw * ratio), int(th * ratio),
+                                 float(result[y, x]), name))
 
     # Stage 1: per-template NMS (dedup one mark hit at many scales/
     # variants), then the junk-template guard on the deduped counts. A
