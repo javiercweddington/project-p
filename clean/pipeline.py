@@ -531,9 +531,16 @@ class CleanPipeline:
                 router.pdf_cleaner._get_image_cleaner()
             except Exception:
                 pass
-            from concurrent.futures import ThreadPoolExecutor
+            from concurrent.futures import (ThreadPoolExecutor,
+                                            as_completed)
             executor = ThreadPoolExecutor(max_workers=n_workers)
-            outcome_iter = executor.map(_clean_one, todo)
+            # as_completed, NOT map: map yields in submission order, so
+            # one monster file froze the progress counter at its index
+            # for hours while workers ran far ahead (live: counter at
+            # 80/14404 with the log visibly cleaning much later files —
+            # read as a hang, was a healthy run).
+            futures = [executor.submit(_clean_one, f) for f in todo]
+            outcome_iter = (f.result() for f in as_completed(futures))
         else:
             executor = None
             outcome_iter = map(_clean_one, todo)
