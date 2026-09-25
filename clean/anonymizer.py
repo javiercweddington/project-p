@@ -226,6 +226,8 @@ class EntityMapper:
         # deduped by (type, value): review-file suggestions the human can
         # promote to seeds.
         self._demoted: Dict[Tuple[str, str], Dict] = {}
+        # (mapping_count, automaton) cache for candidate_mappings.
+        self._needle_auto_cache = None
         # Registration is read-modify-write (counter increment + dict
         # insert): parallel per-file cleaning (--workers) would mint
         # duplicate placeholders without it. RLock: variant derivation
@@ -556,6 +558,61 @@ class EntityMapper:
         _PREFILTER_NEEDLE_CACHE[cache_key] = needles
         return needles
 
+    def _needle_automaton(self):
+        """Aho-Corasick automaton over every text-entity mapping's
+        prefilter needles, rebuilt lazily when the mapper grows.
+        None when pyahocorasick is unavailable or no needles exist
+        (callers fall back to per-mapping substring scans)."""
+        with self._lock:
+            key = self.mapping_count
+            cached = self._needle_auto_cache
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            auto = None
+            try:
+                import ahocorasick
+                candidate = ahocorasick.Automaton()
+                added = 0
+                for m in self._mappings.values():
+                    if m.entity_type in NON_TEXT_ENTITY_TYPES:
+                        continue
+                    for n in self.prefilter_needles(
+                            m.original, m.entity_type):
+                        candidate.add_word(n, n)
+                        added += 1
+                if added:
+                    candidate.make_automaton()
+                    auto = candidate
+            except ImportError:
+                pass
+            self._needle_auto_cache = (key, auto)
+            return auto
+
+    def candidate_mappings(self, text_lower: str) -> List['EntityMapping']:
+        """Text-entity mappings whose prefilter needles occur in the
+        text — ONE automaton pass over the text instead of per-mapping
+        substring scans. The per-mapping gate is O(entities x bytes)
+        and dominated large-mapper runs (live: a 700KB xlsx spent ~25s
+        in the XML passes; the verifier had the identical blowup and
+        the identical fix)."""
+        auto = self._needle_automaton()
+        found = None
+        if auto is not None:
+            found = {tok for _end, tok in auto.iter(text_lower)}
+        out = []
+        for m in self._mappings.values():
+            if m.entity_type in NON_TEXT_ENTITY_TYPES:
+                continue
+            needles = self.prefilter_needles(m.original, m.entity_type)
+            if needles:
+                if found is not None:
+                    if not any(n in found for n in needles):
+                        continue
+                elif not any(n in text_lower for n in needles):
+                    continue
+            out.append(m)
+        return out
+
     def replace_in_text(self, text: str, source: str = "") -> str:
         """Replace all known entities in text with their placeholders.
 
@@ -573,12 +630,12 @@ class EntityMapper:
         if not self._mappings:
             return text
 
-        # Sort mappings by original length (descending) to handle overlaps.
-        # Audit-only types (filename/directory stems) are excluded — they
-        # are often short/generic and would corrupt normal text.
+        # Sort candidate mappings (needle-gated in ONE automaton pass)
+        # by original length (descending) to handle overlaps. Audit-only
+        # types (filename/directory stems) are excluded — they are
+        # often short/generic and would corrupt normal text.
         sorted_mappings = sorted(
-            (m for m in self._mappings.values()
-             if m.entity_type not in NON_TEXT_ENTITY_TYPES),
+            self.candidate_mappings(text.lower()),
             key=lambda m: len(m.original),
             reverse=True,
         )
@@ -592,13 +649,7 @@ class EntityMapper:
         # whose needles are absent from the input cannot gain a match
         # mid-loop. With 300+ entities this gate is the difference
         # between seconds and minutes on multi-MB XML members.
-        text_lower = text.lower()
         for mapping in sorted_mappings:
-            needles = self.prefilter_needles(
-                mapping.original, mapping.entity_type)
-            if needles and not any(n in text_lower for n in needles):
-                continue
-
             pattern = self._build_pattern_cached(
                 mapping.original, mapping.entity_type)
             if pattern is None:

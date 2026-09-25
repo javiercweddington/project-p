@@ -95,13 +95,9 @@ def _replace_across_text_runs(xml_text: str, mapper, source: str) -> str:
     # Collect cross-node match spans (non-overlapping, first-come)
     spans = []
     taken = []
-    for mapping in mapper.mappings:
-        if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
-            continue
-        needles = mapper.prefilter_needles(
-            mapping.original, mapping.entity_type)
-        if needles and not any(n in joined_lower for n in needles):
-            continue
+    # Needle-gated in one automaton pass (see candidate_mappings) —
+    # the per-mapping substring gate was O(entities x bytes) per member.
+    for mapping in mapper.candidate_mappings(joined_lower):
         pattern = mapper._build_pattern_cached(
             mapping.original, mapping.entity_type)
         if pattern is None:
