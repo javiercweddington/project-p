@@ -558,64 +558,75 @@ class EntityMapper:
         _PREFILTER_NEEDLE_CACHE[cache_key] = needles
         return needles
 
-    def _needle_automaton(self):
-        """Aho-Corasick automaton over every text-entity mapping's
-        prefilter needles, rebuilt lazily when the mapper grows.
-        None when pyahocorasick is unavailable or no needles exist
-        (callers fall back to per-mapping substring scans)."""
+    def _needle_index(self):
+        """Aho-Corasick index mapping each prefilter needle -> the
+        mappings that carry it, PLUS the list of mappings that have no
+        needle (always candidates). Rebuilt lazily when the mapper
+        grows. Returns (automaton_or_None, always_list).
+
+        The payload is the mapping list, so a single text pass yields
+        the PRESENT mappings directly — the caller never iterates the
+        absent ones. (The previous version built an automaton but then
+        still looped all mappings to filter, so it was O(entities) per
+        call regardless — 1.6 BILLION `any()` calls cleaning one live
+        workbook, 19 minutes. This is that bug's fix.)"""
         with self._lock:
             key = self.mapping_count
             cached = self._needle_auto_cache
             if cached is not None and cached[0] == key:
                 return cached[1]
+            always: List['EntityMapping'] = []
             auto = None
-            try:
-                import ahocorasick
-                candidate = ahocorasick.Automaton()
-                added = 0
-                for m in self._mappings.values():
-                    if m.entity_type in NON_TEXT_ENTITY_TYPES:
-                        continue
-                    for n in self.prefilter_needles(
-                            m.original, m.entity_type):
-                        candidate.add_word(n, n)
-                        added += 1
-                if added:
-                    candidate.make_automaton()
-                    auto = candidate
-            except ImportError:
-                pass
-            self._needle_auto_cache = (key, auto)
-            return auto
+            needle_to_maps: Dict[str, list] = {}
+            for m in self._mappings.values():
+                if m.entity_type in NON_TEXT_ENTITY_TYPES:
+                    continue
+                needles = self.prefilter_needles(m.original, m.entity_type)
+                if not needles:
+                    always.append(m)      # no needle -> always a candidate
+                    continue
+                for n in needles:
+                    needle_to_maps.setdefault(n, []).append(m)
+            if needle_to_maps:
+                try:
+                    import ahocorasick
+                    auto = ahocorasick.Automaton()
+                    for n, maps in needle_to_maps.items():
+                        auto.add_word(n, maps)
+                    auto.make_automaton()
+                except ImportError:
+                    auto = None
+            result = (auto, always, needle_to_maps)
+            self._needle_auto_cache = (key, result)
+            return result
 
     def candidate_mappings(self, text_lower: str) -> List['EntityMapping']:
         """Text-entity mappings whose prefilter needles occur in the
-        text — ONE automaton pass over the text instead of per-mapping
-        substring scans. The per-mapping gate is O(entities x bytes)
-        and dominated large-mapper runs (live: a 700KB xlsx spent ~25s
-        in the XML passes; the verifier had the identical blowup and
-        the identical fix)."""
-        auto = self._needle_automaton()
-        found = None
-        if auto is not None:
-            found = {tok for _end, tok in auto.iter(text_lower)}
-        out = []
-        # SNAPSHOT the mappings: with --workers, another thread can
-        # register a discovered entity mid-iteration ('dictionary
-        # changed size during iteration' quarantined a live xlsx).
-        # list(dict.values()) is a single C-level op under the GIL —
-        # an atomic copy; iterating the live view is not.
-        for m in list(self._mappings.values()):
-            if m.entity_type in NON_TEXT_ENTITY_TYPES:
-                continue
-            needles = self.prefilter_needles(m.original, m.entity_type)
-            if needles:
-                if found is not None:
-                    if not any(n in found for n in needles):
-                        continue
-                elif not any(n in text_lower for n in needles):
-                    continue
-            out.append(m)
+        text. ONE automaton pass yields the present mappings directly
+        (O(text + hits)); absent mappings are never visited. Falls back
+        to a per-mapping substring scan only when pyahocorasick is
+        missing."""
+        auto, always, needle_to_maps = self._needle_index()
+        if auto is None:
+            # No pyahocorasick: per-needle substring gate (slow path).
+            out = list(always)
+            seen = {id(m) for m in always}
+            for needles_maps in (needle_to_maps.items()
+                                 if needle_to_maps else ()):
+                needle, maps = needles_maps
+                if needle in text_lower:
+                    for m in maps:
+                        if id(m) not in seen:
+                            seen.add(id(m))
+                            out.append(m)
+            return out
+        out = list(always)
+        seen = {id(m) for m in always}
+        for _end, maps in auto.iter(text_lower):
+            for m in maps:
+                if id(m) not in seen:
+                    seen.add(id(m))
+                    out.append(m)
         return out
 
     def replace_in_text(self, text: str, source: str = "") -> str:
