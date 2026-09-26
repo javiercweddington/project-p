@@ -605,8 +605,20 @@ class ImageCleaner:
                     raise RuntimeError('no OCR backend for word boxes')
                 return lines
 
-            def _entity_patterns():
-                for mapping in self.mapper.mappings:
+            def _entity_patterns(present_text_lower=None):
+                # PRESENCE GATE: with a large discovered mapper (live:
+                # 10k entities), building+applying a pattern for every
+                # mapping per OCR line is O(entities x lines) — the same
+                # wall as PDF belt-1. candidate_mappings() returns only
+                # the entities whose needles actually occur in this
+                # page's OCR text, in one automaton pass. Falls back to
+                # all mappings when no page text is supplied.
+                if present_text_lower is not None:
+                    src = self.mapper.candidate_mappings(present_text_lower)
+                else:
+                    src = [m for m in self.mapper.mappings
+                           if m.entity_type not in NON_TEXT_ENTITY_TYPES]
+                for mapping in src:
                     if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
                         continue
                     pattern = self.mapper._build_pattern_cached(
@@ -707,7 +719,7 @@ class ImageCleaner:
             # 3 full-page re-OCRs verifying text needles that were
             # never present — dominant cost on packaging artwork).
             had_text_redactions = False
-            patterns = list(_entity_patterns())
+            patterns = list(_entity_patterns(full_text.lower()))
 
             # Belt 0: logo template matching — the leak class OCR can
             # never see (vector logo art has no text and no embedded

@@ -433,7 +433,15 @@ class PDFCleaner:
                 # on the words it actually touches before we redact them —
                 # otherwise ordinary words get destroyed.
                 added_redactions = False
+                # Presence gate — see the raster belt-1 note: skip the
+                # per-term textpage search for entities the boundary
+                # pattern can't find in the page's own words.
+                page_word_text = ' '.join(
+                    wb[4] for wb in word_boxes) if word_boxes else ''
                 for term, placeholder, boundary_pattern in entity_terms:
+                    if (boundary_pattern is not None and page_word_text
+                            and not boundary_pattern.search(page_word_text)):
+                        continue
                     try:
                         occurrences = page.search_for(term)
                     except Exception:
@@ -671,7 +679,22 @@ class PDFCleaner:
                     word_boxes = page.get_text('words')
                 except Exception:
                     word_boxes = []
+                # PRESENCE GATE. search_for() builds a textpage and scans
+                # geometry PER TERM; with a large discovered mapper that
+                # is thousands of textpage searches per page, almost all
+                # finding nothing (live: 17 files/hour, 3 of 4 workers
+                # stuck here). The boundary pattern is already the
+                # authority for what counts as a hit — if it doesn't
+                # match the page's own word text, there is nothing to
+                # redact, so skip the expensive search_for. Same source
+                # (word_boxes) the post-search validator uses, so this
+                # cannot skip a term that would have survived validation.
+                page_word_text = ' '.join(
+                    wb[4] for wb in word_boxes) if word_boxes else ''
                 for term, _placeholder, boundary_pattern in entity_terms:
+                    if (boundary_pattern is not None and page_word_text
+                            and not boundary_pattern.search(page_word_text)):
+                        continue
                     try:
                         occurrences = page.search_for(term)
                     except Exception:
