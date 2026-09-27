@@ -433,15 +433,15 @@ class PDFCleaner:
                 # on the words it actually touches before we redact them —
                 # otherwise ordinary words get destroyed.
                 added_redactions = False
-                # Presence gate — see the raster belt-1 note: skip the
-                # per-term textpage search for entities the boundary
-                # pattern can't find in the page's own words.
+                # Present-gate via the automaton (ONE pass) — see the
+                # raster belt-1 note. Builds terms only for entities on
+                # this page instead of scanning all ~30k per page.
                 page_word_text = ' '.join(
                     wb[4] for wb in word_boxes) if word_boxes else ''
-                for term, placeholder, boundary_pattern in entity_terms:
-                    if (boundary_pattern is not None and page_word_text
-                            and not boundary_pattern.search(page_word_text)):
-                        continue
+                page_terms = (self._get_entity_terms_to_redact(
+                    page_word_text.lower()) if page_word_text
+                    else entity_terms)
+                for term, placeholder, boundary_pattern in page_terms:
                     try:
                         occurrences = page.search_for(term)
                     except Exception:
@@ -691,10 +691,15 @@ class PDFCleaner:
                 # cannot skip a term that would have survived validation.
                 page_word_text = ' '.join(
                     wb[4] for wb in word_boxes) if word_boxes else ''
-                for term, _placeholder, boundary_pattern in entity_terms:
-                    if (boundary_pattern is not None and page_word_text
-                            and not boundary_pattern.search(page_word_text)):
-                        continue
+                # Present-gate via the automaton (ONE pass) rather than a
+                # boundary_pattern.search PER TERM: the per-term gate was
+                # still O(all entities) per page — 30k regex searches x
+                # pages, 52s of a 165s PDF. candidate_mappings builds
+                # terms only for entities whose needles are on this page.
+                page_terms = (self._get_entity_terms_to_redact(
+                    page_word_text.lower()) if page_word_text
+                    else entity_terms)
+                for term, _placeholder, boundary_pattern in page_terms:
                     try:
                         occurrences = page.search_for(term)
                     except Exception:
@@ -789,7 +794,8 @@ class PDFCleaner:
                     except Exception:
                         pass
 
-    def _get_entity_terms_to_redact(self) -> List[Tuple[str, str, object]]:
+    def _get_entity_terms_to_redact(self, present_text_lower=None
+                                    ) -> List[Tuple[str, str, object]]:
         """Get (search_term, placeholder, boundary_pattern) triples.
 
         Includes each mapped entity's original text plus its collapsed /
@@ -797,13 +803,27 @@ class PDFCleaner:
         name tokens. Each triple carries the anonymizer's boundary-aware
         compiled pattern so hits from PyMuPDF's boundary-free substring
         search can be validated before redacting. Longest terms first.
+
+        present_text_lower: when given, only entities whose needles occur
+        in that text are considered (one Aho-Corasick pass via
+        candidate_mappings) — so belt-1 builds/searches terms for the few
+        entities actually ON THE PAGE, not all ~30k every page. Without
+        it, ~30k boundary_pattern.search calls per page dominated a live
+        24-page PDF (52s of the 165s). Absent-entity terms would find
+        nothing anyway, so this is a pure short-circuit.
         """
         from ..anonymizer import NON_TEXT_ENTITY_TYPES, PERSON_TOKEN_STOPWORDS
         import re as _re
 
+        if present_text_lower is not None:
+            source_mappings = self.mapper.candidate_mappings(
+                present_text_lower)
+        else:
+            source_mappings = self.mapper.mappings
+
         triples = []
         seen = set()
-        for mapping in self.mapper.mappings:
+        for mapping in source_mappings:
             if mapping.entity_type in NON_TEXT_ENTITY_TYPES:
                 continue
             original = (mapping.original or '').strip()
