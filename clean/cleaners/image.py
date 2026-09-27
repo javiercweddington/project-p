@@ -582,24 +582,35 @@ class ImageCleaner:
             pass
         return None
 
-    def redact_pil(self, work, source_name: str = '<image>'):
+    def redact_pil(self, work, source_name: str = '<image>',
+                   skip_ocr: bool = False):
         """OCR a PIL RGB image, black out entity text at word level, verify.
 
         Shared by image files and rasterized PDF pages. Returns
         (redacted_PIL_image, had_redactions, ocr_word_count) on success,
         or None when redaction could not be verified (caller must fail
         closed).
+
+        skip_ocr: caller has determined this page's text is already
+        covered by the PDF text layer (belt-1) and it carries no
+        embedded raster images — so OCR (belt 2) is redundant. Belt 0
+        (logo template matching) still runs; OCR, email registration,
+        GLiNER pixel spans, and the re-OCR verify are skipped. Only the
+        caller (pdf raster path, opt-in) sets this; standalone images
+        never do (they ARE the image).
         """
         from ..anonymizer import NON_TEXT_ENTITY_TYPES
         try:
             from PIL import ImageDraw
         except ImportError:
             return None
-        if not (self.image_ocr and self.image_ocr.available):
+        if not skip_ocr and not (self.image_ocr and self.image_ocr.available):
             return None
 
         try:
             def _ocr_lines(image):
+                if skip_ocr:
+                    return {}
                 lines = self.image_ocr.ocr_lines(image)
                 if lines is None:
                     raise RuntimeError('no OCR backend for word boxes')

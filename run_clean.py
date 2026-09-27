@@ -172,6 +172,13 @@ def main() -> int:
                              'the GIL, so 3-4 scales well on a many-'
                              'core box. Note: the per-file time budget '
                              'only arms with 1 worker.')
+    parser.add_argument('--resume', action='store_true',
+                        help='Reuse a killed run\'s staging + saved '
+                             'mapper + per-file checkpoint and clean '
+                             'only the not-yet-done files. Placeholder '
+                             'numbering stays consistent (the saved '
+                             'mapper is loaded, not re-discovered). '
+                             'Mutually exclusive with --clobber.')
     parser.add_argument('--clobber', action='store_true',
                         help='Delete an existing non-empty staging dir '
                              'before cleaning. Without it, a non-empty '
@@ -190,6 +197,12 @@ def main() -> int:
         return 2
     os.environ['PROJECT_P_ENTITY_TYPES'] = targets
     os.environ['PROJECT_P_CLEAN_WORKERS'] = str(max(1, args.workers))
+    if args.resume and args.clobber:
+        print('ERROR: --resume and --clobber are mutually exclusive '
+              '(resume reuses staging; clobber wipes it).', file=sys.stderr)
+        return 2
+    if args.resume:
+        os.environ['PROJECT_P_RESUME'] = '1'
     os.environ['PROJECT_P_LLM_VERIFY'] = args.llm
     os.environ['PROJECT_P_OPAQUE_BINARY'] = args.opaque_binary
     os.environ['PROJECT_P_COMB'] = '1' if args.comb == 'on' else '0'
@@ -224,7 +237,9 @@ def main() -> int:
     staging = Path(args.staging) if args.staging else (
         Path('/tmp/clean') / project)
     if staging.is_dir() and any(staging.iterdir()):
-        if args.clobber:
+        if args.resume:
+            print(f'Resuming into existing staging: {staging}')
+        elif args.clobber:
             import shutil
             shutil.rmtree(staging)
             print(f'Cleared existing staging: {staging}')
@@ -241,14 +256,6 @@ def main() -> int:
     # stale FILE_nnn outputs from an earlier run under SHIFTED numbers
     # absent from path_manifest.json (two pseudonyms for one original
     # breaks unlinkability). Refuse rather than merge.
-    if staging.is_dir() and any(staging.iterdir()):
-        print(f'ERROR: staging directory is not empty: {staging}\n'
-              f'  Outputs from a previous run would mix with this one '
-              f'(stale FILE_nnn pseudonyms, incomplete manifest). '
-              f'Delete it or pass a fresh --staging path.',
-              file=sys.stderr)
-        return 2
-
     llm = LocalLLM()
     print(f'LLM endpoint: {llm.base_url} (model {llm.model}) — '
           f'{"reachable" if llm.available() else "NOT reachable"} '

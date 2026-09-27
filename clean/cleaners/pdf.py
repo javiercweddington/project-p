@@ -55,6 +55,19 @@ from .text import TextCleaner
 _logger = logging.getLogger(__name__)
 
 
+def _ocr_skip_enabled() -> bool:
+    """Opt-in: skip belt-2 OCR on born-digital PDF pages (text layer
+    present, no embedded images) where belt-1 already covers the text."""
+    return os.environ.get('PROJECT_P_PDF_SKIP_OCR_TEXT_PAGES', '0') == '1'
+
+
+def _ocr_skip_min_chars() -> int:
+    try:
+        return int(os.environ.get('PROJECT_P_PDF_OCR_SKIP_MIN_CHARS', '200'))
+    except ValueError:
+        return 200
+
+
 def _keep_embedded_images() -> bool:
     """Whether embedded raster images survive cleaning.
 
@@ -726,9 +739,32 @@ class PDFCleaner:
 
                 # Belt 2: pixel-level redaction shared with image files
                 # (OCR + mapper patterns + shape rules + GLiNER + verify).
+                # OCR-SKIP (opt-in): on a born-digital page — substantial
+                # text layer AND no embedded raster images — belt-1 above
+                # already redacted the names off the text layer, and there
+                # are no images that could hide text OCR would need to
+                # read. Skipping belt-2 OCR (redundant here) removes the
+                # dominant per-page cost on text PDFs (onnxruntime.run +
+                # normalize). Logo matching (belt 0) still runs inside
+                # redact_pil. Default OFF — it trades on the born-digital
+                # assumption, so the user enables it explicitly.
+                skip_ocr = False
+                if _ocr_skip_enabled():
+                    try:
+                        has_images = bool(page.get_images(full=True))
+                        text_len = len(page.get_text('text').strip())
+                    except Exception:
+                        has_images, text_len = True, 0
+                    if text_len >= _ocr_skip_min_chars() and not has_images:
+                        skip_ocr = True
+                        _logger.debug(
+                            "OCR-skip: %s page %d (text=%d chars, no "
+                            "images) — belt-2 OCR skipped.",
+                            input_path.name, page_num + 1, text_len)
                 redaction = image_cleaner.redact_pil(
                     img,
-                    source_name=f'{input_path.name}#page{page_num + 1}')
+                    source_name=f'{input_path.name}#page{page_num + 1}',
+                    skip_ocr=skip_ocr)
                 if redaction is None:
                     _logger.warning(
                         "Could not verify pixel redaction for %s page %d "

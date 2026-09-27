@@ -180,6 +180,12 @@ class CleanPipeline:
         if flat_output is None:
             flat_output = os.environ.get('PROJECT_P_FLAT_OUTPUT', '1') == '1'
         self.flat_output = flat_output
+        # Resume: reuse an existing staging + saved mapper + per-file
+        # checkpoint from a killed run, cleaning only the not-yet-done
+        # files. The saved mapper is loaded verbatim so placeholder
+        # numbering stays consistent with the files already cleaned
+        # (re-discovering would renumber and desync the deliverable).
+        self.resume = os.environ.get('PROJECT_P_RESUME', '0') == '1'
         self.project_name = project_name
         self.source_dir = Path(source_dir)
         self.staging_dir = Path(staging_dir) if staging_dir else (
@@ -207,6 +213,8 @@ class CleanPipeline:
             )
             self._verifier_tracker.record_change(original, placeholder, source or "")
 
+        # Stored so resume can re-attach it to a reloaded mapper.
+        self._on_replace_callback = _on_replace
         self.mapper = mapper
         if self.mapper is None:
             self.mapper = EntityMapper(tracker_callback=_on_replace)
@@ -281,21 +289,40 @@ class CleanPipeline:
         _logger.info("Starting clean pipeline for %s", self.project_name)
         self._progress = _Progress()
 
-        # Step 1: Copy source to staging
-        try:
-            self._progress.stage(f'copying {self.source_dir.name} to staging')
-            self._copy_to_staging()
-        except Exception as e:
-            result.errors.append(f"Failed to copy to staging: {e}")
-            result.success = False
-            return result
+        resuming = self.resume and self._resume_state_available()
+        if self.resume and not resuming:
+            _logger.info("Resume requested but no prior staging+mapper "
+                         "checkpoint found — starting fresh.")
 
-        # Step 1b (one-pass mode): discover ALL entities up front — LLM
-        # scan plus deterministic identifier registration on the staged
-        # (still-original) content — so a single clean pass suffices and
-        # no retroactive re-cleans are needed.
-        if self.one_pass:
-            self._upfront_discovery(result)
+        if resuming:
+            # Reuse the killed run's staging (partial cleaned output) and
+            # its saved mapper; skip the copy and re-discovery entirely.
+            n_done = len(self._load_checkpoint())
+            _logger.info(
+                "RESUMING %s: reusing staging, loaded mapper (%d "
+                "entities), %d file(s) already checkpointed as done.",
+                self.project_name, self.mapper.mapping_count, n_done)
+        else:
+            # Step 1: Copy source to staging
+            try:
+                self._progress.stage(
+                    f'copying {self.source_dir.name} to staging')
+                self._copy_to_staging()
+            except Exception as e:
+                result.errors.append(f"Failed to copy to staging: {e}")
+                result.success = False
+                return result
+
+            # Step 1b (one-pass mode): discover ALL entities up front —
+            # LLM scan plus deterministic identifier registration on the
+            # staged (still-original) content — so a single clean pass
+            # suffices and no retroactive re-cleans are needed.
+            if self.one_pass:
+                self._upfront_discovery(result)
+
+            # Persist the mapper NOW, before cleaning, so a killed run is
+            # resumable with the SAME placeholder numbering.
+            self._save_mapper()
 
         # Step 2: Clean files
         cleaned, failed = self._clean_all_files(
@@ -412,6 +439,60 @@ class CleanPipeline:
 
         return result
 
+    def _checkpoint_path(self) -> Path:
+        return (self._audit_root() / self.project_name
+                / '.clean_checkpoint.tsv')
+
+    def _resume_state_available(self) -> bool:
+        """True when a killed run left enough to resume: existing staging,
+        a saved mapper, and a checkpoint. Loads the mapper as a side
+        effect so numbering matches the already-cleaned files."""
+        mapper_path = (self._audit_root() / self.project_name
+                       / '.entity_mapper.json')
+        if not (self.staging_dir.exists() and mapper_path.is_file()
+                and self._checkpoint_path().is_file()):
+            return False
+        try:
+            with open(mapper_path) as f:
+                data = json.load(f)
+            self.mapper = EntityMapper.from_dict(data)
+            # Re-wire the tracker callback onto the reloaded mapper.
+            self.mapper._tracker_callback = self._on_replace_callback
+        except Exception as e:
+            _logger.warning("Resume: could not load saved mapper (%s) — "
+                            "starting fresh.", e)
+            return False
+        return True
+
+    def _load_checkpoint(self) -> set:
+        """Set of staging-relative paths already cleaned in a prior run."""
+        done = set()
+        path = self._checkpoint_path()
+        if not path.is_file():
+            return done
+        try:
+            with open(path) as f:
+                for line in f:
+                    rel = line.rstrip('\n')
+                    if rel:
+                        done.add(rel)
+        except OSError:
+            pass
+        return done
+
+    def _append_checkpoint(self, rel_path: str) -> None:
+        """Record one file as cleaned, flushed so a kill preserves it."""
+        try:
+            path = self._checkpoint_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'a') as f:
+                f.write(rel_path + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as e:
+            _logger.debug("Checkpoint append failed for %s: %s",
+                          rel_path, e)
+
     def _copy_to_staging(self) -> None:
         """Copy source files to staging directory.
 
@@ -475,6 +556,19 @@ class CleanPipeline:
 
         todo = [f for f in self.staging_dir.rglob('*')
                 if f.is_file() and not f.name.startswith('.')]
+        # Resume: skip files a prior run already checkpointed as cleaned
+        # (their staging content is the finished output). Not-done files
+        # are re-cleaned from source (idempotent — source is immutable),
+        # so a file killed mid-clean is simply redone cleanly.
+        self._checkpoint_lock = __import__('threading').Lock()
+        if self.resume:
+            done = self._load_checkpoint()
+            if done:
+                before = len(todo)
+                todo = [f for f in todo
+                        if str(f.relative_to(self.staging_dir)) not in done]
+                _logger.info("Resume: skipping %d already-cleaned file(s), "
+                             "%d remaining.", before - len(todo), len(todo))
         progress = getattr(self, '_progress', None) or _Progress()
 
         # Per-file parallelism (PROJECT_P_CLEAN_WORKERS / --workers).
@@ -575,6 +669,11 @@ class CleanPipeline:
                 )
                 cleaned += 1
                 cleaned_files.append((staging_file, rel_path))
+                # Record as done for resume (checkpoint uses the ORIGINAL
+                # staging rel path, which is what a resumed run's rglob
+                # sees — flatten/anonymize happens later).
+                with self._checkpoint_lock:
+                    self._append_checkpoint(str(rel_path))
             else:
                 failed += 1
                 _logger.warning("Failed to clean %s", rel_path)
