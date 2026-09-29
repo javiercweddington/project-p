@@ -421,8 +421,19 @@ class PDFCleaner:
                 # 'ander' behind when 'Alex' matches inside 'Alexander'.
                 # Expanding each match to the full word boxes it touches
                 # removes the whole word cleanly.
+                # Build the textpage ONCE and share it across get_text('words')
+                # and every per-term search_for below (see raster belt-1 note):
+                # otherwise each search_for(term) re-extracts the full textpage,
+                # which on a text-heavy page with many present terms is the
+                # dominant per-page cost.
                 try:
-                    word_boxes = page.get_text('words')
+                    textpage = page.get_textpage()
+                except Exception:
+                    textpage = None
+                try:
+                    word_boxes = (page.get_text('words', textpage=textpage)
+                                  if textpage is not None
+                                  else page.get_text('words'))
                 except Exception:
                     word_boxes = []
 
@@ -456,7 +467,10 @@ class PDFCleaner:
                     else entity_terms)
                 for term, placeholder, boundary_pattern in page_terms:
                     try:
-                        occurrences = page.search_for(term)
+                        occurrences = (
+                            page.search_for(term, textpage=textpage)
+                            if textpage is not None
+                            else page.search_for(term))
                     except Exception:
                         continue
                     for rect in occurrences:
@@ -688,8 +702,22 @@ class PDFCleaner:
 
                 # Belt 1: text-layer entity boxes (exact glyph geometry).
                 draw = ImageDraw.Draw(img)
+                # Build the textpage ONCE and share it across get_text('words')
+                # and every per-term search_for below. Without this, each
+                # search_for(term) re-extracts the full textpage (pymupdf
+                # get_textpage); on a large raster page with many present
+                # terms that is thousands of textpage extractions on one page
+                # — the observed single-file stall (py-spy: MainThread pinned
+                # in page_get_textpage under search_for). One extraction,
+                # reused, makes each term a cheap geometry scan.
                 try:
-                    word_boxes = page.get_text('words')
+                    textpage = page.get_textpage()
+                except Exception:
+                    textpage = None
+                try:
+                    word_boxes = (page.get_text('words', textpage=textpage)
+                                  if textpage is not None
+                                  else page.get_text('words'))
                 except Exception:
                     word_boxes = []
                 # PRESENCE GATE. search_for() builds a textpage and scans
@@ -714,7 +742,10 @@ class PDFCleaner:
                     else entity_terms)
                 for term, _placeholder, boundary_pattern in page_terms:
                     try:
-                        occurrences = page.search_for(term)
+                        occurrences = (
+                            page.search_for(term, textpage=textpage)
+                            if textpage is not None
+                            else page.search_for(term))
                     except Exception:
                         continue
                     for rect in occurrences:
