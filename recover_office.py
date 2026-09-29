@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recover Office files corrupted by the pre-fix XML catch-all pass.
+"""Recover Office files broken by the pre-fix XML catch-all pass.
 
 Background
 ----------
@@ -11,23 +11,28 @@ reserved attribute NAME there (e.g. a company named "Target" vs the
 malformed XML — `[COMPANY_510]="..."` — and the whole workbook became
 unopenable (blank in Excel / VS Code).
 
-The fix (skip plumbing + validate well-formedness) prevents new
-corruption, but files already produced by the buggy run are broken AND
-checkpointed as done, so a plain `--resume` would skip them.
+That produced TWO kinds of broken Office files:
+  1. corrupt-but-shipped  — sitting in the cleaned tree, unreadable,
+     recorded in the resume checkpoint as "done".
+  2. quarantined          — a later fail-closed guard moved the original
+     OUT of the cleaned tree into the quarantine dir; it is therefore
+     MISSING from cleaned and NOT in the checkpoint.
+
+The code fix (skip plumbing + revert only the broken member) prevents
+both going forward. This tool repairs what the buggy run already
+produced so `--resume` can finish the job.
 
 What this does
 --------------
-1. Scans the cleaned/output tree for zip-based Office files
-   (.xlsx/.xlsm/.docx/.pptx).
-2. Flags a file as corrupt if ANY of its XML members fails to parse
-   (definitive test for this bug class — not a heuristic).
-3. For each corrupt file: restores the pristine original from --source
-   back into the staging/output tree, and removes its line from the
-   resume checkpoint so `--resume` re-cleans it (now with the fixed code).
+For every Office file (.xlsx/.xlsm/.docx/.pptx) in --source, it checks
+the matching path under --cleaned and, if that copy is MISSING or fails
+to XML-parse (corrupt), restores the pristine original into the cleaned/
+staging tree and drops its line from the resume checkpoint. Files that
+cleaned fine are left untouched.
 
-Originals are read-only inputs; this only overwrites already-broken
-outputs. Run without --apply first to see the scope; add --apply to act.
-A timestamped checkpoint backup is written before any edit.
+Originals in --source are read-only inputs; this only writes into the
+cleaned/staging tree and the checkpoint (backed up first). Run without
+--apply to see the scope; add --apply to act.
 """
 from __future__ import annotations
 
@@ -60,8 +65,8 @@ def main() -> int:
     ap.add_argument('--cleaned', required=True,
                     help='Root of the cleaned/staging output tree.')
     ap.add_argument('--source', required=True,
-                    help='Root of the pristine originals (the run\'s '
-                         '--source dir).')
+                    help="Root of the pristine originals (the run's "
+                         "--source dir).")
     ap.add_argument('--checkpoint', required=True,
                     help='Path to .clean_checkpoint.tsv for this run.')
     ap.add_argument('--apply', action='store_true',
@@ -73,55 +78,52 @@ def main() -> int:
     source = Path(args.source).resolve()
     checkpoint = Path(args.checkpoint)
 
-    corrupt: list[Path] = []
     total = 0
-    for f in cleaned.rglob('*'):
-        if f.is_file() and f.suffix.lower() in OFFICE_EXTS:
-            total += 1
-            if is_corrupt(f):
-                corrupt.append(f)
-
-    print(f"Office files scanned: {total}")
-    print(f"Corrupt (need recovery): {len(corrupt)}")
-
-    restorable: list[tuple[Path, Path, str]] = []  # (dst, src, rel)
-    missing_src: list[Path] = []
-    for f in corrupt:
-        rel = os.path.relpath(f, cleaned)
-        src = source / rel
-        if src.is_file():
-            restorable.append((f, src, rel))
+    missing: list[str] = []   # rel paths absent from cleaned (quarantined)
+    corrupt: list[str] = []   # rel paths present but unreadable
+    fine = 0
+    for src in source.rglob('*'):
+        if not (src.is_file() and src.suffix.lower() in OFFICE_EXTS):
+            continue
+        total += 1
+        rel = os.path.relpath(src, source)
+        dst = cleaned / rel
+        if not dst.exists():
+            missing.append(rel)
+        elif is_corrupt(dst):
+            corrupt.append(rel)
         else:
-            missing_src.append(f)
+            fine += 1
 
-    print(f"  - originals found (recoverable): {len(restorable)}")
-    print(f"  - originals MISSING (manual):    {len(missing_src)}")
-    for f in missing_src[:20]:
-        print(f"      MISSING SRC: {f}")
+    to_restore = missing + corrupt
+    print(f"Office files in source: {total}")
+    print(f"  cleaned OK (leave alone): {fine}")
+    print(f"  MISSING from cleaned (quarantined): {len(missing)}")
+    print(f"  CORRUPT in cleaned:                 {len(corrupt)}")
+    print(f"  -> to restore + re-clean:           {len(to_restore)}")
 
     if not args.apply:
         print("\nDRY RUN — nothing changed. Re-run with --apply to recover.")
         return 0
 
-    # Restore pristine originals over the corrupt outputs.
-    restored_rels = set()
-    for dst, src, rel in restorable:
+    # Restore pristine originals into the staging/cleaned tree.
+    for rel in to_restore:
+        dst = cleaned / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        restored_rels.add(rel)
-    print(f"\nRestored {len(restored_rels)} original(s) into the output tree.")
+        shutil.copy2(source / rel, dst)
+    print(f"\nRestored {len(to_restore)} original(s) into the cleaned tree.")
 
     # Drop restored files from the checkpoint so --resume re-cleans them.
-    if checkpoint.is_file() and restored_rels:
+    restore_set = set(to_restore)
+    if checkpoint.is_file() and restore_set:
         backup = checkpoint.with_name(
             f'{checkpoint.name}.bak.{int(time.time())}')
         shutil.copy2(checkpoint, backup)
-        kept = []
-        dropped = 0
+        kept, dropped = [], 0
         with open(checkpoint) as fh:
             for line in fh:
                 rel = line.rstrip('\n')
-                if rel in restored_rels:
+                if rel in restore_set:
                     dropped += 1
                 else:
                     kept.append(line if line.endswith('\n') else line + '\n')
@@ -129,15 +131,9 @@ def main() -> int:
             fh.writelines(kept)
         print(f"Checkpoint: dropped {dropped} line(s) "
               f"(backup at {backup.name}).")
-        if dropped != len(restored_rels):
-            print(f"  NOTE: {len(restored_rels) - dropped} restored file(s) "
-                  f"were not found in the checkpoint by rel-path — verify "
-                  f"the checkpoint rel-path convention matches the output "
-                  f"tree before resuming (otherwise --resume will skip "
-                  f"them and they stay unrecovered).")
 
-    print("\nDone. Now relaunch with --resume to re-clean the restored "
-          "files and finish the backlog.")
+    print("\nDone. Relaunch with --resume to re-clean the restored files "
+          "and finish the backlog.")
     return 0
 
 

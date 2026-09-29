@@ -198,25 +198,31 @@ def scrub_zip_xml_members(zip_path: Path, mapper,
                     new_text = _replace_across_text_runs(
                         new_text, mapper, member_label)
                     if new_text != text:
-                        # Never ship a member the replacement made
-                        # malformed. A discovered entity can collide with
-                        # text inside an attribute name/value and break
-                        # well-formedness; a corrupt part makes the whole
-                        # Office file unopenable (blank in Excel). If the
-                        # rewrite no longer parses, fail closed so the file
-                        # is quarantined, not shipped broken.
+                        # If the blunt replace broke this member's XML (an
+                        # entity string collided with markup, e.g. an
+                        # attribute), DON'T ship a corrupt part and DON'T
+                        # quarantine the whole file — keep this member's
+                        # original bytes. For Office zips those bytes are
+                        # the structured cleaner's output (openpyxl /
+                        # python-docx), already valid and already cleaned;
+                        # the catch-all only adds coverage for members the
+                        # structured pass can't reach. Step 3 verification
+                        # is the backstop for any genuine residual this
+                        # revert leaves behind.
                         try:
                             ET.fromstring(new_text)
                         except ET.ParseError as pe:
-                            _logger.error(
-                                "XML catch-all made %s::%s malformed (%s); "
-                                "failing closed.", label, info.filename, pe)
-                            return False
-                        changed = True
-                        _logger.info(
-                            "XML catch-all pass replaced entities in "
-                            "%s::%s", label, info.filename)
-                        data = new_text.encode('utf-8')
+                            _logger.warning(
+                                "XML catch-all would break %s::%s (%s); "
+                                "keeping structured-cleaned member "
+                                "unchanged.", label, info.filename, pe)
+                            # leave `data` as the original member bytes
+                        else:
+                            changed = True
+                            _logger.info(
+                                "XML catch-all pass replaced entities in "
+                                "%s::%s", label, info.filename)
+                            data = new_text.encode('utf-8')
                 members[info.filename] = data
 
         if not changed:
