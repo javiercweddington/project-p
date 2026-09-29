@@ -28,12 +28,29 @@ import bisect
 import logging
 import os
 import re
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
 _logger = logging.getLogger(__name__)
 
 _XML_SUFFIXES = ('.xml', '.rels', '.vml')
+
+
+def _is_opc_plumbing(name: str) -> bool:
+    """True for OPC plumbing members that carry no user-authored text.
+
+    Relationship graphs (*.rels) and the content-type map
+    ([Content_Types].xml) hold only relationship IDs, type URLs and target
+    paths — and their attribute NAMES include reserved words like 'Target'
+    that a discovered entity ('Target' the company) matches. The blunt
+    text replace would rewrite Target="..." into [COMPANY_510]="...",
+    malformed XML that makes the whole file unopenable (blank in Excel).
+    The structured cleaners already handle the only content-bearing case
+    here (external-link / hyperlink targets), so the catch-all skips them.
+    """
+    low = name.lower()
+    return low.endswith('.rels') or low == '[content_types].xml'
 
 # OOXML text nodes: <w:t>, <a:t>, <t>, <xdr:t>... Rich-text formatting
 # SPLITS one visible string across adjacent runs (<t>MAKRO</t><t>LON</t>),
@@ -168,7 +185,8 @@ def scrub_zip_xml_members(zip_path: Path, mapper,
             changed = False
             for info in infos:
                 data = zin.read(info.filename)
-                if info.filename.lower().endswith(_XML_SUFFIXES):
+                if (info.filename.lower().endswith(_XML_SUFFIXES)
+                        and not _is_opc_plumbing(info.filename)):
                     try:
                         text = data.decode('utf-8')
                     except UnicodeDecodeError:
@@ -180,6 +198,20 @@ def scrub_zip_xml_members(zip_path: Path, mapper,
                     new_text = _replace_across_text_runs(
                         new_text, mapper, member_label)
                     if new_text != text:
+                        # Never ship a member the replacement made
+                        # malformed. A discovered entity can collide with
+                        # text inside an attribute name/value and break
+                        # well-formedness; a corrupt part makes the whole
+                        # Office file unopenable (blank in Excel). If the
+                        # rewrite no longer parses, fail closed so the file
+                        # is quarantined, not shipped broken.
+                        try:
+                            ET.fromstring(new_text)
+                        except ET.ParseError as pe:
+                            _logger.error(
+                                "XML catch-all made %s::%s malformed (%s); "
+                                "failing closed.", label, info.filename, pe)
+                            return False
                         changed = True
                         _logger.info(
                             "XML catch-all pass replaced entities in "
