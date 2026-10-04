@@ -47,10 +47,24 @@ WORD_RE = re.compile(r'[A-Za-z]+')
 NUM_RE = re.compile(r'(\d+)')
 
 
-def entity_tokens(mapper: dict) -> set[str]:
-    """Lowercased alphabetic tokens of every mapped entity's original text."""
+def entity_tokens(mapper: dict, seeds_only: bool = True) -> set[str]:
+    """Lowercased alphabetic tokens of mapped entities' original text.
+
+    seeds_only (default): include ONLY entities you deliberately seeded
+    (a source starting with 'seed' — covers --seed, --seed-file and the
+    'seed_variant' derivations). GLiNER-discovered entries are skipped,
+    because on CAD corpora GLiNER tags generic part words and codes
+    (HINGE, LOCK, AIB, IDR) as 'company'; stripping those nukes the whole
+    descriptive stem down to the 'File_nnn' fallback. The names that
+    actually matter (the client companies/people) are the ones you
+    seeded, so seed-sourced stripping is both safe and precise.
+    """
     toks: set[str] = set()
     for info in mapper.values():
+        if seeds_only:
+            srcs = info.get('sources') or []
+            if not any(str(s).startswith('seed') for s in srcs):
+                continue
         original = str(info.get('original', ''))
         for w in WORD_RE.findall(original):
             if len(w) >= 2:
@@ -96,6 +110,11 @@ def main() -> int:
                          'a path to a file with one word per line.')
     ap.add_argument('--fallback', default='File',
                     help='Stem when no generic word survives (default File).')
+    ap.add_argument('--use-full-mapper', action='store_true',
+                    help='Strip tokens from ALL mapper entities, not just '
+                         'seeded names. Default OFF: GLiNER-discovered junk '
+                         '(part codes/words tagged as companies) would '
+                         'otherwise strip filenames down to File_nnn.')
     ap.add_argument('--min-word', type=int, default=3)
     ap.add_argument('--max-words', type=int, default=3)
     ap.add_argument('--apply', action='store_true',
@@ -112,7 +131,7 @@ def main() -> int:
         words = (p.read_text().split() if p.is_file()
                  else args.deny_words.split(','))
         deny = {w.strip().lower() for w in words if w.strip()}
-    deny |= entity_tokens(mapper)
+    deny |= entity_tokens(mapper, seeds_only=not args.use_full_mapper)
 
     # Build rename plan, resolving collisions within each target stem.
     used: set[str] = set()
