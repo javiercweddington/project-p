@@ -52,8 +52,9 @@ DROP = {'unigraphics', 'solidworks', 'autocad', 'inventor', 'catia',
         'date', 'sheet', 'rev', 'model', 'project', 'none', 'unit', 'mm'}
 
 
-def ocr_pdf(path: Path, ocr: ImageOCR, dpi: int = 200) -> str:
-    """OCR every page of a PDF at four rotations; return merged text."""
+def ocr_pdf(path: Path, ocr: ImageOCR, rotations, max_pages: int,
+            dpi: int) -> str:
+    """OCR a PDF's first `max_pages` pages at the given rotations."""
     chunks = []
     try:
         doc = fitz.open(path)
@@ -62,10 +63,13 @@ def ocr_pdf(path: Path, ocr: ImageOCR, dpi: int = 200) -> str:
         return ''
     try:
         zoom = dpi / 72.0
-        for page in doc:
+        pages = list(doc)
+        if max_pages > 0:
+            pages = pages[:max_pages]
+        for page in pages:
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             base = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
-            for angle in (0, 90, 180, 270):
+            for angle in rotations:
                 img = base if angle == 0 else base.rotate(angle, expand=True)
                 buf = io.BytesIO()
                 img.save(buf, format='PNG')
@@ -87,8 +91,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--source', required=True,
                     help='Dossier root to scan for PDFs.')
-    ap.add_argument('--dpi', type=int, default=200)
+    ap.add_argument('--dpi', type=int, default=180)
+    ap.add_argument('--rotations', default='0,90',
+                    help='Comma-separated page rotations to OCR (default '
+                         '"0,90" — title blocks are landscape or sideways; '
+                         'add 180,270 only if names are upside down).')
+    ap.add_argument('--max-pages', type=int, default=2,
+                    help='OCR only the first N pages per PDF (title blocks '
+                         'sit on the first sheet; 0 = all pages).')
     args = ap.parse_args()
+    rotations = [int(a) for a in args.rotations.split(',') if a.strip() != '']
 
     ocr = ImageOCR()
     if not ocr.available:
@@ -102,17 +114,23 @@ def main() -> int:
 
     companies: dict[str, set] = defaultdict(set)
     persons: dict[str, set] = defaultdict(set)
-    for i, pdf in enumerate(pdfs, 1):
-        print(f"  [{i}/{len(pdfs)}] {pdf.name}", file=sys.stderr)
-        text = ocr_pdf(pdf, ocr, args.dpi)
-        for m in COMPANY_RE.finditer(text):
-            val = re.sub(r'\s+', ' ', m.group(1)).strip(' .,')
-            if val and val.lower() not in DROP and len(val) > 2:
-                companies[val].add(pdf.name)
-        for m in PERSON_RE.finditer(text):
-            val = m.group(1).strip()
-            if val and val.lower() not in DROP and len(val) >= 2:
-                persons[val].add(pdf.name)
+    # Interrupt-safe: Ctrl-C stops scanning but still dumps what was found
+    # so a long run is never wasted.
+    try:
+        for i, pdf in enumerate(pdfs, 1):
+            print(f"  [{i}/{len(pdfs)}] {pdf.name}", file=sys.stderr)
+            text = ocr_pdf(pdf, ocr, rotations, args.max_pages, args.dpi)
+            for m in COMPANY_RE.finditer(text):
+                val = re.sub(r'\s+', ' ', m.group(1)).strip(' .,')
+                if val and val.lower() not in DROP and len(val) > 2:
+                    companies[val].add(pdf.name)
+            for m in PERSON_RE.finditer(text):
+                val = m.group(1).strip()
+                if val and val.lower() not in DROP and len(val) >= 2:
+                    persons[val].add(pdf.name)
+    except KeyboardInterrupt:
+        print(f"\n[interrupted at {i}/{len(pdfs)} — dumping partial "
+              f"results]", file=sys.stderr)
 
     def dump(title, d, etype):
         print(f"\n=== {title} ({len(d)}) ===")
