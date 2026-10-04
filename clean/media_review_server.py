@@ -294,6 +294,9 @@ def _thumb_data_uri(path: Optional[Path]) -> Optional[str]:
     return 'data:image/png;base64,' + base64.b64encode(blob).decode('ascii')
 
 
+_EXAMPLES_PREVIEW = 20
+
+
 def _cluster_items(review: dict, offset: int, limit: int) -> list:
     """One page of clusters with thumbnails as fetchable URLs.
 
@@ -306,6 +309,17 @@ def _cluster_items(review: dict, offset: int, limit: int) -> list:
         item = dict(entry)
         thumb = entry.get('thumbnail')
         item['thumb'] = ('/' + thumb.lstrip('/')) if thumb else None
+        # Ship only a PREVIEW of the occurrence list to the browser. A
+        # single logo on thousands of docs makes one cluster carry
+        # thousands of occurrence dicts; shipping every occurrence of
+        # every cluster was half the page stall. The FULL list stays in
+        # media_review.json on disk (what --apply and run_batch template
+        # scoping read); the UI only renders it in a collapsed <details>,
+        # and the true totals come from the 'occurrences'/'documents'
+        # integer fields, which are untouched.
+        ex = item.get('examples')
+        if isinstance(ex, list) and len(ex) > _EXAMPLES_PREVIEW:
+            item['examples'] = ex[:_EXAMPLES_PREVIEW]
         out.append(item)
     return out
 
@@ -379,6 +393,24 @@ def _write_back(review_path: Path, decisions: list,
 
 def serve(review_path: Path, audit_dir: Path, port: int = 8000,
           host: str = '127.0.0.1') -> None:
+    # Parse the review ONCE and reuse it across requests. Re-reading +
+    # re-parsing the whole file on every request (the index, every
+    # /clusters page the background loader fires) was the load stall:
+    # one logo on thousands of docs makes media_review.json hundreds of
+    # MB. mtime-keyed, so an external edit or our own write-back is
+    # picked up on the next request without a restart.
+    _cache: dict = {}
+
+    def _read_review() -> dict:
+        mt = review_path.stat().st_mtime_ns
+        if _cache.get('mtime') != mt:
+            with open(review_path) as handle:
+                _cache['review'] = json.load(handle)
+            _cache['mtime'] = mt
+        return _cache['review']
+
+    _read_review()  # prime once so concurrent first requests don't race
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             _logger.debug(fmt, *args)
@@ -392,8 +424,7 @@ def serve(review_path: Path, audit_dir: Path, port: int = 8000,
             self.wfile.write(body)
 
         def _load_review(self):
-            with open(review_path) as handle:
-                return json.load(handle)
+            return _read_review()
 
         def do_GET(self):
             parsed = urlparse(self.path)
