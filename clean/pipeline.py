@@ -593,29 +593,48 @@ class CleanPipeline:
         def _clean_one(staging_file: Path):
             rel_path = staging_file.relative_to(self.staging_dir)
             source_file = self.source_dir / rel_path
-            entity_spans = self._entity_spans.get(str(rel_path), None)
-            orig_size = source_file.stat().st_size
-            success = router.clean_file(
-                input_path=source_file,
-                output_path=staging_file,
-                entity_spans=entity_spans,
-            )
-            if success and not staging_file.exists():
-                # Format-converting cleaners (legacy .ppt -> image-only
-                # .pdf) write a sibling with a new extension and remove
-                # the original; track the replacement from here on.
-                converted = staging_file.with_suffix('.pdf')
-                if converted.exists():
-                    _logger.info("Tracking converted output: %s -> %s",
-                                 staging_file.name, converted.name)
-                    staging_file = converted
-                    rel_path = staging_file.relative_to(self.staging_dir)
-                else:
-                    _logger.warning(
-                        "Cleaner reported success for %s but no output "
-                        "exists; treating as failure.", rel_path)
-                    success = False
-            return success, staging_file, rel_path, source_file, orig_size
+            try:
+                entity_spans = self._entity_spans.get(str(rel_path), None)
+                orig_size = source_file.stat().st_size
+                success = router.clean_file(
+                    input_path=source_file,
+                    output_path=staging_file,
+                    entity_spans=entity_spans,
+                )
+                if success and not staging_file.exists():
+                    # Format-converting cleaners (legacy .ppt -> image-only
+                    # .pdf) write a sibling with a new extension and remove
+                    # the original; track the replacement from here on.
+                    converted = staging_file.with_suffix('.pdf')
+                    if converted.exists():
+                        _logger.info("Tracking converted output: %s -> %s",
+                                     staging_file.name, converted.name)
+                        staging_file = converted
+                        rel_path = staging_file.relative_to(self.staging_dir)
+                    else:
+                        _logger.warning(
+                            "Cleaner reported success for %s but no output "
+                            "exists; treating as failure.", rel_path)
+                        success = False
+                return (success, staging_file, rel_path, source_file,
+                        orig_size)
+            except Exception as e:
+                # CONTAIN per-file failures. An uncaught worker exception
+                # surfaces via future.result() in the consume loop and
+                # takes down the whole run -> the ThreadPoolExecutor's
+                # atexit handler then drains the entire submitted backlog
+                # on the workers while the main loop (the only place the
+                # checkpoint is written) is dead, i.e. a multi-day zombie
+                # frozen at a fixed checkpoint. A single bad file must
+                # quarantine and let the run continue, never propagate.
+                _logger.error(
+                    "Exception cleaning %s: %s (quarantining, run "
+                    "continues).", rel_path, e)
+                try:
+                    orig_size = source_file.stat().st_size
+                except Exception:
+                    orig_size = 0
+                return False, staging_file, rel_path, source_file, orig_size
 
         if n_workers > 1:
             # Pre-warm lazily-initialized shared components (raster
@@ -640,48 +659,65 @@ class CleanPipeline:
             outcome_iter = map(_clean_one, todo)
 
         file_index = 0
-        for outcome in outcome_iter:
-            file_index += 1
-            (success, staging_file, rel_path, source_file,
-             orig_size) = outcome
-            progress.step(file_index, len(todo), staging_file.name)
-            if staging_file.suffix.lower() in IMAGE_EXTS:
-                images_cleaned += 1
+        interrupted = False
+        try:
+            for outcome in outcome_iter:
+                file_index += 1
+                (success, staging_file, rel_path, source_file,
+                 orig_size) = outcome
+                progress.step(file_index, len(todo), staging_file.name)
+                if staging_file.suffix.lower() in IMAGE_EXTS:
+                    images_cleaned += 1
 
-            if success:
-                # Record hashes and sizes
-                orig_hash = compute_file_hash(source_file)
-                clean_hash = compute_file_hash(staging_file)
-                clean_size = staging_file.stat().st_size
+                if success:
+                    # Record hashes and sizes
+                    orig_hash = compute_file_hash(source_file)
+                    clean_hash = compute_file_hash(staging_file)
+                    clean_size = staging_file.stat().st_size
 
-                # Size-delta check: verify cleaning had effect
-                self._check_size_delta(rel_path, orig_size, clean_size)
+                    # Size-delta check: verify cleaning had effect
+                    self._check_size_delta(rel_path, orig_size, clean_size)
 
-                # Normalize filesystem mtime to prevent temporal leakage
-                self._normalize_mtime(staging_file)
+                    # Normalize filesystem mtime to prevent temporal leakage
+                    self._normalize_mtime(staging_file)
 
-                self.tracker.finalize_file(
-                    file_path=str(rel_path),
-                    original_hash=orig_hash,
-                    cleaned_hash=clean_hash,
-                    original_size=orig_size,
-                    cleaned_size=clean_size,
-                )
-                cleaned += 1
-                cleaned_files.append((staging_file, rel_path))
-                # Record as done for resume (checkpoint uses the ORIGINAL
-                # staging rel path, which is what a resumed run's rglob
-                # sees — flatten/anonymize happens later).
-                with self._checkpoint_lock:
-                    self._append_checkpoint(str(rel_path))
-            else:
-                failed += 1
-                _logger.warning("Failed to clean %s", rel_path)
-                # Quarantine: move the original file outside the deliverable
-                self._quarantine_file(staging_file, rel_path)
-
-        if executor is not None:
-            executor.shutdown(wait=True)
+                    self.tracker.finalize_file(
+                        file_path=str(rel_path),
+                        original_hash=orig_hash,
+                        cleaned_hash=clean_hash,
+                        original_size=orig_size,
+                        cleaned_size=clean_size,
+                    )
+                    cleaned += 1
+                    cleaned_files.append((staging_file, rel_path))
+                    # Record as done for resume (checkpoint uses the ORIGINAL
+                    # staging rel path, which is what a resumed run's rglob
+                    # sees — flatten/anonymize happens later).
+                    with self._checkpoint_lock:
+                        self._append_checkpoint(str(rel_path))
+                else:
+                    failed += 1
+                    _logger.warning("Failed to clean %s", rel_path)
+                    # Quarantine: move the original outside the deliverable
+                    self._quarantine_file(staging_file, rel_path)
+        except BaseException:
+            # Ctrl-C (KeyboardInterrupt) or any error must NOT leave the
+            # ThreadPoolExecutor's backlog to be drained by the
+            # interpreter-exit handler (_python_exit) while this loop — the
+            # ONLY place the checkpoint is appended — is dead. That created
+            # a multi-day zombie that kept cleaning files on the worker
+            # threads without ever advancing the checkpoint. Mark it so the
+            # finally cancels pending work without blocking.
+            interrupted = True
+            raise
+        finally:
+            if executor is not None:
+                # cancel_futures=True (py3.9+) empties the still-queued
+                # futures so neither this shutdown nor the atexit join
+                # drains the whole backlog. On a clean finish every future
+                # is already done, so this is a no-op; on interrupt we also
+                # skip waiting so a long in-flight file can't block exit.
+                executor.shutdown(wait=not interrupted, cancel_futures=True)
 
         # RETROACTIVE PASSES: entities discovered mid-run (emails inside a
         # workbook, authors in document metadata) were unknown when earlier
