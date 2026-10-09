@@ -381,14 +381,7 @@ class EntityMapper:
             # Multi-word entities must match across line wraps: PDF/OCR
             # extraction routinely breaks 'Lech Alexander Murawski' onto
             # separate lines, which a literal-space pattern never matches.
-            # POSSESSIVE (\s++): entity tokens are always separated by
-            # whitespace from a non-whitespace next token, so the engine
-            # never needs to give whitespace back — making it possessive
-            # keeps identical matches while removing the backtracking that
-            # can make finditer run for minutes on pathological text (and a
-            # C-level regex scan can't be interrupted by the verify SIGALRM
-            # budget). Requires Python 3.11+ (server is 3.12).
-            escaped = re.sub(r'(?:\\\s|\s)+', r'\\s++', escaped)
+            escaped = re.sub(r'(?:\\\s|\s)+', r'\\s+', escaped)
             if self._CJK_RE.search(variant):
                 parts.append(escaped)
                 continue
