@@ -51,6 +51,16 @@ except ImportError:
 
 _logger = logging.getLogger(__name__)
 
+# Max characters a single leakage scan (check_text) will read. Bounds the
+# AC pass and every per-mapping finditer so one ballooned Office member
+# cannot wedge the scan inside an un-interruptible C regex call.
+# 0 = unlimited. 20M chars (~20 MB) comfortably covers real content.
+try:
+    _VERIFY_MAX_CHARS = int(os.environ.get('PROJECT_P_VERIFY_MAX_CHARS',
+                                           '20000000'))
+except ValueError:
+    _VERIFY_MAX_CHARS = 20000000
+
 
 class _VerifyTimeBudgetExceeded(Exception):
     """Raised by the SIGALRM handler when one file's leakage scan
@@ -297,6 +307,22 @@ class LeakageChecker:
 
     def check_text(self, cleaned_text: str, file_path: str = "") -> List[LeakageHit]:
         """Check cleaned text for any surviving original entity strings."""
+        # Cap the text a single scan looks at. A ballooned Office member
+        # (e.g. a 127 KB xlsx whose sheet XML decompresses to 100+ MB of
+        # empty-cell padding) makes both the AC pass and every per-mapping
+        # finditer run over that whole blob; one finditer in C can then run
+        # longer than the SIGALRM budget, which cannot interrupt a C call,
+        # so the scan wedges (seen live on FILE_3087.xlsx). Real content
+        # sits well within the cap; the oversized tail of a ballooned
+        # member is padding. Logged loudly, fail-visible — not silent.
+        # PROJECT_P_VERIFY_MAX_CHARS, default 20M chars, 0 = unlimited.
+        if (_VERIFY_MAX_CHARS > 0 and len(cleaned_text) > _VERIFY_MAX_CHARS):
+            _logger.warning(
+                "Verify: %s is %d chars — scanning first %d only "
+                "(oversized/ballooned member; raise "
+                "PROJECT_P_VERIFY_MAX_CHARS to scan more).",
+                file_path or '<text>', len(cleaned_text), _VERIFY_MAX_CHARS)
+            cleaned_text = cleaned_text[:_VERIFY_MAX_CHARS]
         hits = []
         # One lowercase copy for the substring prefilter: with a large
         # mapper (100+ entities) the per-entity compiled patterns are the
